@@ -1,5 +1,5 @@
 use crate::config::load_or_create_config;
-use crate::ssh::{LocalSource, file_exists, scp, ssh_run};
+use crate::remote::{LocalSource, file_exists, scp, ssh_run};
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use std::io::{self, Write};
@@ -45,7 +45,7 @@ pub fn check_s5cmd() -> Result<()> {
 }
 
 /// 执行 s5cmd 命令，使用配置文件中的 AWS 凭证
-fn run_s5cmd(args: &str) -> Result<crate::ssh::CommandOutput> {
+fn run_s5cmd(args: &str) -> Result<crate::remote::CommandOutput> {
     let config = load_or_create_config()?;
 
     let access_key_id = config

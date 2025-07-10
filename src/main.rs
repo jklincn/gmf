@@ -1,10 +1,10 @@
 mod config;
 mod s5cmd;
-mod ssh;
+mod remote;
 
 use anyhow::Result;
 use s5cmd::{check_s5cmd, s5cmd_cp, s5cmd_mb, s5cmd_rb, s5cmd_rm};
-use ssh::ssh_connect;
+use remote::ssh_connect;
 
 fn main() -> Result<()> {
     ssh_connect()?;
