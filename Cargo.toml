@@ -4,9 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = "0.8.4"
 anyhow = "1.0.98"
+cbc = "0.1.2"
+clap = { version = "4.5.41", features = ["derive"] }
+md5 = "0.8.0"
 once_cell = "1.21.3"
+openssl = { version = "0.10", features = ["vendored"] }
 reqwest = { version = "0.12.22", features = ["blocking"] }
 serde = { version = "1.0.219", features = ["derive"] }
+shell-escape = "0.1.5"
+shellexpand = "3.1.1"
 tempfile = "3.20.0"
 toml = "0.8.23"
+hex = "0.4"
+sha2 = "0.10"
+base64 = "0.22"
+dunce = "1.0.5"
+shlex = "1.3.0"
