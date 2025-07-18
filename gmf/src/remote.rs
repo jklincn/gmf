@@ -209,3 +209,4 @@ async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
         ))
     }
 }
+
