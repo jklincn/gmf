@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use chunk::split_and_encrypt;
 use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
@@ -24,7 +25,7 @@ fn main() -> Result<()> {
     // 1. 解析命令行参数
     let args = Args::parse();
     let filepath = &args.path;
-    
+
     // 2. 获取文件的元数据
     // 我们直接对用户提供的路径（已展开'~'）进行操作
     let metadata = fs::metadata(filepath)
@@ -42,6 +43,6 @@ fn main() -> Result<()> {
     // 使用 .display() 方法可以更好地打印路径
     println!("文件: {}", filepath.display());
     println!("大小: {} 字节", file_size);
-
+    split_and_encrypt(filepath)?;
     Ok(())
 }

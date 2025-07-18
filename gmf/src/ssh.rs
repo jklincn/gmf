@@ -1,12 +1,6 @@
 use crate::config::{Config, load_or_create_config};
-use anyhow::{Context, Result, anyhow};
-// use dunce::canonicalize;
-use serde::{Deserialize, Serialize};
-// use shlex::try_quote;
+use anyhow::{Context, Result};
 use bytes::Bytes;
-use std::borrow::Cow;
-use std::ffi::OsString;
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
