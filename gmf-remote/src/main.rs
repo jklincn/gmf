@@ -1,15 +1,65 @@
+// src/main.rs
+
 use anyhow::Result;
-use anyhow::anyhow;
-use chunk::split_and_encrypt;
-use clap::Parser;
-use std::fs;
+use axum::{
+    Router,
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    routing::{get, post},
+};
+use axum_server::tls_rustls::RustlsConfig;
+use rcgen::{CertifiedKey, generate_simple_self_signed};
+use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[arg(value_parser = expand_tilde)]
-    path: PathBuf,
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let pid = std::process::id();
+    println!("{}", pid);
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let tls_config = RustlsConfig::from_pem(
+        cert.pem().into_bytes(),
+        signing_key.serialize_pem().into_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let app = Router::new()
+        .route("/", get(healthy_handler))
+        .route("/split", post(split_handler));
+    let ipv6_listener = TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).await?;
+    let ipv6_addr = ipv6_listener.local_addr()?;
+    drop(ipv6_listener);
+    println!("{}", ipv6_addr.port());
+
+    axum_server::bind_rustls(ipv6_addr, tls_config)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+// --- 处理器函数 (保持不变) ---
+
+async fn healthy_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct SplitPayload {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct SplitResponse {
+    status: String,
+    received_path: String,
+    message: String,
 }
 
 fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
@@ -21,28 +71,25 @@ fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn main() -> Result<()> {
-    // 1. 解析命令行参数
-    let args = Args::parse();
-    let filepath = &args.path;
+async fn split_handler(Json(payload): Json<SplitPayload>) -> impl IntoResponse {
+    println!("接收到 /split 请求，路径为: {}", payload.path);
 
-    // 2. 获取文件的元数据
-    // 我们直接对用户提供的路径（已展开'~'）进行操作
-    let metadata = fs::metadata(filepath)
-        .map_err(|e| anyhow!("无法获取路径 {:?} 的元数据: {}", filepath, e))?;
-
-    // 3. 检查路径是否指向一个文件
-    if !metadata.is_file() {
-        return Err(anyhow!("提供的路径 {:?} 不是一个文件", filepath));
+    match expand_tilde(&payload.path) {
+        Ok(expanded_path) => {
+            let response = SplitResponse {
+                status: "success".to_string(),
+                received_path: expanded_path.to_string_lossy().to_string(),
+                message: "路径已接收并成功展开。".to_string(),
+            };
+            (StatusCode::OK, Json(response))
+        }
+        Err(e) => {
+            let response = SplitResponse {
+                status: "error".to_string(),
+                received_path: payload.path,
+                message: e,
+            };
+            (StatusCode::BAD_REQUEST, Json(response))
+        }
     }
-
-    // 4. 获取文件大小 (单位: 字节)
-    let file_size = metadata.len();
-
-    // 5. 打印结果
-    // 使用 .display() 方法可以更好地打印路径
-    println!("文件: {}", filepath.display());
-    println!("大小: {} 字节", file_size);
-    split_and_encrypt(filepath)?;
-    Ok(())
 }

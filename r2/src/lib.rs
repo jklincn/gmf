@@ -7,8 +7,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-
-
+use anyhow::Context;
+// use aws_sdk_s3 as s3;
+// use aws_sdk_s3::primitives::ByteStream;
 
 const NONCE_SIZE: usize = 12;
 const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
@@ -80,7 +81,7 @@ fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<
 }
 
 /// 对文件分块并对每个分块进行加密
-pub fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
+pub fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<ManifestFile> {
     let input_path = input_path.as_ref();
     let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();
@@ -145,7 +146,7 @@ pub fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
     println!("{}", manifest_json);
     println!("---GMF-MANIFEST-END---");
 
-    Ok(())
+    Ok(manifest)
 }
 
 /// 从包含分隔符的完整输出中提取并初始化 ManifestFile
@@ -229,3 +230,65 @@ pub fn decrypt_and_merge(
 
     Ok(())
 }
+
+// 把 ManifestFile 中的所有分块上传到指定 bucket/前缀
+// pub async fn upload_manifest<F>(
+//     manifest: &ManifestFile,
+//     mut progress_cb: F,
+// ) -> anyhow::Result<()>
+// where
+//     F: FnMut(f64) + Send, // 允许用户自定义 UI，比如绘制进度条
+// {
+//     // 统计总大小（直接复用 manifest.total_size 亦可）
+//     let total_size = manifest.total_size;
+//     let mut uploaded_bytes: u64 = 0;
+
+//     // **按 id 顺序上传分块**（确保与下载端顺序一致）
+//     let mut chunks = manifest.chunks.clone();
+//     chunks.sort_by_key(|c| c.id);
+
+//     let bucket_name = "gmf";
+//     let account_id = "<accountid>";
+//     let access_key_id = "<access_key_id>";
+//     let access_key_secret = "<access_key_secret>";
+
+//     // Configure the client
+//     let config = aws_config::from_env()
+//         .endpoint_url(format!("https://{}.r2.cloudflarestorage.com", account_id))
+//         .credentials_provider(aws_sdk_s3::config::Credentials::new(
+//             access_key_id,
+//             access_key_secret,
+//             None, // session token is not used with R2
+//             None,
+//             "R2",
+//         ))
+//         .region("auto")
+//         .load()
+//         .await;
+
+//     let client = s3::Client::new(&config);
+
+//     for chunk in chunks {
+//         let path = Path::new(&chunk.filename);
+//         let file_name_in_r2 = format!("{}", path.file_name().unwrap().to_string_lossy());
+
+//         // 用 ByteStream::from_path 最简单；上传结束后再更新 uploaded_bytes
+//         let body = ByteStream::from_path(path)
+//             .await
+//             .with_context(|| format!("无法读取分块文件 {:?}", path))?;
+
+//         client
+//             .put_object()
+//             .bucket(bucket_name)
+//             .key(&file_name_in_r2)
+//             .body(body)
+//             .send()
+//             .await?;
+
+//         uploaded_bytes += chunk.size;
+//         let progress = uploaded_bytes as f64 / total_size as f64;
+//         progress_cb(progress);
+//     }
+
+//     Ok(())
+// }

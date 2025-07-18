@@ -14,7 +14,7 @@ fn main() {
     let remote_elf = workspace_root
         .join("target")
         .join("x86_64-unknown-linux-musl")
-        .join("release")
+        .join("debug")
         .join("gmf-remote");
 
     println!("cargo:rerun-if-changed={}", remote_elf.display());
@@ -48,7 +48,7 @@ fn main() {
     // 生成 Rust 源文件：OUT_DIR/gmf-remote.rs
     let embed_rs = out_dir.join("gmf-remote.rs");
     let content = format!(
-        r#"pub const REMOTE_ELF: &[u8] = include_bytes!("{gz_path}");
+        r#"pub const REMOTE_ELF_GZ: &[u8] = include_bytes!("{gz_path}");
 pub const REMOTE_ELF_SHA256: &str = "{sha256}";
 "#,
         gz_path = gz_path.display(),

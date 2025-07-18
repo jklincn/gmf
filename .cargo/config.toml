@@ -1,7 +1,8 @@
 [alias]
-br = "build -p gmf-remote --release --target x86_64-unknown-linux-musl"
-b = "build -p gmf --release --target x86_64-unknown-linux-musl"
+br = "build -p gmf-remote --target x86_64-unknown-linux-musl"
+b = "build -p gmf --target x86_64-unknown-linux-musl"
 b-win = "build -p gmf --release --target x86_64-pc-windows-gnu"
-
+br-r = "build -p gmf-remote --release --target x86_64-unknown-linux-musl"
+b-r  = "build -p gmf --release --target x86_64-unknown-linux-musl"
 [build]
 target = "x86_64-unknown-linux-musl"

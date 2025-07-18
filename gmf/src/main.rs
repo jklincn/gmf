@@ -3,8 +3,8 @@ mod ssh;
 
 use anyhow::Result;
 use clap::Parser;
-use chunk::{decrypt_and_merge, manifest_from_str};
-use ssh::{run_remote, ssh_connect};
+use r2::{decrypt_and_merge, manifest_from_str};
+use ssh::start_remote;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -12,13 +12,13 @@ struct Args {
     path: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
     let filepath = args.path;
-    ssh_connect()?;
-    let result = run_remote(&filepath)?;
-    let manifest = manifest_from_str(&result.stdout)?;
-    decrypt_and_merge(&manifest,"./decrypted_output")?;
+    
+    let mut runner = start_remote().await?;
+    runner.shutdown().await?;
 
     Ok(())
 }
