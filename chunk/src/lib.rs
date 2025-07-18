@@ -118,14 +118,14 @@ pub fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<()> {
         let size = encrypted_data.len() as u64;
 
         // 4. 将加密后的分块写入随机子目录
-        let chunk_filename = format!("{}/gmf.part{}", work_dir_name, chunk_index);
-        let chunk_path = temp_dir.join(&chunk_filename);
-        fs::write(&chunk_path, &encrypted_data)?;
+        let chunk_basename = format!("gmf.part{}", chunk_index);
+        let chunk_path = work_dir.join(chunk_basename);
+        fs::write(&chunk_path , &encrypted_data)?;
 
         // 5. 收集分块信息
         chunks_info.push(ChunkInfo {
             id: chunk_index,
-            filename: chunk_filename,
+            filename: chunk_path.to_string_lossy().into_owned(),
             passphrase_b64,
             sha256,
             size,

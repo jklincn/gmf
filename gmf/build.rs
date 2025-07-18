@@ -17,6 +17,17 @@ fn main() {
         .join("release")
         .join("gmf-remote");
 
+    println!("cargo:rerun-if-changed={}", remote_elf.display());
+    if !remote_elf.exists() {
+        // 如果文件不存在，可以选择直接 panic 给出清晰的提示，
+        // 或者安静地退出，让后续的 include_bytes! 宏在编译时报错。
+        // 这里我们选择 panic，因为错误信息更明确。
+        panic!(
+            "gmf-remote ELF not found at: {}. Please build the 'gmf-remote' crate first.",
+            remote_elf.display()
+        );
+    }
+
     // 读取 ELF
     let bytes = fs::read(&remote_elf).expect("read ELF failed");
 
@@ -33,10 +44,6 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let gz_path = out_dir.join("gmf-remote.gz");
     fs::write(&gz_path, &gz_bytes).expect("写入压缩文件失败");
-
-    // 计算 SHA-256（原始 ELF 的）
-    let sha256 = Sha256::digest(&bytes);
-    let sha256_hex = format!("{:x}", sha256);
 
     // 生成 Rust 源文件：OUT_DIR/gmf-remote.rs
     let embed_rs = out_dir.join("gmf-remote.rs");
