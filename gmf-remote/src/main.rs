@@ -8,11 +8,12 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
+use r2::{ManifestFile, split_and_encrypt};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -50,18 +51,6 @@ async fn healthy_handler() -> StatusCode {
     StatusCode::OK
 }
 
-#[derive(Deserialize)]
-struct SplitPayload {
-    path: String,
-}
-
-#[derive(Serialize)]
-struct SplitResponse {
-    status: String,
-    received_path: String,
-    message: String,
-}
-
 fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
     let expanded = shellexpand::tilde(raw).into_owned();
     if expanded.is_empty() {
@@ -71,25 +60,44 @@ fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
     }
 }
 
-async fn split_handler(Json(payload): Json<SplitPayload>) -> impl IntoResponse {
-    println!("接收到 /split 请求，路径为: {}", payload.path);
+async fn split_handler(Json(mut payload): Json<HashMap<String, String>>) -> impl IntoResponse {
+    // 1) 校验 filepath
+    let filepath = match payload.remove("filepath") {
+        Some(fp) => fp,
+        None => {
+            // 构造统一格式的错误响应
+            let mut resp = HashMap::new();
+            resp.insert(
+                "content".to_string(),
+                "missing `filepath` field".to_string(),
+            );
+            return (StatusCode::BAD_REQUEST, Json(resp));
+        }
+    };
 
-    match expand_tilde(&payload.path) {
-        Ok(expanded_path) => {
-            let response = SplitResponse {
-                status: "success".to_string(),
-                received_path: expanded_path.to_string_lossy().to_string(),
-                message: "路径已接收并成功展开。".to_string(),
+    // 2) 转成 PathBuf
+    let path: PathBuf = filepath.into();
+
+    // 3) 调用业务逻辑
+    match split_and_encrypt(&path).await {
+        Ok(manifest) => {
+            // 把 ManifestFile 序列化成 JSON 字符串
+            let json_str = match serde_json::to_string(&manifest) {
+                Ok(s) => s,
+                Err(e) => {
+                    let mut resp = HashMap::new();
+                    resp.insert("content".to_string(), format!("序列化失败：{}", e));
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(resp));
+                }
             };
-            (StatusCode::OK, Json(response))
+            let mut resp = HashMap::new();
+            resp.insert("content".to_string(), json_str);
+            (StatusCode::OK, Json(resp))
         }
         Err(e) => {
-            let response = SplitResponse {
-                status: "error".to_string(),
-                received_path: payload.path,
-                message: e,
-            };
-            (StatusCode::BAD_REQUEST, Json(response))
+            let mut resp = HashMap::new();
+            resp.insert("content".to_string(), e.to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(resp))
         }
     }
 }

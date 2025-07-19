@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
     let filepath = args.path;
     
     let mut remote = start_remote().await?;
-
+    remote.split_and_encrypt(&filepath).await?;
     remote.shutdown().await?;
 
     Ok(())

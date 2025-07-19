@@ -81,7 +81,7 @@ fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<
 }
 
 /// 对文件分块并对每个分块进行加密
-pub fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<ManifestFile> {
+pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<ManifestFile> {
     let input_path = input_path.as_ref();
     let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();

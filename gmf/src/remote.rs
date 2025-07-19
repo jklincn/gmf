@@ -2,7 +2,10 @@
 //! 依赖见 Cargo.toml：tokio="1", reqwest="0.12", anyhow, sha2
 use crate::config::{Config, load_or_create_config};
 use anyhow::{Context, Result, anyhow};
+use r2::ManifestFile;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -25,7 +28,12 @@ pub struct RemoteRunner {
     cfg: Config,
     child: Child,
     pid: u32,
-    port: u16,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct Wrapper {
+    content: String,
 }
 
 impl RemoteRunner {
@@ -38,6 +46,35 @@ impl RemoteRunner {
         ssh_once(&self.cfg, &cmd)
             .await
             .context("远端 gmf-remote 杀掉失败")?;
+        Ok(())
+    }
+    pub async fn split_and_encrypt(&self, filepath: &str) -> Result<()> {
+        let map = HashMap::from([("filepath".to_string(), filepath.to_string())]);
+        let client = Client::builder()
+            .timeout(TIMEOUT)
+            .danger_accept_invalid_certs(true)
+            .build()?;
+        let resp = client
+            .post(&format!("{}/split", self.url))
+            .json(&map)
+            .send()
+            .await?;
+
+        // 检查 HTTP 状态
+        if !resp.status().is_success() {
+            anyhow::bail!("请求失败：{}", resp.status());
+        }
+
+        // 解析返回的 JSON 为 ManifestFile
+        let wrap: Wrapper = resp.json().await?;
+        let content_str = wrap.content;
+
+        // 2. 再把 content 里面的 JSON 字符串反序列化
+        let manifest: ManifestFile = serde_json::from_str(&content_str)?;
+
+        // 打印结果以验证
+        println!("收到 ManifestFile: {:#?}", manifest);
+
         Ok(())
     }
 }
@@ -87,22 +124,18 @@ pub async fn start_remote() -> Result<RemoteRunner> {
     let port: u16 = port_line.trim().parse().context("端口号解析失败")?;
 
     println!("gmf-remote (PID {}) 正在监听端口 {}", pid, port);
-
+    let address = format!("https://{}:{}", cfg.host, port);
     //--------------------------------------------------------
-    // 3. 本地轮询直到 200
+    // 3. 本地轮询
     //--------------------------------------------------------
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(TIMEOUT)
         .danger_accept_invalid_certs(true)
         .build()?;
     let deadline = Instant::now() + TIMEOUT;
 
     loop {
-        match client
-            .get(format!("https://{}:{port}", cfg.host))
-            .send()
-            .await
-        {
+        match client.get(&address).send().await {
             Ok(resp) if resp.status() == 200 => break,
             _ if Instant::now() > deadline => {
                 child.kill().await.ok();
@@ -116,7 +149,7 @@ pub async fn start_remote() -> Result<RemoteRunner> {
         cfg,
         child,
         pid,
-        port,
+        url: address,
     })
 }
 
@@ -209,4 +242,3 @@ async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
         ))
     }
 }
-
