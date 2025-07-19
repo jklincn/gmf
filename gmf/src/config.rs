@@ -6,7 +6,7 @@ use std::path::Path;
 const CONFIG_FILE_NAME: &str = "config.toml";
 
 /// 配置结构体
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,

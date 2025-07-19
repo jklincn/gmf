@@ -1,13 +1,13 @@
-use aes_gcm::aead::{rand_core::RngCore, Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use base64::{engine::general_purpose, Engine as _};
+use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use anyhow::Context;
 // use aws_sdk_s3 as s3;
 // use aws_sdk_s3::primitives::ByteStream;
 
@@ -82,7 +82,7 @@ fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<
 
 /// 对文件分块并对每个分块进行加密
 pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<ManifestFile> {
-    let input_path = input_path.as_ref();
+    let input_path: &Path = input_path.as_ref();
     let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();
     let mut reader = BufReader::new(input_file);
@@ -121,7 +121,7 @@ pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<M
         // 4. 将加密后的分块写入随机子目录
         let chunk_basename = format!("gmf.part{}", chunk_index);
         let chunk_path = work_dir.join(chunk_basename);
-        fs::write(&chunk_path , &encrypted_data)?;
+        fs::write(&chunk_path, &encrypted_data)?;
 
         // 5. 收集分块信息
         chunks_info.push(ChunkInfo {
@@ -142,9 +142,6 @@ pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<M
     };
 
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    println!("---GMF-MANIFEST-START---");
-    println!("{}", manifest_json);
-    println!("---GMF-MANIFEST-END---");
 
     Ok(manifest)
 }
@@ -206,10 +203,7 @@ pub fn decrypt_and_merge(
         }
         let sha256 = format!("{:x}", Sha256::digest(&encrypted_data));
         if sha256 != chunk_info.sha256 {
-            anyhow::bail!(
-                "分块 {} SHA256校验和不匹配.",
-                chunk_info.id
-            );
+            anyhow::bail!("分块 {} SHA256校验和不匹配.", chunk_info.id);
         }
 
         // 3. 解码密钥并解密
@@ -221,7 +215,9 @@ pub fn decrypt_and_merge(
     }
 
     // 恢复原始文件名并重命名
-    let original_os_name = manifest.filename.file_name()
+    let original_os_name = manifest
+        .filename
+        .file_name()
         .expect("原始文件名丢失")
         .to_os_string();
     let restored_path = temp_output_path.with_file_name(&original_os_name);
