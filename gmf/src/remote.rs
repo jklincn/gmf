@@ -1,9 +1,10 @@
 use crate::config::{Config, load_or_create_config};
 use anyhow::{Context, Result, anyhow};
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 use r2::ManifestFile;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -19,8 +20,6 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 //------------------------------------------------------------
 // 对外结构体
 //------------------------------------------------------------
-/// `ssh_child` 负责在远端执行 gmf‑remote；
-/// `forward_child` 负责本地端口转发 (ssh -N -L …)。
 pub struct RemoteRunner {
     cfg: Config,
     pid: u32,
@@ -29,36 +28,45 @@ pub struct RemoteRunner {
     url: String,
 }
 
-#[derive(Deserialize)]
-struct Wrapper {
-    content: String,
-}
-
 impl RemoteRunner {
     //--------------------------------------------------------
     // 用户态 API
     //--------------------------------------------------------
-    pub async fn split_and_encrypt(&self, filepath: &str) -> Result<()> {
-        println!("请求远端分割加密文件：{}", filepath);
-        let map = HashMap::from([("filepath".to_string(), filepath.to_string())]);
+    pub async fn split(&self, filepath: &str) -> Result<ManifestFile> {
+        let url = format!(
+            "{}/split_sse?path={}",
+            self.url,
+            urlencoding::encode(filepath)
+        );
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .build()?;
-        let resp = client
-            .post(&format!("{}/split", self.url))
-            .json(&map)
-            .send()
-            .await?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("请求失败：{}", resp.status());
+        let resp = client.get(&url).send().await?.error_for_status()?; // Propagate HTTP 错误
+
+        let mut stream = resp.bytes_stream().eventsource();
+
+        // 等待处理进度 & 结果
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            match event.event.as_str() {
+                "status" => {
+                    println!("远端处理状态：{}", event.data);
+                }
+                "done" => {
+                    let data = event.data.trim();
+                    let manifest: ManifestFile =
+                        serde_json::from_str(data).map_err(|e| anyhow!("反序列化失败: {}", e))?;
+                    println!("远端处理完成：{:#?}", manifest);
+                    return Ok(manifest);
+                }
+                other => {
+                    println!("收到未知 SSE 事件：{}，数据：{}", other, event.data);
+                }
+            }
         }
-        let wrap: Wrapper = resp.json().await?;
-        let manifest: ManifestFile = serde_json::from_str(&wrap.content)?;
-        println!("收到 ManifestFile: {:#?}", manifest);
-        println!("OK");
-        Ok(())
+
+        Err(anyhow!("SSE 流意外关闭，没有收到 done 事件"))
     }
 
     /// 主动关闭远端。
@@ -74,9 +82,7 @@ impl RemoteRunner {
             .arg(format!("kill {}", self.pid))
             .status();
         match cmd {
-            Ok(status) if status.success() => {
-                eprintln!("✅ 远端 gmf-remote 已被杀死");
-            }
+            Ok(status) if status.success() => {}
             Ok(status) => {
                 eprintln!("⚠️ 远端杀 gmf-remote 返回非零状态: {}", status);
             }

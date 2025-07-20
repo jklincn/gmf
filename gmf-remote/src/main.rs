@@ -1,21 +1,30 @@
 use anyhow::Result;
+use async_stream::stream;
 use axum::{
-    extract::Json,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
     Router,
+    extract::{Json, Query},
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
+use futures_util::stream::{self, Stream};
 use r2::split_and_encrypt;
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::{convert::Infallible, time::Duration};
 use tokio::net::TcpListener;
+use tokio_stream::StreamExt as _;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info, instrument};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(healthy_handler))
         .route("/split", post(split_handler))
+        .route("/split_sse", get(sse_handler))
         .layer(CatchPanicLayer::new()) // 捕获 panic, 防止服务器崩溃
         .layer(TraceLayer::new_for_http()); // 自动记录 HTTP 请求
 
@@ -78,6 +88,46 @@ async fn healthy_handler() -> StatusCode {
     StatusCode::OK
 }
 
+#[derive(Deserialize)]
+struct Params {
+    path: String,
+}
+async fn sse_handler(
+    Query(params): Query<Params>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // 从 Query 中取出 path
+    let path: PathBuf = params.path.into();
+    // 构造一个只发两次事件的 Stream：先发一个 status，再执行任务，最后发一个 done
+    let event_stream = stream! {
+        // （1）可选：先告诉客户端“processing”
+        yield Ok::<_, Infallible>(Event::default()
+            .event("status")
+            .data("processing"));
+        sleep(Duration::from_secs(10)).await;
+        // （2）调用你的耗时处理函数
+        let result = split_and_encrypt(path).await;
+        let data = match result {
+            Ok(manifest) => {
+                // 如果 ManifestFile 可序列化，直接转成 JSON 字符串
+                serde_json::to_string(&manifest)
+                    .unwrap_or_else(|e| format!("序列化失败: {}", e))
+            }
+            Err(err) => {
+                // 错误时也返回一个描述
+                format!("处理出错: {}", err)
+            }
+        };
+        // （3）处理完成后，推送“done”事件并附上结果
+        yield Ok(Event::default()
+            .event("done")
+            .data(data));
+
+    };
+
+    // 可选心跳，防止中间网络设备断开空闲连接
+    Sse::new(event_stream).keep_alive(KeepAlive::default())
+}
+
 // 使用 `instrument` 宏可以自动为这个函数创建一个日志 span
 #[instrument(skip(payload), fields(filepath))]
 async fn split_handler(Json(mut payload): Json<HashMap<String, String>>) -> impl IntoResponse {
@@ -90,7 +140,10 @@ async fn split_handler(Json(mut payload): Json<HashMap<String, String>>) -> impl
         None => {
             error!("请求中缺少 'filepath' 字段");
             let mut resp = HashMap::new();
-            resp.insert("content".to_string(), "missing `filepath` field".to_string());
+            resp.insert(
+                "content".to_string(),
+                "missing `filepath` field".to_string(),
+            );
             return (StatusCode::BAD_REQUEST, Json(resp));
         }
     };
