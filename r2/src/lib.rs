@@ -1,6 +1,5 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +17,7 @@ const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChunkInfo {
     pub id: u32,                // 分块序号（从 1 开始）
-    pub filename: String,       // 远程最终文件名
+    pub local_path: PathBuf,    // 远程最终文件名
     pub passphrase_b64: String, // Base64-encoded 随机口令
     pub sha256: String,         // 加密后文件哈希
     pub size: u64,              // 加密后大小（字节）
@@ -26,12 +25,23 @@ pub struct ChunkInfo {
 
 /// 整个文件的清单
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ManifestFile {
+pub struct Manifest {
     pub filename: PathBuf,
     pub total_size: u64,
     pub chunk_size: usize,
     pub total_chunks: u32,
     pub chunks: Vec<ChunkInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", content = "data")]
+pub enum TaskEvent {
+    ProcessingStart,
+    SplitComplete { manifest: Manifest },
+    ChunkReadyForDownload { chunk_id: u32, remote_path: String },
+    ChunkAcknowledged { chunk_id: u32 },
+    TaskCompleted,
+    Error { message: String },
 }
 
 fn generate_key() -> [u8; 32] {
@@ -81,7 +91,7 @@ fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<
 }
 
 /// 对文件分块并对每个分块进行加密
-pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<ManifestFile> {
+pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<Manifest> {
     let input_path: &Path = input_path.as_ref();
     let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();
@@ -91,8 +101,8 @@ pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<M
     let mut chunk_index = 0;
     let mut chunks_info = Vec::new();
 
+    // 创建一个临时目录用于存储分块
     let temp_dir = env::temp_dir();
-    // 在临时目录下为此次分块创建随机子目录
     let mut rng = OsRng;
     let random_id = rng.next_u64();
     let work_dir_name = format!("gmf-{}", random_id);
@@ -126,54 +136,24 @@ pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<M
         // 5. 收集分块信息
         chunks_info.push(ChunkInfo {
             id: chunk_index,
-            filename: chunk_path.to_string_lossy().into_owned(),
+            local_path: chunk_path,
             passphrase_b64,
             sha256,
             size,
         });
     }
 
-    let manifest = ManifestFile {
+    Ok(Manifest {
         filename: input_path.to_path_buf(),
         total_size: file_size,
         chunk_size: CHUNK_SIZE,
         total_chunks: chunk_index,
         chunks: chunks_info,
-    };
-
-    let manifest_json = serde_json::to_string_pretty(&manifest)?;
-
-    Ok(manifest)
-}
-
-/// 从包含分隔符的完整输出中提取并初始化 ManifestFile
-pub fn manifest_from_str(full_output: &str) -> anyhow::Result<ManifestFile> {
-    const START_DELIMITER: &str = "---GMF-MANIFEST-START---";
-    const END_DELIMITER: &str = "---GMF-MANIFEST-END---";
-
-    let start_bytes = full_output
-        .find(START_DELIMITER)
-        .ok_or_else(|| anyhow::anyhow!("找不到清单起始分隔符: {}", START_DELIMITER))?
-        + START_DELIMITER.len();
-
-    let end_bytes = full_output
-        .rfind(END_DELIMITER)
-        .ok_or_else(|| anyhow::anyhow!("找不到清单结束分隔符: {}", END_DELIMITER))?;
-
-    if start_bytes >= end_bytes {
-        anyhow::bail!("清单分隔符顺序不正确或内容为空");
-    }
-
-    let json_part = &full_output[start_bytes..end_bytes].trim();
-    let manifest: ManifestFile = serde_json::from_str(json_part)?;
-    Ok(manifest)
+    })
 }
 
 /// 对文件解密并合并
-pub fn decrypt_and_merge(
-    manifest: &ManifestFile,
-    output_path: impl AsRef<Path>,
-) -> anyhow::Result<()> {
+pub fn decrypt_and_merge(manifest: &Manifest, output_path: impl AsRef<Path>) -> anyhow::Result<()> {
     // 使用临时路径以便后续重命名
     let output_path_ref = output_path.as_ref();
     let temp_output_path = output_path_ref.to_path_buf();
@@ -186,7 +166,7 @@ pub fn decrypt_and_merge(
 
     for chunk_info in sorted_chunks {
         // 1. 读取加密的分块文件
-        let chunk_path = temp_dir.join(&chunk_info.filename);
+        let chunk_path = temp_dir.join(&chunk_info.local_path);
         if !chunk_path.exists() {
             anyhow::bail!("分块文件不存在: {:?}", chunk_path);
         }
@@ -227,6 +207,9 @@ pub fn decrypt_and_merge(
     Ok(())
 }
 
+pub async fn upload_file() -> anyhow::Result<()> {
+    Ok(())
+}
 // 把 ManifestFile 中的所有分块上传到指定 bucket/前缀
 // pub async fn upload_manifest<F>(
 //     manifest: &ManifestFile,

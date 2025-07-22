@@ -1,9 +1,7 @@
 mod config;
 mod remote;
-
 use anyhow::Result;
 use clap::Parser;
-use r2::{decrypt_and_merge, manifest_from_str};
 use remote::start_remote;
 
 #[derive(Parser, Debug)]
@@ -16,9 +14,10 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let filepath = args.path;
-    
+
     let mut remote = start_remote().await?;
-    remote.split(&filepath).await?;
+    remote.setup(&filepath).await?;
+    remote.start().await?;
     remote.shutdown().await?;
 
     Ok(())

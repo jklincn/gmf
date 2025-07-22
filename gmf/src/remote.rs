@@ -1,15 +1,16 @@
 use crate::config::{Config, load_or_create_config};
 use anyhow::{Context, Result, anyhow};
-use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use r2::ManifestFile;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use r2::{Manifest, TaskEvent};
+use reqwest::{Client, StatusCode};
+use reqwest_eventsource::{Event, EventSource};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 include!(concat!(env!("OUT_DIR"), "/gmf-remote.rs"));
@@ -17,56 +18,159 @@ include!(concat!(env!("OUT_DIR"), "/gmf-remote.rs"));
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
-//------------------------------------------------------------
-// 对外结构体
-//------------------------------------------------------------
 pub struct RemoteRunner {
     cfg: Config,
     pid: u32,
-    forward_child: Child,
-    local_port: u16,
-    url: String,
+    pub url: String,
+    manifest_file: Option<Manifest>,
+}
+
+#[derive(serde::Serialize)]
+struct SetupPayload {
+    path: String,
 }
 
 impl RemoteRunner {
-    //--------------------------------------------------------
-    // 用户态 API
-    //--------------------------------------------------------
-    pub async fn split(&self, filepath: &str) -> Result<ManifestFile> {
-        let url = format!(
-            "{}/split_sse?path={}",
-            self.url,
-            urlencoding::encode(filepath)
-        );
+    pub async fn setup(&self, file_path: &str) -> Result<()> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
 
-        let resp = client.get(&url).send().await?.error_for_status()?; // Propagate HTTP 错误
+        let payload = SetupPayload {
+            path: file_path.to_string(),
+        };
 
-        let mut stream = resp.bytes_stream().eventsource();
+        let url = format!("{}/setup", self.url);
+        let response = client.post(&url).json(&payload).send().await?;
 
-        // 等待处理进度 & 结果
-        while let Some(event) = stream.next().await {
-            let event = event?;
-            match event.event.as_str() {
-                "status" => {
-                    println!("远端处理状态：{}", event.data);
+        match response.status() {
+            StatusCode::OK => {
+                let response_text = response.text().await?;
+                println!("文件路径已设置: {}", response_text);
+                Ok(())
+            }
+            // 处理其他可能的错误状态码
+            status => {
+                let error_text = response.text().await?;
+                eprintln!("An unexpected error occurred.");
+                eprintln!("   Status: {}", status);
+                eprintln!("   Server response: {}", error_text);
+                Err(anyhow!("Task setup failed with status: {}", status))
+            }
+        }
+    }
+
+    pub async fn start(&mut self) -> Result<()> {
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        let url = format!("{}/start", self.url);
+
+        // 创建一个通道，用于下载任务通知主循环它们已完成（多写单读）
+        let (download_complete_tx, mut download_complete_rx) =
+            mpsc::channel::<Result<u32, (u32, anyhow::Error)>>(128);
+
+        // 2. 连接到 SSE 事件源
+        let mut event_source =
+            EventSource::new(client.get(&url).header("Accept", "text/event-stream"))?;
+        println!("已连接到服务端事件流...");
+
+        // 3. 主事件循环
+        let mut total_chunks = 0;
+        let mut completed_chunks = HashSet::new();
+        let mut server_task_completed = false;
+
+        loop {
+            tokio::select! {
+                // 分支一：监听 SSE 事件
+                Some(event) = event_source.next() => {
+                    match event {
+                        Ok(Event::Open) => println!("SSE 连接已打开。"),
+                        Ok(Event::Message(message)) => {
+                            let task_event: TaskEvent = serde_json::from_str(&message.data)?;
+                            match task_event {
+                                TaskEvent::ProcessingStart => {
+                                    println!("服务端开始处理...");
+                                }
+                                TaskEvent::SplitComplete { manifest } => {
+                                    println!("服务端准备完成，收到清单。总分块数: {}", manifest.total_chunks);
+                                    total_chunks = manifest.total_chunks;
+                                    self.manifest_file = Some(manifest);
+                                }
+                                TaskEvent::ChunkReadyForDownload { chunk_id, remote_path } => {
+                                    println!("分块 {} 已就绪，准备下载: {}", chunk_id, remote_path);
+
+                                    // 派生一个新任务去下载并确认
+                                    let task_client = client.clone();
+                                    let ack_url = format!("{}/acknowledge/{}", self.url, chunk_id);
+                                    let tx_clone = download_complete_tx.clone();
+
+                                    tokio::spawn(async move {
+                                        // 下载文件
+                                        println!("[下载任务 {}] 开始下载...", chunk_id);
+                                        sleep(Duration::from_secs(3)).await; // 模拟下载延迟
+                                        println!("[下载任务 {}] 下载完成。", chunk_id);
+
+                                        println!("[下载任务 {}] 发送确认...", chunk_id);
+
+                                        let ack_result = task_client.post(&ack_url).send().await;
+                                         if let Err(e) = ack_result {
+                                            let _ = tx_clone.send(Err((chunk_id, e.into()))).await;
+                                            return;
+                                        }
+                                        println!("[下载任务 {}] 确认成功。", chunk_id);
+
+                                        // 通知主循环此分块已完成
+                                        let _ = tx_clone.send(Ok(chunk_id)).await;
+                                    });
+                                }
+                                TaskEvent::TaskCompleted => {
+                                    println!("服务端报告任务已全部完成！");
+                                    server_task_completed = true;
+                                }
+                                TaskEvent::Error { message } => {
+                                    event_source.close();
+                                    return Err(anyhow!("服务端错误: {}", message));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("SSE 流错误: {}", e));
+                        }
+                    }
                 }
-                "done" => {
-                    let data = event.data.trim();
-                    let manifest: ManifestFile =
-                        serde_json::from_str(data).map_err(|e| anyhow!("反序列化失败: {}", e))?;
-                    println!("远端处理完成：{:#?}", manifest);
-                    return Ok(manifest);
+
+                // 分支二：处理已完成的下载任务
+                Some(download_result) = download_complete_rx.recv() => {
+                    match download_result {
+                        Ok(chunk_id) => {
+                            completed_chunks.insert(chunk_id);
+                            println!("进度: {} / {}", completed_chunks.len(), total_chunks);
+                        }
+                        Err((chunk_id, e)) => {
+                             eprintln!("处理分块 {} 时发生错误: {}", chunk_id, e);
+                             // todo:重试
+                             event_source.close();
+                             return Err(e);
+                        }
+                    }
                 }
-                other => {
-                    println!("收到未知 SSE 事件：{}，数据：{}", other, event.data);
-                }
+            }
+
+            // 检查退出条件
+            if server_task_completed
+                && total_chunks > 0
+                && completed_chunks.len() == total_chunks as usize
+            {
+                println!("所有分块已成功下载和确认！");
+                break;
             }
         }
 
-        Err(anyhow!("SSE 流意外关闭，没有收到 done 事件"))
+        event_source.close();
+        Ok(())
     }
 
     /// 主动关闭远端。
@@ -102,12 +206,21 @@ pub async fn start_remote() -> Result<RemoteRunner> {
     ensure_remote(&cfg).await?;
 
     //--------------------------------------------------------
-    // 1. ssh 启动 gmf‑remote（前台运行，stdout 打印 PID 和端口）
+    // 1. ssh 启动 gmf‑remote
     //--------------------------------------------------------
     let mut ssh_child = {
         let mut cmd = Command::new("ssh");
         add_ssh_args(&mut cmd, &cfg)
             .arg("~/.local/bin/gmf-remote")
+            .env("ENDPOINT", cfg.endpoint.clone().unwrap_or_default())
+            .env(
+                "ACCESS_KEY_ID",
+                cfg.access_key_id.clone().unwrap_or_default(),
+            )
+            .env(
+                "SECRET_ACCESS_KEY",
+                cfg.secret_access_key.clone().unwrap_or_default(),
+            )
             .kill_on_drop(true);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
@@ -135,7 +248,6 @@ pub async fn start_remote() -> Result<RemoteRunner> {
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("远端未输出 PID"))?;
-    println!("收到远端 PID：{}", pid_line);
     let pid: u32 = pid_line.trim().parse().context("PID 解析失败")?;
 
     // 2.2 端口
@@ -143,27 +255,30 @@ pub async fn start_remote() -> Result<RemoteRunner> {
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("远端未输出端口号"))?;
-    println!("收到远端端口：{}", port_line);
     let remote_port: u16 = port_line.trim().parse().context("端口号解析失败")?;
+    let local_port = remote_port;
+
+    // todo：解决防火墙
 
     //--------------------------------------------------------
     // 3. 建立本地端口转发：local_port -> 127.0.0.1:remote_port
     //--------------------------------------------------------
-    let local_port = pick_free_port().await?;
-    let mut forward_child = {
-        let mut cmd = Command::new("ssh");
-        add_ssh_args(&mut cmd, &cfg)
-            .args(["-N", "-o", "ExitOnForwardFailure=yes"])
-            .arg("-L")
-            .arg(format!("{local_port}:127.0.0.1:{remote_port}"))
-            .kill_on_drop(true);
-        cmd.spawn().context("无法启动 ssh 端口转发进程")?
-    };
+    // let local_port = pick_free_port().await?;
+    // let mut forward_child = {
+    //     let mut cmd = Command::new("ssh");
+    //     add_ssh_args(&mut cmd, &cfg)
+    //         .args(["-N", "-o", "ExitOnForwardFailure=yes"])
+    //         .arg("-L")
+    //         .arg(format!("{local_port}:127.0.0.1:{remote_port}"))
+    //         .kill_on_drop(true);
+    //     cmd.spawn().context("无法启动 ssh 端口转发进程")?
+    // };
 
     //--------------------------------------------------------
     // 4. 轮询本地端口是否就绪
     //--------------------------------------------------------
-    let url = format!("https://127.0.0.1:{local_port}");
+    // let url = format!("http://127.0.0.1:{local_port}");
+    let url: String = format!("https://{}:{local_port}", &cfg.host);
     let client = Client::builder()
         .timeout(TIMEOUT)
         .danger_accept_invalid_certs(true)
@@ -174,21 +289,20 @@ pub async fn start_remote() -> Result<RemoteRunner> {
             Ok(resp) if resp.status() == 200 => break,
             _ if Instant::now() > deadline => {
                 ssh_child.kill().await.ok();
-                forward_child.kill().await.ok();
+                // forward_child.kill().await.ok();
                 return Err(anyhow!("等待端口 {local_port} 就绪超时 (> {TIMEOUT:?})"));
             }
             _ => sleep(RETRY_INTERVAL).await,
         }
     }
 
-    println!("gmf-remote 已通过 SSH 隧道暴露为 {url} (远端 {remote_port})");
+    println!("gmf-remote 已启用，连接地址: {}", url);
 
     Ok(RemoteRunner {
         cfg,
         pid,
-        forward_child,
-        local_port,
         url,
+        manifest_file: None,
     })
 }
 
@@ -196,6 +310,9 @@ pub async fn start_remote() -> Result<RemoteRunner> {
 // 内部：文件校验 / 上传
 //------------------------------------------------------------
 async fn ensure_remote(cfg: &Config) -> Result<()> {
+    // To be improved
+    let _ = ssh_once(cfg, "pkill -x gmf-remote || true").await?;
+
     let sha = ssh_once(
         cfg,
         "sha256sum ~/.local/bin/gmf-remote 2>/dev/null | cut -d' ' -f1",
@@ -220,7 +337,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     "#;
     ssh_once(cfg, cmd).await?;
 
-    // 再校验
+    // 再次校验
     let new_sha = ssh_once(cfg, "sha256sum ~/.local/bin/gmf-remote | cut -d' ' -f1").await?;
     if new_sha.trim() != REMOTE_ELF_SHA256 {
         Err(anyhow!(
