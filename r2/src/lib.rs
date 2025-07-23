@@ -1,5 +1,6 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aws_sdk_s3 as s3;
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,11 +8,10 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-// use aws_sdk_s3 as s3;
-// use aws_sdk_s3::primitives::ByteStream;
 
 const NONCE_SIZE: usize = 12;
 const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+const BUCKETNAME: &str = "gmf";
 
 /// 分块信息结构体
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -207,9 +207,69 @@ pub fn decrypt_and_merge(manifest: &Manifest, output_path: impl AsRef<Path>) -> 
     Ok(())
 }
 
-pub async fn upload_file() -> anyhow::Result<()> {
-    Ok(())
+pub async fn get_config<'a>(
+    cfg: Option<(&'a str, &'a str, &'a str)>,
+) -> anyhow::Result<s3::Client> {
+    let endpoint;
+    let access_key_id;
+    let secret_access_key;
+    if let Some((ep, akid, sak)) = cfg {
+        endpoint = ep.to_string();
+        access_key_id = akid.to_string();
+        secret_access_key = sak.to_string();
+    } else {
+        endpoint = env::var("ENDPOINT").unwrap();
+        access_key_id = env::var("ACCESS_KEY_ID").unwrap();
+        secret_access_key = env::var("SECRET_ACCESS_KEY").unwrap();
+    }
+    let config = aws_config::from_env()
+        .endpoint_url(endpoint)
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            access_key_id,
+            secret_access_key,
+            None,
+            None,
+            "R2",
+        ))
+        .region("auto")
+        .load()
+        .await;
+
+    let client = s3::Client::new(&config);
+    Ok(client)
 }
+
+pub async fn create_bucket(client: &s3::Client) -> anyhow::Result<()> {
+    client
+        .create_bucket()
+        .bucket(BUCKETNAME)
+        .create_bucket_configuration(s3::types::CreateBucketConfiguration::builder().build())
+        .send()
+        .await?;
+
+    let mut buckets = client.list_buckets().into_paginator().send();
+    while let Some(Ok(output)) = buckets.next().await {
+        for bucket in output.buckets() {
+            if bucket.name.as_deref() == Some(BUCKETNAME) {
+                println!("Bucket 创建成功");
+                return Ok(());
+            }
+        }
+    }
+    Err(anyhow::anyhow!("Bucket 创建失败"))
+}
+
+pub async fn delete_bucket<'a>(client: &s3::Client) -> anyhow::Result<()> {
+    let resp = client.delete_bucket().bucket(BUCKETNAME).send().await;
+    match resp {
+        Ok(_) => {
+            println!("Bucket 删除成功");
+            Ok(())
+        }
+        Err(err) => Err(anyhow::anyhow!("删除 Bucket 失败: {}", err)),
+    }
+}
+
 // 把 ManifestFile 中的所有分块上传到指定 bucket/前缀
 // pub async fn upload_manifest<F>(
 //     manifest: &ManifestFile,

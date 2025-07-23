@@ -8,15 +8,10 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use std::net::Ipv6Addr;
 use time::macros::format_description;
-use tokio::net::TcpListener;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing_subscriber::{
-    EnvFilter,
-    fmt::time::UtcTime,
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
+    EnvFilter, fmt::time::UtcTime, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
 fn set_log() {
@@ -55,7 +50,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let app_state = state::AppState::new();
 
-    // 添加 TraceLayer 用于自动记录请求信息，CatchPanicLayer 用于捕获 panic
     let app = Router::new()
         .route("/", get(handler::healthy))
         .route("/setup", post(handler::setup))
@@ -65,11 +59,9 @@ async fn main() -> anyhow::Result<()> {
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
 
-    let ipv6_listener = TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).await?;
-    let ipv6_addr = ipv6_listener.local_addr()?;
-    println!("{}", ipv6_addr.port());
-    let std_listener = ipv6_listener.into_std()?;
-    axum_server::from_tcp_rustls(std_listener, tls_config)
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+    println!("{}", listener.local_addr()?.port());
+    axum_server::from_tcp_rustls(listener, tls_config)
         .serve(app.into_make_service())
         .await?;
     Ok(())

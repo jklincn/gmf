@@ -1,4 +1,4 @@
-use crate::config::{Config, load_or_create_config};
+use crate::config::Config;
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use r2::{Manifest, TaskEvent};
@@ -7,7 +7,7 @@ use reqwest_eventsource::{Event, EventSource};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -22,41 +22,49 @@ pub struct RemoteRunner {
     cfg: Config,
     pid: u32,
     pub url: String,
+    forward_child: tokio::process::Child,
     manifest_file: Option<Manifest>,
 }
 
-#[derive(serde::Serialize)]
-struct SetupPayload {
-    path: String,
-}
-
 impl RemoteRunner {
-    pub async fn setup(&self, file_path: &str) -> Result<()> {
-        let client = Client::builder()
+    pub async fn setup(&self, file_path: &str) -> Result<String> {
+        #[derive(serde::Serialize)]
+        struct Payload {
+            path: String,
+        }
+        let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
 
-        let payload = SetupPayload {
+        let payload = Payload {
             path: file_path.to_string(),
         };
-
         let url = format!("{}/setup", self.url);
-        let response = client.post(&url).json(&payload).send().await?;
-
-        match response.status() {
+        let response = client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow!("请求发送失败: {}", e))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<无法读取响应体>".to_string());
+        match status {
             StatusCode::OK => {
-                let response_text = response.text().await?;
-                println!("文件路径已设置: {}", response_text);
-                Ok(())
+                println!("{}", body);
+                Ok(body)
             }
-            // 处理其他可能的错误状态码
-            status => {
-                let error_text = response.text().await?;
-                eprintln!("An unexpected error occurred.");
-                eprintln!("   Status: {}", status);
-                eprintln!("   Server response: {}", error_text);
-                Err(anyhow!("Task setup failed with status: {}", status))
+            StatusCode::BAD_REQUEST => Err(anyhow!("远程文件查找失败（请求错误 400）: {}", body)),
+            StatusCode::INTERNAL_SERVER_ERROR => {
+                Err(anyhow!("远程文件查找失败（服务器错误 500）: {}", body))
             }
+            _ => Err(anyhow!(
+                "远程文件查找失败（状态 {}）: {}",
+                status.as_u16(),
+                body
+            )),
         }
     }
 
@@ -74,7 +82,6 @@ impl RemoteRunner {
         // 2. 连接到 SSE 事件源
         let mut event_source =
             EventSource::new(client.get(&url).header("Accept", "text/event-stream"))?;
-        println!("已连接到服务端事件流...");
 
         // 3. 主事件循环
         let mut total_chunks = 0;
@@ -86,15 +93,15 @@ impl RemoteRunner {
                 // 分支一：监听 SSE 事件
                 Some(event) = event_source.next() => {
                     match event {
-                        Ok(Event::Open) => println!("SSE 连接已打开。"),
+                        Ok(Event::Open) => {},
                         Ok(Event::Message(message)) => {
                             let task_event: TaskEvent = serde_json::from_str(&message.data)?;
                             match task_event {
                                 TaskEvent::ProcessingStart => {
-                                    println!("服务端开始处理...");
+                                    println!("服务端开始处理");
                                 }
                                 TaskEvent::SplitComplete { manifest } => {
-                                    println!("服务端准备完成，收到清单。总分块数: {}", manifest.total_chunks);
+                                    println!("服务端已完成分块加密。总分块数: {}", manifest.total_chunks);
                                     total_chunks = manifest.total_chunks;
                                     self.manifest_file = Some(manifest);
                                 }
@@ -175,6 +182,11 @@ impl RemoteRunner {
 
     /// 主动关闭远端。
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.forward_child
+            .kill()
+            .await
+            .context("无法关闭远端 gmf-remote")?;
+
         use std::process::Command;
         let cfg = &self.cfg;
         let cmd = Command::new("ssh")
@@ -201,84 +213,59 @@ impl RemoteRunner {
 //------------------------------------------------------------
 // 入口：启动远端并返回 Runner
 //------------------------------------------------------------
-pub async fn start_remote() -> Result<RemoteRunner> {
-    let cfg = load_or_create_config()?;
-    ensure_remote(&cfg).await?;
+pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
+    ensure_remote(cfg).await?;
 
-    //--------------------------------------------------------
-    // 1. ssh 启动 gmf‑remote
-    //--------------------------------------------------------
+    // 启动 gmf‑remote
     let mut ssh_child = {
         let mut cmd = Command::new("ssh");
         add_ssh_args(&mut cmd, &cfg)
             .arg("~/.local/bin/gmf-remote")
-            .env("ENDPOINT", cfg.endpoint.clone().unwrap_or_default())
-            .env(
-                "ACCESS_KEY_ID",
-                cfg.access_key_id.clone().unwrap_or_default(),
-            )
-            .env(
-                "SECRET_ACCESS_KEY",
-                cfg.secret_access_key.clone().unwrap_or_default(),
-            )
+            .env("ENDPOINT", cfg.endpoint.clone())
+            .env("ACCESS_KEY_ID", cfg.access_key_id.clone())
+            .env("SECRET_ACCESS_KEY", cfg.secret_access_key.clone())
             .kill_on_drop(true);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
         cmd.spawn().context("无法启动 ssh 进程 (gmf-remote)")?
     };
 
-    if let Some(mut err) = ssh_child.stderr.take() {
-        tokio::spawn(async move {
-            let mut buf = vec![];
-            err.read_to_end(&mut buf).await.ok();
-            eprintln!("ssh stderr: {}", String::from_utf8_lossy(&buf));
-        });
-    }
-    //--------------------------------------------------------
-    // 2. 读取远端 PID 与端口
-    //--------------------------------------------------------
+    println!("gmf-remote 启动成功");
+
+    // 获取输出
     let stdout = ssh_child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("无法获得 ssh stdout"))?;
     let mut reader = BufReader::new(stdout).lines();
 
-    // 2.1 PID
+    // 读取 PID
     let pid_line = reader
         .next_line()
         .await?
-        .ok_or_else(|| anyhow!("远端未输出 PID"))?;
+        .ok_or_else(|| anyhow!("gmf-remote 未输出 PID"))?;
     let pid: u32 = pid_line.trim().parse().context("PID 解析失败")?;
 
-    // 2.2 端口
+    // 读取端口
     let port_line = reader
         .next_line()
         .await?
-        .ok_or_else(|| anyhow!("远端未输出端口号"))?;
+        .ok_or_else(|| anyhow!("gmf-remote 未输出端口号"))?;
     let remote_port: u16 = port_line.trim().parse().context("端口号解析失败")?;
-    let local_port = remote_port;
 
-    // todo：解决防火墙
-
-    //--------------------------------------------------------
     // 3. 建立本地端口转发：local_port -> 127.0.0.1:remote_port
-    //--------------------------------------------------------
-    // let local_port = pick_free_port().await?;
-    // let mut forward_child = {
-    //     let mut cmd = Command::new("ssh");
-    //     add_ssh_args(&mut cmd, &cfg)
-    //         .args(["-N", "-o", "ExitOnForwardFailure=yes"])
-    //         .arg("-L")
-    //         .arg(format!("{local_port}:127.0.0.1:{remote_port}"))
-    //         .kill_on_drop(true);
-    //     cmd.spawn().context("无法启动 ssh 端口转发进程")?
-    // };
+    let local_port = pick_free_port().await?;
+    let mut forward_child = {
+        let mut cmd = Command::new("ssh");
+        add_ssh_args(&mut cmd, &cfg)
+            .args(["-N", "-o", "ExitOnForwardFailure=yes"])
+            .arg("-L")
+            .arg(format!("{local_port}:127.0.0.1:{remote_port}"));
+        cmd.spawn().context("无法启动 ssh 端口转发进程")?
+    };
 
-    //--------------------------------------------------------
     // 4. 轮询本地端口是否就绪
-    //--------------------------------------------------------
-    // let url = format!("http://127.0.0.1:{local_port}");
-    let url: String = format!("https://{}:{local_port}", &cfg.host);
+    let url = format!("https://127.0.0.1:{local_port}");
     let client = Client::builder()
         .timeout(TIMEOUT)
         .danger_accept_invalid_certs(true)
@@ -289,29 +276,45 @@ pub async fn start_remote() -> Result<RemoteRunner> {
             Ok(resp) if resp.status() == 200 => break,
             _ if Instant::now() > deadline => {
                 ssh_child.kill().await.ok();
-                // forward_child.kill().await.ok();
+                forward_child.kill().await.ok();
                 return Err(anyhow!("等待端口 {local_port} 就绪超时 (> {TIMEOUT:?})"));
             }
             _ => sleep(RETRY_INTERVAL).await,
         }
     }
 
-    println!("gmf-remote 已启用，连接地址: {}", url);
+    println!("gmf-remote 连接成功");
 
     Ok(RemoteRunner {
-        cfg,
+        cfg: cfg.clone(),
         pid,
         url,
+        forward_child,
         manifest_file: None,
     })
+}
+
+async fn ensure_cmd_exists(cfg: &Config, cmd: &str) -> Result<()> {
+    // command -v 是 POSIX 推荐的方式，比 which 更通用
+    ssh_once(cfg, &format!("command -v {} >/dev/null 2>&1", cmd))
+        .await
+        .with_context(|| format!("远程服务器上未找到命令 `{}`，请先安装或配置 PATH", cmd))?;
+    Ok(())
 }
 
 //------------------------------------------------------------
 // 内部：文件校验 / 上传
 //------------------------------------------------------------
 async fn ensure_remote(cfg: &Config) -> Result<()> {
+    ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
+    println!("远程服务器连接成功");
+
+    for cmd in &["pkill", "sha256sum", "cut", "gunzip"] {
+        ensure_cmd_exists(cfg, cmd).await?;
+    }
+
     // To be improved
-    let _ = ssh_once(cfg, "pkill -x gmf-remote || true").await?;
+    ssh_once(cfg, "pkill -x gmf-remote || true").await?;
 
     let sha = ssh_once(
         cfg,
@@ -321,7 +324,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     if sha.trim() == REMOTE_ELF_SHA256 {
         return Ok(());
     }
-    println!("上传远端 ELF：当前校验 {sha}，期待 {REMOTE_ELF_SHA256}");
+    println!("正在安装 gmf-remote 至 ~/.local/bin 目录");
     // 上传 gzip
     let tmp = std::env::temp_dir().join("gmf-remote.gz");
     tokio::fs::write(&tmp, REMOTE_ELF_GZ).await?;
@@ -341,7 +344,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     let new_sha = ssh_once(cfg, "sha256sum ~/.local/bin/gmf-remote | cut -d' ' -f1").await?;
     if new_sha.trim() != REMOTE_ELF_SHA256 {
         Err(anyhow!(
-            "远端 ELF 校验失败：期待 {REMOTE_ELF_SHA256}，得到 {}",
+            "安装失败：数据完整性校验失败：实际值 {} 与期望值 {REMOTE_ELF_SHA256} 不符",
             new_sha.trim()
         ))
     } else {
@@ -349,9 +352,6 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     }
 }
 
-//------------------------------------------------------------
-// 内部：ssh / scp 工具
-//------------------------------------------------------------
 fn add_ssh_args<'a>(cmd: &'a mut Command, cfg: &Config) -> &'a mut Command {
     cmd.arg("-p")
         .arg(cfg.port.to_string())
@@ -360,17 +360,21 @@ fn add_ssh_args<'a>(cmd: &'a mut Command, cfg: &Config) -> &'a mut Command {
 }
 
 fn private_key_args(cfg: &Config) -> Vec<String> {
-    cfg.private_key_path
-        .as_ref()
-        .filter(|p| !p.is_empty())
-        .map(|p| vec!["-i".into(), p.clone()])
-        .unwrap_or_default()
+    // 判断私钥路径字符串是否为空
+    if !cfg.private_key_path.is_empty() {
+        // 如果不为空，则返回包含 "-i" 和路径的 Vec
+        vec!["-i".to_string(), cfg.private_key_path.clone()]
+    } else {
+        // 如果为空，则返回一个空的 Vec
+        Vec::new()
+    }
 }
 
 async fn scp_send(cfg: &Config, local: &Path, remote: &str) -> Result<()> {
     let status = {
         let mut cmd = Command::new("scp");
-        cmd.arg("-P")
+        cmd.arg("-q")
+            .arg("-P")
             .arg(cfg.port.to_string())
             .args(private_key_args(cfg))
             .arg(local)
@@ -399,9 +403,7 @@ async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
     }
 }
 
-//------------------------------------------------------------
-// Util
-//------------------------------------------------------------
+// 获取一个可用的本地端口
 async fn pick_free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();

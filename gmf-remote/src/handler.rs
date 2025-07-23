@@ -1,18 +1,19 @@
 use crate::state::AppState;
 use crate::worker::run_task;
+use anyhow::Context;
 use async_stream::stream;
 use axum::{
     Json,
     extract::{Path, State},
     http::StatusCode,
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
 use r2::TaskEvent;
 use serde::Deserialize;
-use std::convert::Infallible;
+use std::{convert::Infallible, fs::File};
 use tokio::sync::broadcast;
 use tracing::{error, info, instrument, warn};
 
@@ -20,6 +21,16 @@ use tracing::{error, info, instrument, warn};
 pub async fn healthy() -> StatusCode {
     info!("健康检查接口被调用");
     StatusCode::OK
+}
+
+fn format_size(mut size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut unit = 0;
+    while size >= 1024 && unit < UNITS.len() - 1 {
+        size /= 1024;
+        unit += 1;
+    }
+    format!("{} {}", size, UNITS[unit])
 }
 
 #[derive(Deserialize, Debug)]
@@ -31,11 +42,31 @@ pub struct SetupPayload {
 pub async fn setup(
     State(state): State<AppState>,
     Json(payload): Json<SetupPayload>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, Response> {
     let mut context = state.0.lock().unwrap();
     context.path = Some(payload.path.clone().into());
-    info!("文件路径已设置: {}", payload.path);
-    (StatusCode::OK, format!("{}", payload.path)).into_response()
+
+    let path = context.path.as_deref().expect("path not set");
+    let input_file = File::open(path).map_err(|e| {
+        let msg = format!("无法打开文件 `{}`: {}", path.display(), e);
+        (StatusCode::BAD_REQUEST, msg).into_response()
+    })?;
+
+    let metadata = input_file.metadata().map_err(|e| {
+        let msg = format!("无法获取文件 `{}` 的元数据: {}", path.display(), e);
+        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    })?;
+    let file_size = metadata.len();
+    let human_size = format_size(file_size);
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+    info!("已设置文件: {}，总大小: {}", file_name, human_size);
+
+    let body = format!("文件: {}，大小: {}", file_name, human_size);
+    Ok((StatusCode::OK, body))
 }
 
 #[instrument(skip_all, name = "start_task_sse_stream")]
