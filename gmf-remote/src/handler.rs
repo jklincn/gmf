@@ -1,6 +1,5 @@
 use crate::state::AppState;
 use crate::worker::run_task;
-use anyhow::Context;
 use async_stream::stream;
 use axum::{
     Json,
@@ -43,10 +42,11 @@ pub async fn setup(
     State(state): State<AppState>,
     Json(payload): Json<SetupPayload>,
 ) -> Result<impl IntoResponse, Response> {
+    let expanded_path_str = shellexpand::tilde(&payload.path).to_string();
     let mut context = state.0.lock().unwrap();
-    context.path = Some(payload.path.clone().into());
+    context.path = Some(expanded_path_str.into());
 
-    let path = context.path.as_deref().expect("path not set");
+    let path = context.path.as_deref().expect("path should have been set");
     let input_file = File::open(path).map_err(|e| {
         let msg = format!("无法打开文件 `{}`: {}", path.display(), e);
         (StatusCode::BAD_REQUEST, msg).into_response()

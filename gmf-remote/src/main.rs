@@ -15,7 +15,7 @@ use tracing_subscriber::{
 };
 
 fn set_log() {
-    let log_file_path = "gmf-remote.log";
+    let log_file_path = ".gmf-remote.log";
     let log_file = std::fs::File::create(log_file_path).expect("无法创建日志文件");
 
     let filter = EnvFilter::new("info");

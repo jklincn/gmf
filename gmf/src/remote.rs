@@ -21,12 +21,13 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 pub struct RemoteRunner {
     cfg: Config,
     pid: u32,
-    pub url: String,
+    url: String,
     forward_child: tokio::process::Child,
     manifest_file: Option<Manifest>,
 }
 
 impl RemoteRunner {
+    // 设置文件路径
     pub async fn setup(&self, file_path: &str) -> Result<String> {
         #[derive(serde::Serialize)]
         struct Payload {
@@ -72,6 +73,7 @@ impl RemoteRunner {
         Ok(body)
     }
 
+    // 开始处理
     pub async fn start(&mut self) -> Result<()> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
@@ -184,7 +186,7 @@ impl RemoteRunner {
         Ok(())
     }
 
-    /// 主动关闭远端。
+    // 关闭远程服务
     pub async fn shutdown(&mut self) -> Result<()> {
         self.forward_child
             .kill()
@@ -215,9 +217,7 @@ impl RemoteRunner {
     }
 }
 
-//------------------------------------------------------------
-// 入口：启动远端并返回 Runner
-//------------------------------------------------------------
+// 启动远端并返回 Runner
 pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     ensure_remote(cfg).await?;
 
@@ -258,7 +258,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         .ok_or_else(|| anyhow!("gmf-remote 未输出端口号"))?;
     let remote_port: u16 = port_line.trim().parse().context("端口号解析失败")?;
 
-    // 3. 建立本地端口转发：local_port -> 127.0.0.1:remote_port
+    // 建立本地端口转发：local_port -> 127.0.0.1:remote_port
     let local_port = pick_free_port().await?;
     let mut forward_child = {
         let mut cmd = Command::new("ssh");
@@ -269,7 +269,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         cmd.spawn().context("无法启动 ssh 端口转发进程")?
     };
 
-    // 4. 轮询本地端口是否就绪
+    // 轮询本地端口是否就绪
     let url = format!("https://127.0.0.1:{local_port}");
     let client = Client::builder()
         .timeout(TIMEOUT)
@@ -300,11 +300,13 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
 }
 
 async fn ensure_cmd_exists(cfg: &Config, cmd: &str) -> Result<()> {
-    // command -v 是 POSIX 推荐的方式，比 which 更通用
     ssh_once(cfg, &format!("command -v {} >/dev/null 2>&1", cmd))
         .await
-        .with_context(|| format!("远程服务器上未找到命令 `{}`，请先安装或配置 PATH", cmd))?;
-    Ok(())
+        .context(format!(
+            "远程服务器上未找到命令 `{}`，请先安装或配置 PATH",
+            cmd
+        ))
+        .map(|_| ())
 }
 
 //------------------------------------------------------------
@@ -326,8 +328,9 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     if sha.trim() == REMOTE_ELF_SHA256 {
         return Ok(());
     }
-    println!("正在安装 gmf-remote 至 ~/.local/bin 目录");
+
     // 上传 gzip
+    println!("正在安装 gmf-remote 至 ~/.local/bin 目录");
     let tmp = std::env::temp_dir().join("gmf-remote.gz");
     tokio::fs::write(&tmp, REMOTE_ELF_GZ).await?;
     scp_send(cfg, &tmp, "~/gmf-remote.gz").await?;

@@ -2,6 +2,7 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3 as s3;
+use aws_sdk_s3::primitives::ByteStream;
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -274,64 +275,15 @@ pub async fn delete_bucket(client: &s3::Client) -> Result<()> {
     Ok(())
 }
 
-// 把 ManifestFile 中的所有分块上传到指定 bucket/前缀
-// pub async fn upload_manifest<F>(
-//     manifest: &ManifestFile,
-//     mut progress_cb: F,
-// ) -> anyhow::Result<()>
-// where
-//     F: FnMut(f64) + Send, // 允许用户自定义 UI，比如绘制进度条
-// {
-//     // 统计总大小（直接复用 manifest.total_size 亦可）
-//     let total_size = manifest.total_size;
-//     let mut uploaded_bytes: u64 = 0;
-
-//     // **按 id 顺序上传分块**（确保与下载端顺序一致）
-//     let mut chunks = manifest.chunks.clone();
-//     chunks.sort_by_key(|c| c.id);
-
-//     let bucket_name = "gmf";
-//     let account_id = "<accountid>";
-//     let access_key_id = "<access_key_id>";
-//     let access_key_secret = "<access_key_secret>";
-
-//     // Configure the client
-//     let config = aws_config::from_env()
-//         .endpoint_url(format!("https://{}.r2.cloudflarestorage.com", account_id))
-//         .credentials_provider(aws_sdk_s3::config::Credentials::new(
-//             access_key_id,
-//             access_key_secret,
-//             None, // session token is not used with R2
-//             None,
-//             "R2",
-//         ))
-//         .region("auto")
-//         .load()
-//         .await;
-
-//     let client = s3::Client::new(&config);
-
-//     for chunk in chunks {
-//         let path = Path::new(&chunk.filename);
-//         let file_name_in_r2 = format!("{}", path.file_name().unwrap().to_string_lossy());
-
-//         // 用 ByteStream::from_path 最简单；上传结束后再更新 uploaded_bytes
-//         let body = ByteStream::from_path(path)
-//             .await
-//             .with_context(|| format!("无法读取分块文件 {:?}", path))?;
-
-//         client
-//             .put_object()
-//             .bucket(bucket_name)
-//             .key(&file_name_in_r2)
-//             .body(body)
-//             .send()
-//             .await?;
-
-//         uploaded_bytes += chunk.size;
-//         let progress = uploaded_bytes as f64 / total_size as f64;
-//         progress_cb(progress);
-//     }
-
-//     Ok(())
-// }
+pub async fn upload_object(client: &s3::Client, data: &[u8], key: &str) -> Result<()> {
+    let body = ByteStream::from(data.to_vec());
+    client
+        .put_object()
+        .bucket(BUCKETNAME)
+        .key(key)
+        .body(body)
+        .send()
+        .await
+        .context(format!("上传内存数据到 S3 对象 '{}' 失败", key))?;
+    Ok(())
+}
