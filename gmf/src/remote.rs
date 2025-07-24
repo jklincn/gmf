@@ -89,8 +89,6 @@ impl RemoteRunner {
             EventSource::new(client.get(&url).header("Accept", "text/event-stream"))?;
 
         // --- 主事件循环 ---
-        let mut pending_tasks = 0;
-        let mut completed_tasks = HashSet::new();
         let mut server_task_finished = false;
 
         println!("等待服务端事件...");
@@ -118,7 +116,6 @@ impl RemoteRunner {
                                 }
                                 TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
                                     println!("分块 {} 已就绪，开始下载和处理...", chunk_id);
-                                    pending_tasks += 1;
 
                                     let task_client = client.clone();
                                     let base_url = self.url.clone();
@@ -142,7 +139,6 @@ impl RemoteRunner {
                                     event_source.close();
                                 }
                                 TaskEvent::Error { message } => {
-                                    server_task_finished = true;
                                     event_source.close();
                                     return Err(anyhow!("服务端错误: {}", message));
                                 }
@@ -160,11 +156,9 @@ impl RemoteRunner {
 
                 // --- 分支二：处理已完成的 worker 任务 ---
                 Some(result) = worker_done_rx.recv() => {
-                    pending_tasks -= 1;
                     match result {
                         Ok(chunk_id) => {
-                            completed_tasks.insert(chunk_id);
-                            println!("分块 {} 已成功处理和确认。剩余任务: {}", chunk_id, pending_tasks);
+                            println!("分块 {} 已成功处理和确认。", chunk_id);
                         }
                         Err((chunk_id, e)) => {
                              eprintln!("处理分块 {} 时发生严重错误: {}", chunk_id, e);
@@ -184,7 +178,7 @@ impl RemoteRunner {
             }
 
             // --- 检查退出条件 ---
-            if server_task_finished && pending_tasks == 0 {
+            if server_task_finished {
                 println!("所有分块已成功下载和确认！");
                 break;
             }

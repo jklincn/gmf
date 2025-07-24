@@ -1,12 +1,12 @@
 use crate::state::{AppState, ChunkProcessingStatus, ChunkState};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose;
 use futures::stream::{self, StreamExt};
 use r2::{self, CHUNK_SIZE, TaskEvent};
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::time::Duration;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
@@ -22,7 +22,7 @@ pub struct ChunkJob {
 
 // --- 主任务调度器 ---
 #[instrument(skip_all, name = "run_task")]
-pub async fn run_task(state: AppState) {
+pub async fn run_task(state: AppState) -> anyhow::Result<()> {
     info!("Worker 任务已启动");
 
     // 1. 初始化
@@ -42,29 +42,49 @@ pub async fn run_task(state: AppState) {
     let _ = sender.send(TaskEvent::ProcessingStart);
     info!("已发送 ProcessingStart 事件");
 
-    let file_reader_stream = stream::unfold(
-        (
-            BufReader::new(File::open(&metadata.source_path).unwrap()),
-            1u32,
-        ),
-        move |(mut reader, chunk_id)| async move {
-            let mut buffer = vec![0; CHUNK_SIZE];
-            match reader.read(&mut buffer) {
-                Ok(0) => None,
-                Ok(n) => Some((
-                    ChunkJob {
-                        id: chunk_id,
-                        data: buffer[..n].to_vec(),
-                    },
-                    (reader, chunk_id + 1),
-                )),
+    let expected = ((metadata.source_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as usize;
+    if expected != metadata.total_chunks as usize {
+        warn!(
+            expected = expected,
+            meta_total = metadata.total_chunks,
+            "metadata.total_chunks 与实际计算不一致，将以实际读取为准"
+        );
+    }
+
+    let file = File::open(&metadata.source_path).await?;
+    let reader = BufReader::new(file);
+    let file_reader_stream = stream::unfold((reader, 1u32), |(mut reader, chunk_id)| async move {
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut filled = 0;
+
+        // read 不保证每次都读取 CHUNK_SIZE 字节，因此需要循环读取直到填满或 EOF
+        loop {
+            if filled == CHUNK_SIZE {
+                break;
+            }
+            match reader.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
                 Err(e) => {
                     error!("文件读取失败: {}", e);
-                    None
+                    return None;
                 }
             }
-        },
-    );
+        }
+
+        if filled == 0 {
+            None // EOF 且没有数据 -> 结束
+        } else {
+            buf.truncate(filled);
+            Some((
+                ChunkJob {
+                    id: chunk_id,
+                    data: buf,
+                },
+                (reader, chunk_id + 1),
+            ))
+        }
+    });
 
     // 3. 并发调度与执行，并收集所有结果
     let final_chunk_states: Vec<ChunkState> = file_reader_stream
@@ -93,13 +113,18 @@ pub async fn run_task(state: AppState) {
     if failed_count == 0 && completed_count == metadata.total_chunks as usize {
         info!("任务成功结束");
         let _ = sender.send(TaskEvent::TaskCompleted);
+        Ok(())
     } else {
         let message = format!(
             "任务处理失败。总共 {} 个分块，成功 {} 个，失败 {} 个。",
             metadata.total_chunks, completed_count, failed_count
         );
         error!("{}", message);
-        let _ = sender.send(TaskEvent::Error { message });
+        let _ = sender.send(TaskEvent::Error {
+            message: message.clone(),
+        });
+        bail!(message);
+        // 或者：bail!(message);
     }
 }
 
