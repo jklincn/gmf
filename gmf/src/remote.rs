@@ -17,6 +17,7 @@ include!(concat!(env!("OUT_DIR"), "/gmf-remote.rs"));
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const SSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct RemoteRunner {
     cfg: Config,
@@ -80,18 +81,17 @@ impl RemoteRunner {
 
         let url = format!("{}/start", self.url);
 
-        // --- 1. 设置通道和事件源 ---
-        // 这个通道用于 worker 任务通知主循环它们已完成
+        // --- 设置通道和事件源 ---
         let (worker_done_tx, mut worker_done_rx) =
             mpsc::channel::<Result<u32, (u32, anyhow::Error)>>(128);
 
         let mut event_source =
             EventSource::new(client.get(&url).header("Accept", "text/event-stream"))?;
 
-        // --- 2. 主事件循环 ---
-        let mut pending_tasks = 0; // 正在处理的任务数
-        let mut completed_tasks = HashSet::new(); // 已成功完成的任务ID集合
-        let mut server_task_finished = false; // 服务端是否已发送 TaskCompleted 或 Error
+        // --- 主事件循环 ---
+        let mut pending_tasks = 0;
+        let mut completed_tasks = HashSet::new();
+        let mut server_task_finished = false;
 
         println!("等待服务端事件...");
 
@@ -108,7 +108,7 @@ impl RemoteRunner {
                                 Ok(event) => event,
                                 Err(e) => {
                                     eprintln!("无法解析 SSE 消息: {}, 数据: '{}'", e, message.data);
-                                    continue; // 跳过这个无法解析的消息
+                                    continue;
                                 }
                             };
 
@@ -118,10 +118,8 @@ impl RemoteRunner {
                                 }
                                 TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
                                     println!("分块 {} 已就绪，开始下载和处理...", chunk_id);
+                                    pending_tasks += 1;
 
-                                    pending_tasks += 1; // 增加一个待处理任务
-
-                                    // 派生一个新任务去下载、解密并确认
                                     let task_client = client.clone();
                                     let base_url = self.url.clone();
                                     let tx_clone = worker_done_tx.clone();
@@ -133,8 +131,6 @@ impl RemoteRunner {
                                             chunk_id,
                                             passphrase_b64,
                                         ).await;
-
-                                        // 无论成功失败，都将结果发送回主循环
                                         if let Err(e) = tx_clone.send(result).await {
                                             eprintln!("[Worker {}] 无法将结果发送回主循环: {}", chunk_id, e);
                                         }
@@ -143,31 +139,28 @@ impl RemoteRunner {
                                 TaskEvent::TaskCompleted => {
                                     println!("服务端报告任务已全部完成！等待所有本地任务结束...");
                                     server_task_finished = true;
-                                    event_source.close(); // 服务端任务已结束，可以关闭连接了
+                                    event_source.close();
                                 }
                                 TaskEvent::Error { message } => {
                                     server_task_finished = true;
                                     event_source.close();
-                                    // 返回一个错误，但要先让正在运行的任务有机会完成或超时
-                                    // 这里我们先记录错误，在循环外返回
                                     return Err(anyhow!("服务端错误: {}", message));
                                 }
-                                _ => {} // 忽略其他事件，如 ChunkAcknowledged
+                                _ => {}
                             }
                         }
                         Err(e) => {
-                            // 如果 server_task_finished 为 true，说明是正常关闭，不是错误
                             if !server_task_finished {
                                 return Err(anyhow!("SSE 流错误: {}", e));
                             }
-                            break; // 正常退出循环
+                            break;
                         }
                     }
                 }
 
                 // --- 分支二：处理已完成的 worker 任务 ---
                 Some(result) = worker_done_rx.recv() => {
-                    pending_tasks -= 1; // 无论成功失败，一个任务结束了
+                    pending_tasks -= 1;
                     match result {
                         Ok(chunk_id) => {
                             completed_tasks.insert(chunk_id);
@@ -175,17 +168,22 @@ impl RemoteRunner {
                         }
                         Err((chunk_id, e)) => {
                              eprintln!("处理分块 {} 时发生严重错误: {}", chunk_id, e);
-                             // 决定是否因为单个分块的失败而中止整个任务
-                             // 这里我们选择中止
                              event_source.close();
                              return Err(e.context(format!("分块 {} 处理失败", chunk_id)));
                         }
                     }
                 }
+
+                // --- 3. 新增分支：处理 SSE 超时 ---
+                _ = sleep(SSE_TIMEOUT) => {
+                    if !server_task_finished {
+                        event_source.close();
+                        return Err(anyhow!("SSE 事件流超时：超过 {} 秒未收到新事件", SSE_TIMEOUT.as_secs()));
+                    }
+                }
             }
 
             // --- 检查退出条件 ---
-            // 如果服务端已报告完成，并且所有派生出去的任务也都完成了，那么整个流程结束
             if server_task_finished && pending_tasks == 0 {
                 println!("所有分块已成功下载和确认！");
                 break;

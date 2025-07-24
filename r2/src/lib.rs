@@ -98,68 +98,6 @@ pub fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Res
     Ok(plaintext)
 }
 
-/// 对文件分块并对每个分块进行加密
-pub async fn split_and_encrypt(input_path: impl AsRef<Path>) -> anyhow::Result<Manifest> {
-    let input_path: &Path = input_path.as_ref();
-    let input_file = File::open(input_path)?;
-    let file_size = input_file.metadata()?.len();
-    let mut reader = BufReader::new(input_file);
-
-    let mut buffer = vec![0u8; CHUNK_SIZE];
-    let mut chunk_index = 0;
-    let mut chunks_info = Vec::new();
-
-    // 创建一个临时目录用于存储分块
-    let temp_dir = env::temp_dir();
-    let mut rng = OsRng;
-    let random_id = rng.next_u64();
-    let work_dir_name = format!("gmf-{}", random_id);
-    let work_dir = temp_dir.join(&work_dir_name);
-    fs::create_dir_all(&work_dir)?;
-
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        chunk_index += 1;
-        let current_chunk_data = &buffer[..n];
-
-        // 1. 为分块生成随机加密密钥
-        let key = generate_key();
-        let passphrase_b64 = general_purpose::STANDARD.encode(key);
-
-        // 2. 加密分块
-        let encrypted_data = encrypt_chunk(&key, current_chunk_data)?;
-
-        // 3. 计算哈希和大小
-        let sha256 = format!("{:x}", Sha256::digest(&encrypted_data));
-        let size = encrypted_data.len() as u64;
-
-        // 4. 将加密后的分块写入随机子目录
-        let chunk_basename = format!("gmf.part{}", chunk_index);
-        let chunk_path = work_dir.join(chunk_basename);
-        fs::write(&chunk_path, &encrypted_data)?;
-
-        // 5. 收集分块信息
-        chunks_info.push(ChunkInfo {
-            id: chunk_index,
-            local_path: chunk_path,
-            passphrase_b64,
-            sha256,
-            size,
-        });
-    }
-
-    Ok(Manifest {
-        filename: input_path.to_path_buf(),
-        total_size: file_size,
-        chunk_size: CHUNK_SIZE,
-        total_chunks: chunk_index,
-        chunks: chunks_info,
-    })
-}
-
 /// 对文件解密并合并
 pub fn decrypt_and_merge(manifest: &Manifest, output_path: impl AsRef<Path>) -> anyhow::Result<()> {
     // 使用临时路径以便后续重命名

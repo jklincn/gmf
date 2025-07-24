@@ -21,7 +21,7 @@ pub struct ChunkJob {
 }
 
 // --- 主任务调度器 ---
-#[instrument(skip_all, name = "run_task_worker")]
+#[instrument(skip_all, name = "run_task")]
 pub async fn run_task(state: AppState) {
     info!("Worker 任务已启动");
 
@@ -42,7 +42,6 @@ pub async fn run_task(state: AppState) {
     let _ = sender.send(TaskEvent::ProcessingStart);
     info!("已发送 ProcessingStart 事件");
 
-    // 2. 创建流式文件读取器
     let file_reader_stream = stream::unfold(
         (
             BufReader::new(File::open(&metadata.source_path).unwrap()),
@@ -132,7 +131,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     };
 
     // --- 2. 上传 ---
-    if let Err(e) = upload_chunk_simulation(chunk_id, &encrypted_data).await {
+    if let Err(e) = upload_chunk(chunk_id, &encrypted_data).await {
         let reason = format!("上传失败: {}", e);
         error!("{}", reason);
         return ChunkState {
@@ -160,7 +159,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     info!("收到确认");
 
     // --- 5. 删除远程对象 ---
-    if let Err(e) = delete_chunk_simulation(chunk_id).await {
+    if let Err(e) = delete_chunk(chunk_id).await {
         let reason = format!("删除远程对象失败: {}", e);
         error!("{}", reason);
         warn!("未能清理远程对象: {}", chunk_id);
@@ -201,13 +200,18 @@ async fn wait_for_acknowledgement(
     .await
 }
 
-// 模拟函数
-async fn upload_chunk_simulation(_chunk_id: u32, _data: &[u8]) -> Result<()> {
-    sleep(Duration::from_secs(3)).await;
+async fn upload_chunk(chunk_id: u32, data: &[u8]) -> Result<()> {
+    // loop {}
+    // let chunk_id = chunk_id.to_string();
+    // let client = r2::get_client(None).await?;
+    // r2::upload_object(&client, data, &chunk_id).await?;
     Ok(())
 }
 
-async fn delete_chunk_simulation(_chunk_id: u32) -> Result<()> {
-    sleep(Duration::from_secs(2)).await;
+async fn delete_chunk(chunk_id: u32) -> Result<()> {
+    // loop {}
+    // let chunk_id = chunk_id.to_string();
+    // let client = r2::get_client(None).await?;
+    // r2::remove_object(&client, &chunk_id).await?;
     Ok(())
 }
