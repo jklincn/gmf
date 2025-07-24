@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use r2::{Manifest, TaskEvent};
 use reqwest::{Client, StatusCode};
@@ -32,40 +32,44 @@ impl RemoteRunner {
         struct Payload {
             path: String,
         }
+
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
-            .build()?;
+            .build()
+            .context("创建 reqwest 客户端失败")?;
 
         let payload = Payload {
             path: file_path.to_string(),
         };
         let url = format!("{}/setup", self.url);
+
         let response = client
             .post(&url)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| anyhow!("请求发送失败: {}", e))?;
+            .context("发送 setup 请求失败")?;
+
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<无法读取响应体>".to_string());
-        match status {
-            StatusCode::OK => {
-                println!("{}", body);
-                Ok(body)
+
+        let body = response.text().await.context("读取响应体失败")?;
+
+        if status != StatusCode::OK {
+            match status {
+                StatusCode::BAD_REQUEST => {
+                    bail!("远程文件查找失败 (请求错误 400): {}", body);
+                }
+                StatusCode::INTERNAL_SERVER_ERROR => {
+                    bail!("远程服务器处理失败 (错误 500): {}", body);
+                }
+                _ => {
+                    bail!("远程请求失败，状态码: {}, 响应: {}", status, body);
+                }
             }
-            StatusCode::BAD_REQUEST => Err(anyhow!("远程文件查找失败（请求错误 400）: {}", body)),
-            StatusCode::INTERNAL_SERVER_ERROR => {
-                Err(anyhow!("远程文件查找失败（服务器错误 500）: {}", body))
-            }
-            _ => Err(anyhow!(
-                "远程文件查找失败（状态 {}）: {}",
-                status.as_u16(),
-                body
-            )),
         }
+        // 这会打印文件信息
+        println!("{}", body);
+        Ok(body)
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -185,28 +189,29 @@ impl RemoteRunner {
         self.forward_child
             .kill()
             .await
-            .context("无法关闭远端 gmf-remote")?;
+            .context("无法关闭 ssh 端口转发进程")?;
 
-        use std::process::Command;
         let cfg = &self.cfg;
-        let cmd = Command::new("ssh")
+        let output = Command::new("ssh")
             .arg("-T")
             .arg("-p")
             .arg(cfg.port.to_string())
             .args(private_key_args(cfg))
             .arg(format!("{}@{}", cfg.user, cfg.host))
             .arg(format!("kill {}", self.pid))
-            .status();
-        match cmd {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                eprintln!("⚠️ 远端杀 gmf-remote 返回非零状态: {}", status);
-            }
-            Err(err) => {
-                eprintln!("❌ 无法执行远端 pkill: {}", err);
-            }
+            .output()
+            .await
+            .context("执行远程 kill 命令失败")?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "远程 kill 命令返回非零状态 ({}): {}",
+                output.status,
+                stderr.trim()
+            )
         }
-        Ok(())
     }
 }
 
@@ -309,12 +314,9 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
     println!("远程服务器连接成功");
 
-    for cmd in &["pkill", "sha256sum", "cut", "gunzip"] {
+    for cmd in &["sha256sum", "cut", "gunzip"] {
         ensure_cmd_exists(cfg, cmd).await?;
     }
-
-    // To be improved
-    ssh_once(cfg, "pkill -x gmf-remote || true").await?;
 
     let sha = ssh_once(
         cfg,
@@ -348,6 +350,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
             new_sha.trim()
         ))
     } else {
+        println!("gmf-remote 安装成功");
         Ok(())
     }
 }

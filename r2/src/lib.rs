@@ -1,5 +1,6 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::{Context, Result, bail};
 use aws_sdk_s3 as s3;
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
@@ -239,35 +240,38 @@ pub async fn get_config<'a>(
     Ok(client)
 }
 
-pub async fn create_bucket(client: &s3::Client) -> anyhow::Result<()> {
+pub async fn create_bucket(client: &s3::Client) -> Result<()> {
     client
         .create_bucket()
         .bucket(BUCKETNAME)
         .create_bucket_configuration(s3::types::CreateBucketConfiguration::builder().build())
         .send()
-        .await?;
+        .await
+        .context(format!("向 S3 发送创建 Bucket '{}' 的请求失败", BUCKETNAME))?;
 
     let mut buckets = client.list_buckets().into_paginator().send();
-    while let Some(Ok(output)) = buckets.next().await {
+
+    while let Some(page) = buckets.next().await {
+        let output = page.context("从 S3 获取 Bucket 列表页面失败")?;
         for bucket in output.buckets() {
             if bucket.name.as_deref() == Some(BUCKETNAME) {
-                println!("Bucket 创建成功");
                 return Ok(());
             }
         }
     }
-    Err(anyhow::anyhow!("Bucket 创建失败"))
+
+    bail!("Bucket '{}' 创建后验证失败，未在列表中找到。", BUCKETNAME);
 }
 
-pub async fn delete_bucket<'a>(client: &s3::Client) -> anyhow::Result<()> {
-    let resp = client.delete_bucket().bucket(BUCKETNAME).send().await;
-    match resp {
-        Ok(_) => {
-            println!("Bucket 删除成功");
-            Ok(())
-        }
-        Err(err) => Err(anyhow::anyhow!("删除 Bucket 失败: {}", err)),
-    }
+pub async fn delete_bucket(client: &s3::Client) -> Result<()> {
+    client
+        .delete_bucket()
+        .bucket(BUCKETNAME)
+        .send()
+        .await
+        .context(format!("删除 Bucket '{}' 失败", BUCKETNAME))?;
+
+    Ok(())
 }
 
 // 把 ManifestFile 中的所有分块上传到指定 bucket/前缀
