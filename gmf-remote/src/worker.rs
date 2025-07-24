@@ -1,212 +1,213 @@
-use crate::state::{AppState, ChunkState, ChunkStatus};
+use crate::state::{AppState, ChunkProcessingStatus, ChunkState};
 use anyhow::Result;
+use base64::Engine;
+use base64::engine::general_purpose;
 use futures::stream::{self, StreamExt};
-use r2::TaskEvent;
-use std::path::PathBuf;
+use r2::{self, CHUNK_SIZE, TaskEvent};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
 
-const CONCURRENCY: usize = 2;
+// --- 配置常量 ---
+const CONCURRENCY: usize = 4; // 并发worker数量
 
-pub async fn run_task(state: AppState, path: PathBuf) {
-    info!("开始执行任务");
-    let sender = {
-        let context = state.0.lock().expect("Mutex should not be poisoned here");
-        context.event_sender.clone()
+// --- 作业定义 ---
+pub struct ChunkJob {
+    pub id: u32,
+    pub data: Vec<u8>,
+}
+
+// --- 主任务调度器 ---
+#[instrument(skip_all, name = "run_task_worker")]
+pub async fn run_task(state: AppState) {
+    info!("Worker 任务已启动");
+
+    // 1. 初始化
+    let (metadata, sender) = {
+        let context = state.0.lock().unwrap();
+        let metadata = context
+            .metadata
+            .clone()
+            .expect("Metadata should be set by setup");
+        let sender = context
+            .event_sender
+            .clone()
+            .expect("Sender should be set by start");
+        (metadata, sender)
     };
 
-    let sender = sender.unwrap();
-
-    // 给客户端发送开始执行
     let _ = sender.send(TaskEvent::ProcessingStart);
+    info!("已发送 ProcessingStart 事件");
 
-    info!("开始分块和加密");
-    let manifest = match r2::split_and_encrypt(&path).await {
-        Ok(m) => {
-            info!(total_chunks = m.total_chunks, "分块和加密完成");
-            m
-        }
-        Err(e) => {
-            error!(error = %e, "分块或加密失败");
-            let _ = sender.send(TaskEvent::Error {
-                message: e.to_string(),
-            });
-            return;
-        }
-    };
+    // 2. 创建流式文件读取器
+    let file_reader_stream = stream::unfold(
+        (
+            BufReader::new(File::open(&metadata.source_path).unwrap()),
+            1u32,
+        ),
+        move |(mut reader, chunk_id)| async move {
+            let mut buffer = vec![0; CHUNK_SIZE];
+            match reader.read(&mut buffer) {
+                Ok(0) => None,
+                Ok(n) => Some((
+                    ChunkJob {
+                        id: chunk_id,
+                        data: buffer[..n].to_vec(),
+                    },
+                    (reader, chunk_id + 1),
+                )),
+                Err(e) => {
+                    error!("文件读取失败: {}", e);
+                    None
+                }
+            }
+        },
+    );
 
-    // 保存分块信息到上下文中
-    {
-        let mut context = state.0.lock().unwrap();
-        for chunk_info in &manifest.chunks {
-            context.chunks.insert(
-                chunk_info.id,
-                ChunkState {
-                    info: chunk_info.clone(),
-                    status: ChunkStatus::Pending,
-                    remote_path: None,
-                },
-            );
-        }
-    }
-
-    // 给客户端发送分块完成
-    let _ = sender.send(TaskEvent::SplitComplete {
-        manifest: manifest.clone(),
-    });
-
-    // 设置并发
-    let chunk_ids_stream = stream::iter(manifest.chunks.into_iter().map(|c| c.id));
-
-    // 使用 map 将每个任务转换成一个 future，然后用 buffer_unordered 并发执行
-    let results: Vec<Result<()>> = chunk_ids_stream
-        .map(|chunk_id| {
-            let task_state = state.clone();
-            process_single_chunk(task_state, chunk_id)
-        })
-        .buffer_unordered(CONCURRENCY) // <-- 以指定并发数执行这些 future
-        .collect() // <-- 收集所有 future 的结果
+    // 3. 并发调度与执行，并收集所有结果
+    let final_chunk_states: Vec<ChunkState> = file_reader_stream
+        .map(|job| process_single_chunk(state.clone(), job))
+        .buffer_unordered(CONCURRENCY)
+        .collect()
         .await;
 
-    // --- 关键的状态检查逻辑 ---
-    let mut successful_chunks = 0;
-    for result in results {
-        if result.is_ok() {
-            successful_chunks += 1;
+    // 4. 最终状态检查：基于收集到的结果
+    let mut completed_count = 0;
+    let mut failed_count = 0;
+    for chunk_state in &final_chunk_states {
+        match chunk_state.status {
+            ChunkProcessingStatus::Completed => completed_count += 1,
+            ChunkProcessingStatus::Failed { .. } => failed_count += 1,
         }
     }
 
     info!(
-        total = manifest.total_chunks,
-        successful = successful_chunks,
+        total = metadata.total_chunks,
+        completed = completed_count,
+        failed = failed_count,
         "所有分块处理完毕"
     );
 
-    // 最终检查
-    if successful_chunks == manifest.total_chunks as usize {
+    if failed_count == 0 && completed_count == metadata.total_chunks as usize {
         info!("任务成功结束");
-        // 给客户端发送执行完成
         let _ = sender.send(TaskEvent::TaskCompleted);
     } else {
-        let failed_count = manifest.total_chunks as usize - successful_chunks;
-        error!("任务失败，有 {} 个分块未能成功处理", failed_count);
-        let _ = sender.send(TaskEvent::Error {
-            message: format!("任务处理失败，{} 个分块出错", failed_count),
-        });
+        let message = format!(
+            "任务处理失败。总共 {} 个分块，成功 {} 个，失败 {} 个。",
+            metadata.total_chunks, completed_count, failed_count
+        );
+        error!("{}", message);
+        let _ = sender.send(TaskEvent::Error { message });
     }
 }
 
-// 辅助函数，模拟可能失败的上传
-async fn upload_chunk_simulation(chunk_id: u32) -> Result<String> {
-    sleep(Duration::from_secs(2)).await;
-    Ok(format!("/remote/path/for/chunk/{}", chunk_id))
-}
-
-// 使用 #[instrument] 来追踪单个分块的处理过程
-#[instrument(skip(state), fields(chunk_id = chunk_id))]
-async fn process_single_chunk(state: AppState, chunk_id: u32) -> Result<()> {
+// --- 单个分块处理器 (Worker) ---
+// 函数签名现在返回一个 ChunkState
+#[instrument(skip(state, job), fields(chunk_id = job.id))]
+async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
+    let chunk_id = job.id;
     info!("开始处理分块");
 
     let sender = {
-        let context = state.0.lock().expect("Mutex should not be poisoned here");
-        context.event_sender.clone()
+        let context = state.0.lock().unwrap();
+        context.event_sender.clone().expect("Sender must exist")
     };
 
-    let sender = sender.unwrap();
-
-    let mut ack_receiver = sender.subscribe();
-
-    // todo: 上传
-    info!("正在上传分块");
-    let remote_path = match upload_chunk_simulation(chunk_id).await {
-        Ok(path) => {
-            info!("模拟上传完成");
-            path
-        }
+    // --- 1. 加密 ---
+    let key = r2::generate_key();
+    let passphrase_b64 = general_purpose::STANDARD.encode(&key);
+    let encrypted_data = match r2::encrypt_chunk(&key, &job.data) {
+        Ok(data) => data,
         Err(e) => {
-            error!(error = %e, "上传失败");
-            if let Ok(mut context) = state.0.lock() {
-                if let Some(chunk) = context.chunks.get_mut(&chunk_id) {
-                    chunk.status = ChunkStatus::Failed("上传失败".to_string());
-                }
-            }
-            return Err(e.context("上传失败"));
+            let reason = format!("加密失败: {}", e);
+            error!("{}", reason);
+            return ChunkState {
+                id: chunk_id,
+                status: ChunkProcessingStatus::Failed { reason },
+            };
         }
     };
 
-    // 更新状态
-    if let Ok(mut context) = state.0.lock() {
-        if let Some(chunk) = context.chunks.get_mut(&chunk_id) {
-            chunk.status = ChunkStatus::ReadyForDownload;
-            chunk.remote_path = Some(remote_path.clone());
-        }
+    // --- 2. 上传 ---
+    if let Err(e) = upload_chunk_simulation(chunk_id, &encrypted_data).await {
+        let reason = format!("上传失败: {}", e);
+        error!("{}", reason);
+        return ChunkState {
+            id: chunk_id,
+            status: ChunkProcessingStatus::Failed { reason },
+        };
     }
+    info!("上传完成");
+
+    // --- 3. 发送就绪事件给客户端 ---
     let _ = sender.send(TaskEvent::ChunkReadyForDownload {
         chunk_id,
-        remote_path,
+        passphrase_b64,
     });
 
-    // 等待确认
-    info!("等待客户端确认");
-    match tokio::time::timeout(Duration::from_secs(60), async {
-        // <-- 加入60秒超时
+    // --- 4. 等待客户端确认 ---
+    if wait_for_acknowledgement(&sender, chunk_id).await.is_err() {
+        let reason = "等待客户端确认超时".to_string();
+        error!("{}", reason);
+        return ChunkState {
+            id: chunk_id,
+            status: ChunkProcessingStatus::Failed { reason },
+        };
+    }
+    info!("收到确认");
+
+    // --- 5. 删除远程对象 ---
+    if let Err(e) = delete_chunk_simulation(chunk_id).await {
+        let reason = format!("删除远程对象失败: {}", e);
+        error!("{}", reason);
+        warn!("未能清理远程对象: {}", chunk_id);
+        return ChunkState {
+            id: chunk_id,
+            status: ChunkProcessingStatus::Failed { reason },
+        };
+    }
+    info!("远程对象删除成功");
+
+    // --- 6. 成功完成 ---
+    info!("分块处理完成");
+    ChunkState {
+        id: chunk_id,
+        status: ChunkProcessingStatus::Completed,
+    }
+}
+
+// --- 辅助函数 ---
+
+/// 等待特定分块的确认消息
+async fn wait_for_acknowledgement(
+    sender: &broadcast::Sender<TaskEvent>,
+    chunk_id: u32,
+) -> Result<(), tokio::time::error::Elapsed> {
+    let mut ack_receiver = sender.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match ack_receiver.recv().await {
-                Ok(TaskEvent::ChunkAcknowledged { chunk_id: ack_id }) if ack_id == chunk_id => {
-                    info!("收到确认");
+            // 忽略接收错误，只关心是否收到正确的 ack
+            if let Ok(TaskEvent::ChunkAcknowledged { chunk_id: ack_id }) = ack_receiver.recv().await
+            {
+                if ack_id == chunk_id {
                     break;
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(error = ?e, "等待确认时接收事件失败");
-                    // 这里可以认为是一个可恢复的错误，或者直接返回错误
-                    return Err(anyhow::anyhow!("接收事件通道关闭"));
-                }
             }
         }
-        Ok(())
     })
     .await
-    {
-        Ok(Ok(_)) => { /* 成功 */ }
-        Ok(Err(e)) => return Err(e), // ack_receiver 内部错误
-        Err(_) => {
-            // 超时错误
-            error!("等待客户端确认超时");
-            if let Ok(mut context) = state.0.lock() {
-                if let Some(chunk) = context.chunks.get_mut(&chunk_id) {
-                    chunk.status = ChunkStatus::Failed("等待客户端确认超时".to_string());
-                }
-            }
-            return Err(anyhow::anyhow!("等待客户端确认超时"));
-        }
-    }
+}
 
-    // 删除
-    let local_path = if let Ok(context) = state.0.lock() {
-        context
-            .chunks
-            .get(&chunk_id)
-            .map(|c| c.info.local_path.clone())
-    } else {
-        None
-    };
+// 模拟函数
+async fn upload_chunk_simulation(_chunk_id: u32, _data: &[u8]) -> Result<()> {
+    sleep(Duration::from_secs(3)).await;
+    Ok(())
+}
 
-    if let Some(path) = local_path {
-        info!(path = ?path, "模拟删除本地和远程文件");
-        // todo: 删除本地与远程
-        sleep(Duration::from_secs(5)).await;
-    } else {
-        warn!("未能在状态中找到本地路径进行删除");
-    }
-
-    // 更新最终状态
-    if let Ok(mut context) = state.0.lock() {
-        if let Some(chunk) = context.chunks.get_mut(&chunk_id) {
-            chunk.status = ChunkStatus::Completed;
-        }
-    }
-    info!("分块处理完成");
+async fn delete_chunk_simulation(_chunk_id: u32) -> Result<()> {
+    sleep(Duration::from_secs(2)).await;
     Ok(())
 }

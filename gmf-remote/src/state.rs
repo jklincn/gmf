@@ -1,41 +1,44 @@
+use r2::TaskEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-use r2::{ChunkInfo, TaskEvent};
-
-// --- 状态枚举 ---
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum ChunkStatus {
-    Pending,          // 待处理
-    Uploading,        // 正在上传
-    ReadyForDownload, // 已就绪，等待客户端下载
-    Acknowledged,     // 客户端已确认收到
-    Deleting,         // 正在删除
-    Completed,        // 已完成
-    Failed(String),   // 失败
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum ChunkProcessingStatus {
+    Completed,                 // 成功完成所有步骤
+    Failed { reason: String }, // 在某个步骤失败
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+// ChunkState 现在只记录最终结果
+#[derive(Debug, Clone, Serialize)]
 pub struct ChunkState {
-    pub info: ChunkInfo,
-    pub status: ChunkStatus,
-    pub remote_path: Option<String>,
+    pub id: u32,
+    pub status: ChunkProcessingStatus,
 }
 
+/// 存储任务的静态元数据，这些信息在任务开始后不会改变。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskMetadata {
+    pub source_path: PathBuf,
+    pub source_filename: String,
+    pub source_size: u64,
+    pub total_chunks: u32,
+}
+
+/// 整个任务的上下文，包含所有状态和通信渠道。
 #[derive(Debug)]
 pub struct TaskContext {
-    pub path: Option<PathBuf>,
+    pub metadata: Option<TaskMetadata>,
     pub chunks: HashMap<u32, ChunkState>,
     pub event_sender: Option<broadcast::Sender<TaskEvent>>,
 }
 
-impl Default for TaskContext {
-    fn default() -> Self {
+impl TaskContext {
+    pub fn new() -> Self {
         Self {
-            path: None,
+            metadata: None,
             chunks: HashMap::new(),
             event_sender: None,
         }
@@ -47,6 +50,6 @@ pub struct AppState(pub Arc<Mutex<TaskContext>>);
 
 impl AppState {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(TaskContext::default())))
+        Self(Arc::new(Mutex::new(TaskContext::new())))
     }
 }

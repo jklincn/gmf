@@ -1,7 +1,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use r2::{Manifest, TaskEvent};
+use r2::TaskEvent;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Event, EventSource};
 use std::collections::HashSet;
@@ -23,7 +23,6 @@ pub struct RemoteRunner {
     pid: u32,
     url: String,
     forward_child: tokio::process::Child,
-    manifest_file: Option<Manifest>,
 }
 
 impl RemoteRunner {
@@ -81,108 +80,118 @@ impl RemoteRunner {
 
         let url = format!("{}/start", self.url);
 
-        // 创建一个通道，用于下载任务通知主循环它们已完成（多写单读）
-        let (download_complete_tx, mut download_complete_rx) =
+        // --- 1. 设置通道和事件源 ---
+        // 这个通道用于 worker 任务通知主循环它们已完成
+        let (worker_done_tx, mut worker_done_rx) =
             mpsc::channel::<Result<u32, (u32, anyhow::Error)>>(128);
 
-        // 2. 连接到 SSE 事件源
         let mut event_source =
             EventSource::new(client.get(&url).header("Accept", "text/event-stream"))?;
 
-        // 3. 主事件循环
-        let mut total_chunks = 0;
-        let mut completed_chunks = HashSet::new();
-        let mut server_task_completed = false;
+        // --- 2. 主事件循环 ---
+        let mut pending_tasks = 0; // 正在处理的任务数
+        let mut completed_tasks = HashSet::new(); // 已成功完成的任务ID集合
+        let mut server_task_finished = false; // 服务端是否已发送 TaskCompleted 或 Error
+
+        println!("等待服务端事件...");
 
         loop {
             tokio::select! {
-                // 分支一：监听 SSE 事件
+                // --- 分支一：监听来自服务端的 SSE 事件 ---
                 Some(event) = event_source.next() => {
                     match event {
-                        Ok(Event::Open) => {},
+                        Ok(Event::Open) => {
+                            println!("成功连接到服务端事件流。");
+                        },
                         Ok(Event::Message(message)) => {
-                            let task_event: TaskEvent = serde_json::from_str(&message.data)?;
+                            let task_event: TaskEvent = match serde_json::from_str(&message.data) {
+                                Ok(event) => event,
+                                Err(e) => {
+                                    eprintln!("无法解析 SSE 消息: {}, 数据: '{}'", e, message.data);
+                                    continue; // 跳过这个无法解析的消息
+                                }
+                            };
+
                             match task_event {
                                 TaskEvent::ProcessingStart => {
-                                    println!("服务端开始处理");
+                                    println!("服务端已开始处理任务。");
                                 }
-                                TaskEvent::SplitComplete { manifest } => {
-                                    println!("服务端已完成分块加密。总分块数: {}", manifest.total_chunks);
-                                    total_chunks = manifest.total_chunks;
-                                    self.manifest_file = Some(manifest);
-                                }
-                                TaskEvent::ChunkReadyForDownload { chunk_id, remote_path } => {
-                                    println!("分块 {} 已就绪，准备下载: {}", chunk_id, remote_path);
+                                TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
+                                    println!("分块 {} 已就绪，开始下载和处理...", chunk_id);
 
-                                    // 派生一个新任务去下载并确认
+                                    pending_tasks += 1; // 增加一个待处理任务
+
+                                    // 派生一个新任务去下载、解密并确认
                                     let task_client = client.clone();
-                                    let ack_url = format!("{}/acknowledge/{}", self.url, chunk_id);
-                                    let tx_clone = download_complete_tx.clone();
+                                    let base_url = self.url.clone();
+                                    let tx_clone = worker_done_tx.clone();
 
                                     tokio::spawn(async move {
-                                        // 下载文件
-                                        println!("[下载任务 {}] 开始下载...", chunk_id);
-                                        sleep(Duration::from_secs(3)).await; // 模拟下载延迟
-                                        println!("[下载任务 {}] 下载完成。", chunk_id);
+                                        let result = process_and_acknowledge_chunk(
+                                            task_client,
+                                            base_url,
+                                            chunk_id,
+                                            passphrase_b64,
+                                        ).await;
 
-                                        println!("[下载任务 {}] 发送确认...", chunk_id);
-
-                                        let ack_result = task_client.post(&ack_url).send().await;
-                                         if let Err(e) = ack_result {
-                                            let _ = tx_clone.send(Err((chunk_id, e.into()))).await;
-                                            return;
+                                        // 无论成功失败，都将结果发送回主循环
+                                        if let Err(e) = tx_clone.send(result).await {
+                                            eprintln!("[Worker {}] 无法将结果发送回主循环: {}", chunk_id, e);
                                         }
-                                        println!("[下载任务 {}] 确认成功。", chunk_id);
-
-                                        // 通知主循环此分块已完成
-                                        let _ = tx_clone.send(Ok(chunk_id)).await;
                                     });
                                 }
                                 TaskEvent::TaskCompleted => {
-                                    println!("服务端报告任务已全部完成！");
-                                    server_task_completed = true;
+                                    println!("服务端报告任务已全部完成！等待所有本地任务结束...");
+                                    server_task_finished = true;
+                                    event_source.close(); // 服务端任务已结束，可以关闭连接了
                                 }
                                 TaskEvent::Error { message } => {
+                                    server_task_finished = true;
                                     event_source.close();
+                                    // 返回一个错误，但要先让正在运行的任务有机会完成或超时
+                                    // 这里我们先记录错误，在循环外返回
                                     return Err(anyhow!("服务端错误: {}", message));
                                 }
-                                _ => {}
+                                _ => {} // 忽略其他事件，如 ChunkAcknowledged
                             }
                         }
                         Err(e) => {
-                            return Err(anyhow!("SSE 流错误: {}", e));
+                            // 如果 server_task_finished 为 true，说明是正常关闭，不是错误
+                            if !server_task_finished {
+                                return Err(anyhow!("SSE 流错误: {}", e));
+                            }
+                            break; // 正常退出循环
                         }
                     }
                 }
 
-                // 分支二：处理已完成的下载任务
-                Some(download_result) = download_complete_rx.recv() => {
-                    match download_result {
+                // --- 分支二：处理已完成的 worker 任务 ---
+                Some(result) = worker_done_rx.recv() => {
+                    pending_tasks -= 1; // 无论成功失败，一个任务结束了
+                    match result {
                         Ok(chunk_id) => {
-                            completed_chunks.insert(chunk_id);
-                            println!("进度: {} / {}", completed_chunks.len(), total_chunks);
+                            completed_tasks.insert(chunk_id);
+                            println!("分块 {} 已成功处理和确认。剩余任务: {}", chunk_id, pending_tasks);
                         }
                         Err((chunk_id, e)) => {
-                             eprintln!("处理分块 {} 时发生错误: {}", chunk_id, e);
-                             // todo:重试
+                             eprintln!("处理分块 {} 时发生严重错误: {}", chunk_id, e);
+                             // 决定是否因为单个分块的失败而中止整个任务
+                             // 这里我们选择中止
                              event_source.close();
-                             return Err(e);
+                             return Err(e.context(format!("分块 {} 处理失败", chunk_id)));
                         }
                     }
                 }
             }
 
-            // 检查退出条件
-            if server_task_completed
-                && total_chunks > 0
-                && completed_chunks.len() == total_chunks as usize
-            {
+            // --- 检查退出条件 ---
+            // 如果服务端已报告完成，并且所有派生出去的任务也都完成了，那么整个流程结束
+            if server_task_finished && pending_tasks == 0 {
                 println!("所有分块已成功下载和确认！");
                 break;
             }
         }
 
-        event_source.close();
         Ok(())
     }
 
@@ -217,6 +226,36 @@ impl RemoteRunner {
     }
 }
 
+/// 辅助函数：处理单个分块的完整流程（下载、解密、确认）
+async fn process_and_acknowledge_chunk(
+    client: Client,
+    base_url: String,
+    chunk_id: u32,
+    passphrase_b64: String,
+) -> Result<u32, (u32, anyhow::Error)> {
+    // 模拟下载
+    println!("[Chunk {}] 开始下载...", chunk_id);
+
+    sleep(Duration::from_secs(3)).await; // 模拟下载延迟
+
+    println!("[Chunk {}] 下载完成。", chunk_id);
+
+    // 模拟解密
+    println!("[Chunk {}] 正在使用密码解密...", chunk_id);
+
+    sleep(Duration::from_millis(500)).await;
+    println!("[Chunk {}] 解密完成。", chunk_id);
+
+    // 发送确认
+    println!("[Chunk {}] 发送确认...", chunk_id);
+    let ack_url = format!("{}/acknowledge/{}", base_url, chunk_id);
+    if let Err(e) = client.post(&ack_url).send().await {
+        return Err((chunk_id, anyhow::Error::new(e).context("发送确认请求失败")));
+    }
+    println!("[Chunk {}] 确认成功。", chunk_id);
+
+    Ok(chunk_id)
+}
 // 启动远端并返回 Runner
 pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     ensure_remote(cfg).await?;
@@ -295,7 +334,6 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         pid,
         url,
         forward_child,
-        manifest_file: None,
     })
 }
 

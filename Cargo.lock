@@ -1406,6 +1406,7 @@ dependencies = [
  "async-stream",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "futures",
  "futures-util",
  "r2",

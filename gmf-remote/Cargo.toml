@@ -30,3 +30,4 @@ tracing-subscriber = { version = "0.3.19", features = [
 ] }
 time = { version = "0.3.41", features = ["formatting", "macros"] }
 futures = "0.3.31"
+base64 = "0.22.1"

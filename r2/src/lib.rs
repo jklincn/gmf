@@ -12,7 +12,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 const NONCE_SIZE: usize = 12;
-const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+pub const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
 const BUCKETNAME: &str = "gmf";
 
 /// 分块信息结构体
@@ -35,25 +35,31 @@ pub struct Manifest {
     pub chunks: Vec<ChunkInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum TaskEvent {
     ProcessingStart,
-    SplitComplete { manifest: Manifest },
-    ChunkReadyForDownload { chunk_id: u32, remote_path: String },
-    ChunkAcknowledged { chunk_id: u32 },
+    ChunkReadyForDownload {
+        chunk_id: u32,
+        passphrase_b64: String,
+    },
+    ChunkAcknowledged {
+        chunk_id: u32,
+    },
     TaskCompleted,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
-fn generate_key() -> [u8; 32] {
+pub fn generate_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
     key
 }
 
 // === 加密文件 ===
-fn encrypt_chunk(key_bytes: &[u8; 32], input_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn encrypt_chunk(key_bytes: &[u8; 32], input_data: &[u8]) -> anyhow::Result<Vec<u8>> {
     // 生成随机 nonce（每个文件都唯一）
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -75,7 +81,7 @@ fn encrypt_chunk(key_bytes: &[u8; 32], input_data: &[u8]) -> anyhow::Result<Vec<
 }
 
 // === 解密文件 ===
-fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if encrypted_data.len() < NONCE_SIZE {
         anyhow::bail!("输入文件太短，无法包含有效 nonce");
     }
