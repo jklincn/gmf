@@ -215,7 +215,7 @@ pub fn decrypt_and_merge(manifest: &Manifest, output_path: impl AsRef<Path>) -> 
     Ok(())
 }
 
-pub async fn get_config<'a>(
+pub async fn get_client<'a>(
     cfg: Option<(&'a str, &'a str, &'a str)>,
 ) -> anyhow::Result<s3::Client> {
     let endpoint;
@@ -289,7 +289,16 @@ pub async fn upload_object(client: &s3::Client, data: &[u8], key: &str) -> Resul
         .key(key)
         .body(body)
         .send()
-        .await
-        .context(format!("上传内存数据到 S3 对象 '{}' 失败", key))?;
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_object(client: &s3::Client, key: &str) -> Result<()> {
+    client
+        .delete_object()
+        .bucket(BUCKETNAME)
+        .key(key)
+        .send()
+        .await?;
     Ok(())
 }

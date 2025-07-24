@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let config = config::load_or_create_config()?;
 
     let mut remote = start_remote(&config).await?;
-    let s3_config = r2::get_config(Some((
+    let s3_client = r2::get_client(Some((
         config.endpoint.as_ref(),
         config.access_key_id.as_ref(),
         config.secret_access_key.as_ref(),
@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     .await?;
 
     // 创建 Bucket
-    r2::create_bucket(&s3_config).await?;
+    r2::create_bucket(&s3_client).await?;
 
     // 主逻辑
     let logic_result: Result<()> = async {
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     }
 
     // 清理 Bucket
-    if let Err(e) = r2::delete_bucket(&s3_config).await {
+    if let Err(e) = r2::delete_bucket(&s3_client).await {
         eprintln!("删除 Bucket 时发生错误: {}", e);
     }
 
