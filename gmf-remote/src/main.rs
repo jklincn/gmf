@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(handler::healthy))
         .route("/setup", post(handler::setup))
-        .route("/start", get(handler::start))
+        .route("/start", post(handler::start))
         .with_state(app_state)
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());

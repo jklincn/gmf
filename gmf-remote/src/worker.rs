@@ -10,7 +10,7 @@ use gmf_common::NONCE_SIZE;
 use gmf_common::TaskEvent;
 use std::time::Instant;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tracing::{error, info, instrument};
 
 // --- 配置常量 ---
@@ -22,8 +22,8 @@ pub struct ChunkJob {
 }
 
 // --- 主任务调度器 ---
-#[instrument(skip_all, name = "run_task")]
-pub async fn run_task(state: AppState) -> anyhow::Result<()> {
+#[instrument(skip_all, name = "run_task", fields(resume_from = resume_from_chunk_id))]
+pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Result<()> {
     info!("Worker 任务已启动");
 
     // 1. 初始化
@@ -44,40 +44,55 @@ pub async fn run_task(state: AppState) -> anyhow::Result<()> {
     let _ = sender.send(TaskEvent::ProcessingStart);
     info!("已发送 ProcessingStart 事件");
 
-    let file = File::open(&metadata.source_path).await?;
-    let reader = BufReader::new(file);
-    let file_reader_stream = stream::unfold((reader, 1u32), |(mut reader, chunk_id)| async move {
-        let mut buf = vec![0u8; chunk_size];
-        let mut filled = 0;
+    // 处理断点续传的 seek 逻辑 ---
+    let mut file = File::open(&metadata.source_path).await?;
+    if resume_from_chunk_id > 1 {
+        // chunk_id 是 1-based, seek offset 是 0-based.
+        // 如果从第 6 块开始，需要跳过前 5 块。
+        let offset = (resume_from_chunk_id as u64 - 1) * chunk_size as u64;
+        info!(
+            "恢复任务，从分块 {} 开始，跳过文件前 {} 字节",
+            resume_from_chunk_id, offset
+        );
+        file.seek(tokio::io::SeekFrom::Start(offset)).await?;
+    }
 
-        // read 不保证每次都读取 CHUNK_SIZE 字节，因此需要循环读取直到填满或 EOF
-        loop {
-            if filled == chunk_size {
-                break;
-            }
-            match reader.read(&mut buf[filled..]).await {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => {
-                    error!("文件读取失败: {}", e);
-                    return None;
+    let reader = BufReader::new(file);
+    let file_reader_stream = stream::unfold(
+        (reader, resume_from_chunk_id),
+        |(mut reader, chunk_id)| async move {
+            let mut buf = vec![0u8; chunk_size];
+            let mut filled = 0;
+
+            // read 不保证每次都读取 CHUNK_SIZE 字节，因此需要循环读取直到填满或 EOF
+            loop {
+                if filled == chunk_size {
+                    break;
+                }
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        error!("文件读取失败: {}", e);
+                        return None;
+                    }
                 }
             }
-        }
 
-        if filled == 0 {
-            None // EOF 且没有数据 -> 结束
-        } else {
-            buf.truncate(filled);
-            Some((
-                ChunkJob {
-                    id: chunk_id,
-                    data: buf,
-                },
-                (reader, chunk_id + 1),
-            ))
-        }
-    });
+            if filled == 0 {
+                None // EOF 且没有数据 -> 结束
+            } else {
+                buf.truncate(filled);
+                Some((
+                    ChunkJob {
+                        id: chunk_id,
+                        data: buf,
+                    },
+                    (reader, chunk_id + 1),
+                ))
+            }
+        },
+    );
 
     // 3. 并发调度与执行，并收集所有结果
     let final_chunk_states: Vec<ChunkState> = file_reader_stream
@@ -96,21 +111,26 @@ pub async fn run_task(state: AppState) -> anyhow::Result<()> {
         }
     }
 
+    // 计算本次任务预期应该处理多少个分块
+    let expected_chunks_to_process = metadata
+        .total_chunks
+        .saturating_sub(resume_from_chunk_id - 1);
+
     info!(
-        total = metadata.total_chunks,
+        total_in_this_run = expected_chunks_to_process,
         completed = completed_count,
         failed = failed_count,
         "所有分块处理完毕"
     );
 
-    if failed_count == 0 && completed_count == metadata.total_chunks as usize {
+    if failed_count == 0 && completed_count as u32 == expected_chunks_to_process {
         info!("任务成功结束");
         let _ = sender.send(TaskEvent::TaskCompleted);
         Ok(())
     } else {
         let message = format!(
-            "任务处理失败。总共 {} 个分块，成功 {} 个，失败 {} 个。",
-            metadata.total_chunks, completed_count, failed_count
+            "任务处理失败。本次运行应处理 {} 个分块，成功 {} 个，失败 {} 个。",
+            expected_chunks_to_process, completed_count, failed_count
         );
         error!("{}", message);
         let _ = sender.send(TaskEvent::Error {

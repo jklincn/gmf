@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -33,6 +33,22 @@ impl Header {
         buf[20..24].copy_from_slice(&self.written_count.to_le_bytes());
         buf
     }
+
+    /// 从字节数组创建 Header
+    fn from_bytes(bytes: [u8; HEADER_SIZE as usize]) -> Self {
+        let mut magic = [0u8; 13];
+        magic.copy_from_slice(&bytes[..13]);
+
+        let chunk_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let written_count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+
+        Self {
+            magic,
+            _padding: [0; 3],
+            chunk_count,
+            written_count,
+        }
+    }
 }
 
 pub struct GMFFile {
@@ -49,18 +65,93 @@ impl GMFFile {
         source_size: u64,
         source_sha256: &str,
         chunk_count: u32,
-    ) -> Result<Self> {
-        // 返回 anyhow::Result
-        let gmf_filename = format!(".{source_sha256}.gmf");
-        println!("创建临时文件: {gmf_filename}");
+    ) -> Result<(Self, u32)> {
+        let gmf_filename = PathBuf::from(format!(".{source_sha256}.gmf"));
 
-        Self::create(
+        if gmf_filename.exists() {
+            match Self::open_and_validate(
+                &gmf_filename,
+                chunk_count,
+                source_filename,
+                source_size,
+                source_sha256,
+            ) {
+                Ok(gmf_file) => {
+                    let completed_chunks = gmf_file.header.written_count;
+                    println!(
+                        "检测到未完成的下载任务，从第 {}/{} 个分块继续。",
+                        completed_chunks, gmf_file.header.chunk_count
+                    );
+                    return Ok((gmf_file, completed_chunks));
+                }
+                Err(e) => {
+                    println!("警告：发现旧的临时文件，但验证失败：{}。将重新创建。", e);
+                    fs::remove_file(&gmf_filename).context("删除无效的临时文件失败")?;
+                }
+            }
+        }
+
+        // 如果文件不存在或验证失败，则创建新文件
+        let gmf_file = Self::create(
             &gmf_filename,
             chunk_count,
             source_filename,
             source_size,
             source_sha256,
-        )
+        )?;
+        Ok((gmf_file, 0)) // 新文件，已完成 0 个
+    }
+
+    // --- 新增: 打开并验证现有文件 ---
+    fn open_and_validate<P: AsRef<Path>>(
+        path: P,
+        expected_chunk_count: u32,
+        source_filename: &str,
+        source_size: u64,
+        source_sha256: &str,
+    ) -> Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.as_ref())
+            .context("打开现有 GMF 临时文件失败")?;
+
+        let mut header_bytes = [0u8; HEADER_SIZE as usize];
+        file.read_exact(&mut header_bytes)
+            .context("读取 GMF 文件头失败")?;
+
+        let header = Header::from_bytes(header_bytes);
+
+        // 验证1: Magic Number
+        if &header.magic != MAGIC {
+            bail!("文件格式不正确 (magic number 错误)");
+        }
+
+        // 验证2: 分块总数
+        if header.chunk_count != expected_chunk_count {
+            bail!(
+                "分块总数不匹配 (文件记录: {}, 当前任务: {})",
+                header.chunk_count,
+                expected_chunk_count
+            );
+        }
+
+        // 验证3: 已写入分块数是否合理
+        if header.written_count > header.chunk_count {
+            bail!(
+                "文件头数据损坏 (已写入数 {} > 总数 {})",
+                header.written_count,
+                header.chunk_count
+            );
+        }
+
+        Ok(Self {
+            file,
+            header,
+            source_filename: source_filename.to_string(),
+            source_size,
+            source_sha256: source_sha256.to_string(),
+        })
     }
 
     fn create<P: AsRef<Path>>(
@@ -140,11 +231,15 @@ pub struct GmfSession {
 }
 
 impl GmfSession {
-    pub fn new(gmf_file: GMFFile) -> Self {
+    pub fn new(gmf_file: GMFFile, completed_chunks: u32) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
-        let writer_handle = tokio::spawn(run_writer_task(gmf_file_arc.clone(), decrypted_rx));
+        let writer_handle = tokio::spawn(run_writer_task(
+            gmf_file_arc.clone(),
+            decrypted_rx,
+            completed_chunks,
+        ));
 
         Self {
             gmf_file: gmf_file_arc,
@@ -180,7 +275,7 @@ impl GmfSession {
                         .map_err(|e| anyhow!("分块数据解密失败: {:?}", e))
                 })
                 .await
-                .context("解密任务本身发生错误 (例如 panic)")??; // 第一个?处理JoinError, 第二个?处理内部的Result
+                .context("解密任务本身发生错误 (例如 panic)")??;
 
                 delete_object(&chunk_id.to_string())
                     .await
@@ -219,7 +314,6 @@ impl GmfSession {
             Ok(Err(e)) => return Err(e), // 写入器任务内部返回错误
             Err(e) => return Err(anyhow!("写入器任务 panic: {}", e)), // 写入器任务本身 panic
         }
-        println!("写入器任务已完成");
 
         // 3. 获取 GMFFile 的所有权，准备进行最终处理
         // Arc::try_unwrap 确保我们是 Arc 的唯一所有者，如果不是则表示有逻辑错误
@@ -237,16 +331,12 @@ impl GmfSession {
 }
 
 fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
-    println!("开始文件最终化处理...");
     let temp_filename = format!(".{}.gmf", gmf_file.source_sha256);
     let target_filename = gmf_file.source_filename.clone();
 
     // 显式 drop 文件句柄，以便后续可以安全地进行截断和重命名
     drop(gmf_file.file);
 
-    // --- 步骤 1: 移除文件头 ---
-    // 这是一种高效的“原地”移除文件头部的方法，避免将整个文件读入内存
-    println!("正在移除临时文件头...");
     {
         // 使用新的作用域来管理文件句柄
         let mut file = OpenOptions::new()
@@ -261,8 +351,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         }
         let content_size = total_size - HEADER_SIZE;
 
-        // 通过逐块移动数据来覆盖头部
-        let mut buffer = vec![0; 8192]; // 8KB 缓冲区
+        let mut buffer = vec![0; 8192];
         let mut read_pos = HEADER_SIZE;
         let mut write_pos = 0;
         while read_pos < total_size {
@@ -275,16 +364,13 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
             write_pos += bytes_to_read as u64;
         }
 
-        // 截断文件，移除末尾多余的数据
         file.set_len(content_size).context("截断临时文件失败")?;
-    } // file 句柄在此处被 drop
+    }
 
-    // --- 步骤 2: 校验文件 ---
     println!("正在校验最终文件...");
     let mut final_file = File::open(&temp_filename)
         .with_context(|| format!("无法打开最终文件 '{temp_filename}' 进行校验"))?;
 
-    // 2a. 校验文件大小
     let final_size = final_file.metadata()?.len();
     if final_size != gmf_file.source_size {
         bail!(
@@ -293,9 +379,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
             final_size
         );
     }
-    println!("  - 文件大小校验通过 ({final_size} 字节)");
 
-    // 2b. 校验 SHA256
     let mut hasher = Sha256::new();
     std::io::copy(&mut final_file, &mut hasher).context("计算文件 SHA256 哈希值失败")?;
 
@@ -308,10 +392,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
             calculated_sha
         );
     }
-    println!("  - SHA256 校验通过");
 
-    // --- 步骤 3: 重命名文件 ---
-    println!("正在重命名文件到 '{target_filename}'...");
     fs::rename(&temp_filename, &target_filename)
         .with_context(|| format!("重命名文件从 '{temp_filename}' 到 '{target_filename}' 失败"))?;
 
@@ -323,19 +404,24 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
 async fn run_writer_task(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
+    completed_chunks: u32,
 ) -> Result<()> {
     let mut buffer = BTreeMap::new();
-    let mut next_chunk_to_write = 0u32;
+    let mut next_chunk_to_write = completed_chunks;
 
     while let Some(chunk) = decrypted_rx.recv().await {
+        // 如果收到的块是已经写入过的，直接丢弃
+        if chunk.id < next_chunk_to_write {
+            println!("丢弃已处理过的分块 {}", chunk.id);
+            continue;
+        }
+
         buffer.insert(chunk.id, chunk.data);
 
         while let Some(data_to_write) = buffer.remove(&next_chunk_to_write) {
             let mut gmf = gmf_file_arc.lock().await;
             gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
             drop(gmf);
-
-            println!("[Writer] 已成功写入分块 {next_chunk_to_write}。");
             next_chunk_to_write += 1;
         }
     }

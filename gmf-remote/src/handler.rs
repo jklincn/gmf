@@ -10,7 +10,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use gmf_common::{SetupRequestPayload, SetupResponse, TaskEvent};
+use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::{
@@ -147,15 +147,29 @@ pub async fn setup(
     Ok((StatusCode::OK, Json(response_data)))
 }
 
-#[instrument(skip_all, name = "start_task_sse_stream")]
-pub async fn start(State(state): State<AppState>) -> impl IntoResponse {
+#[instrument(skip(state, payload), name = "start_task_sse_stream", fields(resume_from = %payload.resume_from_chunk_id))]
+pub async fn start(
+    State(state): State<AppState>,
+    Json(payload): Json<StartRequestPayload>,
+) -> impl IntoResponse {
     let (tx, mut rx) = broadcast::channel::<TaskEvent>(128);
     {
         let mut context = state.0.lock().unwrap();
+        if context.event_sender.is_some() {
+            warn!("任务已在运行，拒绝了新的 start 请求");
+            let err_event = TaskEvent::Error {
+                message: "Task is already running.".to_string(),
+            };
+            let json_data = serde_json::to_string(&err_event).unwrap();
+            let stream = stream! {
+                yield Ok::<Event, Infallible>(Event::default().data(json_data));
+            };
+            return Sse::new(stream).into_response();
+        }
         context.event_sender = Some(tx.clone());
     }
 
-    tokio::spawn(run_task(state.clone()));
+    tokio::spawn(run_task(state.clone(), payload.resume_from_chunk_id));
 
     let event_stream = stream! {
         loop {

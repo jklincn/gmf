@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::gmf_file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use gmf_common::{SetupRequestPayload, SetupResponse, TaskEvent};
+use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
 use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
 use std::path::Path;
@@ -25,6 +25,7 @@ pub struct RemoteRunner {
     url: String,
     forward_child: tokio::process::Child,
     session: Option<GmfSession>,
+    completed_chunks: u32,
 }
 
 impl RemoteRunner {
@@ -49,17 +50,19 @@ impl RemoteRunner {
             .error_for_status()?;
         let setup_info = response.json::<SetupResponse>().await?;
 
-        println!("成功获取文件元数据: {setup_info:?}");
+        println!("文件名: {}, 大小: {}", setup_info.filename, setup_info.size);
 
-        let gmf_file = GMFFile::new(
+        let (gmf_file, completed_chunks) = GMFFile::new(
             &setup_info.filename,
             setup_info.size,
             &setup_info.sha256,
             setup_info.total_chunks,
         )?;
 
-        // 创建会话，这会自动启动后台的 writer 任务
-        let session = GmfSession::new(gmf_file);
+        // 存储已完成的分块数
+        self.completed_chunks = completed_chunks;
+
+        let session = GmfSession::new(gmf_file, self.completed_chunks);
         self.session = Some(session);
 
         Ok(())
@@ -76,10 +79,25 @@ impl RemoteRunner {
             .danger_accept_invalid_certs(true)
             .build()?;
         let sse_url = format!("{}/start", self.url);
-        let mut event_source =
-            EventSource::new(client.get(&sse_url).header("Accept", "text/event-stream"))?;
+
+        // 服务端 chunk_id 从 1 开始，而我们的 completed_chunks 是 0-based 计数
+        // 如果 completed_chunks 是 5，表示 0,1,2,3,4 已完成，下一个需要的是 5 (对应服务器的 chunk_id 6)
+        // 所以，请求服务器从 completed_chunks + 1 开始发送。
+        let start_payload = StartRequestPayload {
+            resume_from_chunk_id: self.completed_chunks + 1,
+        };
+
+        let mut event_source = EventSource::new(
+            client
+                .post(&sse_url)
+                .header("Accept", "text/event-stream")
+                .json(&start_payload),
+        )?;
 
         println!("等待服务端事件...");
+        if self.completed_chunks > 0 {
+            println!("请求从分块 ID {} 继续传输。", self.completed_chunks + 1);
+        }
 
         let mut worker_handles = Vec::new();
 
@@ -92,7 +110,11 @@ impl RemoteRunner {
                                 .context("解析服务端事件失败")?;
 
                             if let TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } = task_event {
-                                println!("分块 {chunk_id} 已就绪，派发处理任务...");
+                                // 如果这个块已经下载过了，就跳过
+                                // 注意：服务端 chunk_id 是 1-based
+                                if chunk_id <= self.completed_chunks {
+                                    continue;
+                                }
                                 let handle = session.handle_chunk(
                                     chunk_id,
                                     passphrase_b64,
@@ -114,18 +136,18 @@ impl RemoteRunner {
                     }
                 }
                  _ = sleep(SSE_TIMEOUT) => {
-                    if worker_handles.is_empty() {
+                    // 如果已经有完成的分块，并且没有新的 worker 在运行，这可能是正常的，因为我们可能在等待服务器跳过已完成的块
+                    // 只有当一个 worker 都没有启动过，才认为是超时
+                    if worker_handles.is_empty() && self.completed_chunks == 0 {
                         bail!("SSE 事件流超时：超过 {:?} 未收到任何事件", SSE_TIMEOUT);
                     }
                  }
             }
         }
 
-        // --- 收尾阶段 ---
-        println!("等待所有分块处理任务完成...");
         for handle in worker_handles {
             match handle.await? {
-                ChunkResult::Success(id) => println!("Worker {id} 完成下载和解密。"),
+                ChunkResult::Success(_id) => {},
                 ChunkResult::Failure(id, e) => return Err(e.context(format!("Worker {id} 失败"))),
             }
         }
@@ -133,7 +155,6 @@ impl RemoteRunner {
         println!("所有 worker 已完成。现在等待文件写入器完成...");
         session.wait_for_completion().await?;
 
-        println!("所有任务完成！");
         Ok(())
     }
 
@@ -248,6 +269,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         url,
         forward_child,
         session: None,
+        completed_chunks: 0,
     })
 }
 
@@ -260,12 +282,9 @@ async fn ensure_cmd_exists(cfg: &Config, cmd: &str) -> Result<()> {
         .map(|_| ())
 }
 
-//------------------------------------------------------------
-// 内部：文件校验 / 上传
-//------------------------------------------------------------
 async fn ensure_remote(cfg: &Config) -> Result<()> {
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
-    println!("远程服务器连接成功");
+    println!("远程服务器 {} 连接成功", cfg.host);
 
     for cmd in &["sha256sum", "cut", "tar"] {
         ensure_cmd_exists(cfg, cmd).await?;
@@ -317,12 +336,9 @@ fn add_ssh_args<'a>(cmd: &'a mut Command, cfg: &Config) -> &'a mut Command {
 }
 
 fn private_key_args(cfg: &Config) -> Vec<String> {
-    // 判断私钥路径字符串是否为空
     if !cfg.private_key_path.is_empty() {
-        // 如果不为空，则返回包含 "-i" 和路径的 Vec
         vec!["-i".to_string(), cfg.private_key_path.clone()]
     } else {
-        // 如果为空，则返回一个空的 Vec
         Vec::new()
     }
 }
@@ -364,6 +380,6 @@ async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
 async fn pick_free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    drop(listener); // 立即释放，后续 ssh -L 会占用
+    drop(listener);
     Ok(port)
 }
