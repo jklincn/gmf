@@ -2,6 +2,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::path::Path;
 use std::{env, fs, path::PathBuf};
 use tar::Builder;
 
@@ -17,7 +18,7 @@ struct AssetInfo {
 
 /// 处理本地构建的 gmf-remote ELF 文件。
 /// 它会找到 ELF，将其打包成 tar，然后用 Gzip 压缩。
-fn generate_gmf_remote_asset(out_dir: &PathBuf, profile: &str) -> AssetInfo {
+fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
     println!("cargo:rerun-if-changed=crates/gmf-remote"); // 依赖 gmf-remote crate
 
     let workspace_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
@@ -46,7 +47,7 @@ fn generate_gmf_remote_asset(out_dir: &PathBuf, profile: &str) -> AssetInfo {
 
     // 2. 计算原始文件的 SHA256
     let sha256 = Sha256::digest(&original_bytes);
-    let sha256_hex = format!("{:x}", sha256);
+    let sha256_hex = format!("{sha256:x}");
 
     // 3. 将 ELF 打包进 tar 归档
     let mut tar_builder = Builder::new(Vec::new());

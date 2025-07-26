@@ -135,11 +135,11 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     // --- 加密 ---
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
-    let passphrase_b64 = general_purpose::STANDARD.encode(&key);
+    let passphrase_b64 = general_purpose::STANDARD.encode(key);
     let encrypted_data = match encrypt_chunk(&key, &job.data) {
         Ok(data) => data,
         Err(e) => {
-            let reason = format!("加密失败: {}", e);
+            let reason = format!("加密失败: {e}");
             error!("{}", reason);
             return ChunkState {
                 id: chunk_id,
@@ -150,7 +150,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
     // --- 上传 ---
     if let Err(e) = upload_chunk(chunk_id, &encrypted_data).await {
-        let reason = format!("上传失败: {}", e);
+        let reason = format!("上传失败: {e}");
         error!("{}", reason);
         return ChunkState {
             id: chunk_id,

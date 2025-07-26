@@ -49,7 +49,7 @@ impl RemoteRunner {
             .error_for_status()?;
         let setup_info = response.json::<SetupResponse>().await?;
 
-        println!("成功获取文件元数据: {:?}", setup_info);
+        println!("成功获取文件元数据: {setup_info:?}");
 
         let gmf_file = GMFFile::new(
             &setup_info.filename,
@@ -92,7 +92,7 @@ impl RemoteRunner {
                                 .context("解析服务端事件失败")?;
 
                             if let TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } = task_event {
-                                println!("分块 {} 已就绪，派发处理任务...", chunk_id);
+                                println!("分块 {chunk_id} 已就绪，派发处理任务...");
                                 let handle = session.handle_chunk(
                                     chunk_id,
                                     passphrase_b64,
@@ -125,8 +125,8 @@ impl RemoteRunner {
         println!("等待所有分块处理任务完成...");
         for handle in worker_handles {
             match handle.await? {
-                ChunkResult::Success(id) => println!("Worker {} 完成下载和解密。", id),
-                ChunkResult::Failure(id, e) => return Err(e.context(format!("Worker {} 失败", id))),
+                ChunkResult::Success(id) => println!("Worker {id} 完成下载和解密。"),
+                ChunkResult::Failure(id, e) => return Err(e.context(format!("Worker {id} 失败"))),
             }
         }
 
@@ -179,7 +179,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
             "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' ~/.local/bin/gmf-remote",
             cfg.endpoint, cfg.access_key_id, cfg.secret_access_key,
         );
-        add_ssh_args(&mut cmd, &cfg)
+        add_ssh_args(&mut cmd, cfg)
             .arg(&remote_command)
             .kill_on_drop(true);
         cmd.stdout(std::process::Stdio::piped())
@@ -214,7 +214,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     let local_port = pick_free_port().await?;
     let mut forward_child = {
         let mut cmd = Command::new("ssh");
-        add_ssh_args(&mut cmd, &cfg)
+        add_ssh_args(&mut cmd, cfg)
             .args(["-N", "-o", "ExitOnForwardFailure=yes"])
             .arg("-L")
             .arg(format!("{local_port}:127.0.0.1:{remote_port}"));
@@ -252,11 +252,10 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
 }
 
 async fn ensure_cmd_exists(cfg: &Config, cmd: &str) -> Result<()> {
-    ssh_once(cfg, &format!("command -v {} >/dev/null 2>&1", cmd))
+    ssh_once(cfg, &format!("command -v {cmd} >/dev/null 2>&1"))
         .await
         .context(format!(
-            "远程服务器上未找到命令 `{}`，请先安装或配置 PATH",
-            cmd
+            "远程服务器上未找到命令 `{cmd}`，请先安装或配置 PATH"
         ))
         .map(|_| ())
 }

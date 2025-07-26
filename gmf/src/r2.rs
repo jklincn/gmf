@@ -50,7 +50,7 @@ pub async fn delete_object(path: &str) -> Result<()> {
     bucket
         .delete_object(path)
         .await
-        .context(format!("从存储桶删除对象 '{}' 失败", path))?;
+        .context(format!("从存储桶删除对象 '{path}' 失败"))?;
     Ok(())
 }
 
@@ -61,7 +61,7 @@ pub async fn get_object(path: &str) -> Result<Bytes> {
     let response = bucket
         .get_object(path)
         .await
-        .context(format!("从存储桶下载对象 '{}' 失败", path))?;
+        .context(format!("从存储桶下载对象 '{path}' 失败"))?;
 
     // 检查 HTTP 状态码是否成功 (例如 200 OK)
     if response.status_code() != 200 {
@@ -69,7 +69,7 @@ pub async fn get_object(path: &str) -> Result<Bytes> {
             "下载对象 '{}' 失败，状态码: {}, 响应体: {:?}",
             path,
             response.status_code(),
-            String::from_utf8_lossy(&response.bytes())
+            String::from_utf8_lossy(response.bytes())
         ));
     }
 
@@ -82,7 +82,7 @@ pub async fn delete_bucket() -> Result<()> {
     bucket
         .delete()
         .await
-        .context(format!("删除存储桶 '{}' 失败", BUCKET_NAME))?;
+        .context(format!("删除存储桶 '{BUCKET_NAME}' 失败"))?;
 
     Ok(())
 }

@@ -43,7 +43,7 @@ pub async fn put_object(path: &str, content: &[u8]) -> Result<()> {
     bucket
         .put_object(path, content)
         .await
-        .context(format!("上传对象到 '{}' 失败", path))?;
+        .context(format!("上传对象到 '{path}' 失败"))?;
 
     Ok(())
 }

@@ -11,7 +11,6 @@ use axum::{
     },
 };
 use gmf_common::{SetupRequestPayload, SetupResponse, TaskEvent};
-use hex;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::{

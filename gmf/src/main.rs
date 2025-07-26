@@ -32,12 +32,12 @@ async fn main() -> Result<()> {
     .await;
 
     if let Err(e) = remote.shutdown().await {
-        eprintln!("清理 gmf-remote 时发生错误: {}", e);
+        eprintln!("清理 gmf-remote 时发生错误: {e}");
     }
 
     // 清理 Bucket
     if let Err(e) = r2::delete_bucket().await {
-        eprintln!("删除 Bucket 时发生错误: {}", e);
+        eprintln!("删除 Bucket 时发生错误: {e}");
     }
 
     logic_result?;

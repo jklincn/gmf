@@ -26,7 +26,7 @@ pub struct Header {
 }
 
 impl Header {
-    fn to_bytes(&self) -> [u8; HEADER_SIZE as usize] {
+    fn to_bytes(self) -> [u8; HEADER_SIZE as usize] {
         let mut buf = [0u8; HEADER_SIZE as usize];
         buf[..13].copy_from_slice(&self.magic);
         buf[16..20].copy_from_slice(&self.chunk_count.to_le_bytes());
@@ -51,8 +51,8 @@ impl GMFFile {
         chunk_count: u32,
     ) -> Result<Self> {
         // 返回 anyhow::Result
-        let gmf_filename = format!(".{}.gmf", source_sha256);
-        println!("创建临时文件: {}", gmf_filename);
+        let gmf_filename = format!(".{source_sha256}.gmf");
+        println!("创建临时文件: {gmf_filename}");
 
         Self::create(
             &gmf_filename,
@@ -162,7 +162,7 @@ impl GmfSession {
                 // 1. 下载加密的分块数据
                 let content = r2::get_object(&chunk_id.to_string())
                     .await
-                    .with_context(|| format!("从 r2 获取分块 {} 数据失败", chunk_id))?;
+                    .with_context(|| format!("从 r2 获取分块 {chunk_id} 数据失败"))?;
 
                 // 2. 解密分块
                 let plain_data = tokio::task::spawn_blocking(move || {
@@ -253,7 +253,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
             .read(true)
             .write(true)
             .open(&temp_filename)
-            .with_context(|| format!("无法重新打开临时文件 '{}' 进行最终化", temp_filename))?;
+            .with_context(|| format!("无法重新打开临时文件 '{temp_filename}' 进行最终化"))?;
 
         let total_size = file.metadata()?.len();
         if total_size < HEADER_SIZE {
@@ -282,7 +282,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     // --- 步骤 2: 校验文件 ---
     println!("正在校验最终文件...");
     let mut final_file = File::open(&temp_filename)
-        .with_context(|| format!("无法打开最终文件 '{}' 进行校验", temp_filename))?;
+        .with_context(|| format!("无法打开最终文件 '{temp_filename}' 进行校验"))?;
 
     // 2a. 校验文件大小
     let final_size = final_file.metadata()?.len();
@@ -293,7 +293,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
             final_size
         );
     }
-    println!("  - 文件大小校验通过 ({} 字节)", final_size);
+    println!("  - 文件大小校验通过 ({final_size} 字节)");
 
     // 2b. 校验 SHA256
     let mut hasher = Sha256::new();
@@ -311,15 +311,11 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     println!("  - SHA256 校验通过");
 
     // --- 步骤 3: 重命名文件 ---
-    println!("正在重命名文件到 '{}'...", target_filename);
-    fs::rename(&temp_filename, &target_filename).with_context(|| {
-        format!(
-            "重命名文件从 '{}' 到 '{}' 失败",
-            temp_filename, target_filename
-        )
-    })?;
+    println!("正在重命名文件到 '{target_filename}'...");
+    fs::rename(&temp_filename, &target_filename)
+        .with_context(|| format!("重命名文件从 '{temp_filename}' 到 '{target_filename}' 失败"))?;
 
-    println!("文件 '{}' 已成功下载并校验！", target_filename);
+    println!("文件 '{target_filename}' 已成功下载并校验！");
     Ok(())
 }
 
@@ -339,7 +335,7 @@ async fn run_writer_task(
             gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
             drop(gmf);
 
-            println!("[Writer] 已成功写入分块 {}。", next_chunk_to_write);
+            println!("[Writer] 已成功写入分块 {next_chunk_to_write}。");
             next_chunk_to_write += 1;
         }
     }
