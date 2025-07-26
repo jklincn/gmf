@@ -51,6 +51,7 @@ impl RemoteRunner {
         };
         let url = format!("{}/setup", self.url);
 
+        println!("正在发送 setup 请求到 {}", url);
         let response = client
             .post(&url)
             .json(&payload)
@@ -296,32 +297,27 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     })
 }
 
-async fn ensure_cmd_exists(cfg: &Config, cmd: &str) -> Result<()> {
-    ssh_once(cfg, &format!("command -v {cmd} >/dev/null 2>&1"))
-        .await
-        .context(format!(
-            "远程服务器上未找到命令 `{cmd}`，请先安装或配置 PATH"
-        ))
-        .map(|_| ())
-}
-
 async fn ensure_remote(cfg: &Config) -> Result<()> {
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
     println!("远程服务器 {} 连接成功", cfg.host);
 
-    println!("正在检验命令");
-    for cmd in &["sha256sum", "cut", "tar"] {
-        ensure_cmd_exists(cfg, cmd).await?;
-    }
+    let check_cmd = r#"
+        set -e
+        for cmd in sha256sum cut tar; do
+            command -v "$cmd" >/dev/null 2>&1
+        done
+        FILE_PATH=~/.local/bin/gmf-remote
+        if [ -f "$FILE_PATH" ]; then
+            sha256sum "$FILE_PATH" | cut -d' ' -f1
+        fi
+    "#;
 
-    println!("命令检查通过");
-    println!("正在检查 gmf-remote 是否已安装");
-    let sha = ssh_once(
-        cfg,
-        "sha256sum ~/.local/bin/gmf-remote 2>/dev/null | cut -d' ' -f1",
-    )
-    .await?;
-    if sha.trim() == GMF_REMOTE_SHA256 {
+    let current_sha = ssh_once(cfg, check_cmd)
+        .await
+        .context("远程服务器初始检查失败 (可能缺少依赖命令如 sha256sum, cut, tar)")?;
+
+    // 在 Rust 端进行判断
+    if current_sha.trim() == GMF_REMOTE_SHA256 {
         return Ok(());
     }
 
@@ -333,25 +329,38 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     tokio::fs::remove_file(&tmp).await.ok();
 
     // 解压 + chmod
-    let cmd = r#"
-        mkdir -p ~/.local/bin &&
-        tar -xzf ~/gmf-remote.tar.gz -C ~/.local/bin &&
-        chmod +x ~/.local/bin/gmf-remote &&
-        rm ~/gmf-remote.tar.gz
-    "#;
-    ssh_once(cfg, cmd).await?;
+    let install_and_verify_cmd = format!(
+        r#"
+        # 任何命令失败则立即退出
+        set -e
 
-    // 再次校验
-    let new_sha = ssh_once(cfg, "sha256sum ~/.local/bin/gmf-remote | cut -d' ' -f1").await?;
-    if new_sha.trim() != GMF_REMOTE_SHA256 {
-        Err(anyhow!(
-            "安装失败：数据完整性校验失败：实际值 {} 与期望值 {GMF_REMOTE_SHA256} 不符",
-            new_sha.trim()
-        ))
-    } else {
-        println!("gmf-remote 安装成功");
-        Ok(())
-    }
+        # 定义常量和路径
+        BIN_DIR=~/.local/bin
+        REMOTE_FILE="$BIN_DIR/gmf-remote"
+        ARCHIVE=~/gmf-remote.tar.gz
+        EXPECTED_SHA="{}"
+
+        # 核心操作
+        mkdir -p "$BIN_DIR"
+        tar -xzf "$ARCHIVE" -C "$BIN_DIR"
+        chmod +x "$REMOTE_FILE"
+        rm "$ARCHIVE"
+
+        # 最终校验
+        ACTUAL_SHA=$(sha256sum "$REMOTE_FILE" | cut -d' ' -f1)
+
+        # 如果校验失败，直接以非零状态码退出
+        [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]
+    "#,
+        GMF_REMOTE_SHA256
+    );
+
+    ssh_once(cfg, &install_and_verify_cmd)
+        .await
+        .context("在远程服务器上安装或校验 gmf-remote 时发生错误")?;
+
+    println!("gmf-remote 安装成功");
+    Ok(())
 }
 
 fn add_ssh_args<'a>(cmd: &'a mut Command, cfg: &Config) -> &'a mut Command {
