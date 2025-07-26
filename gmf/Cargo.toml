@@ -17,6 +17,7 @@ clap = { version = "4.5.41", features = ["derive"] }
 eventsource-stream = "0.2.3"
 futures-util = "0.3.31"
 gmf-common = { path = "../gmf-common" }
+indicatif = { version = "0.18.0", features = ["tokio"] }
 reqwest = { version = "0.12.22", default-features = false, features = [
     "stream",
     "json",

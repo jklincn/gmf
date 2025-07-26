@@ -1,1 +1,6 @@
-/target
+/target/
+
+# mydev
+/home
+/config.toml
+/*.zip

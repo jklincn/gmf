@@ -3,6 +3,7 @@ use crate::gmf_file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
 use std::path::Path;
@@ -26,6 +27,8 @@ pub struct RemoteRunner {
     forward_child: tokio::process::Child,
     session: Option<GmfSession>,
     completed_chunks: u32,
+    multi_progress: MultiProgress,
+    download_pb: ProgressBar,
 }
 
 impl RemoteRunner {
@@ -62,6 +65,17 @@ impl RemoteRunner {
         // 存储已完成的分块数
         self.completed_chunks = completed_chunks;
 
+        self.download_pb = self
+            .multi_progress
+            .add(ProgressBar::new(setup_info.total_chunks as u64));
+        self.download_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} 上传进度 [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+                .progress_chars("#>-"),
+        );
+        // 如果是断点续传，设置初始进度
+        self.download_pb.set_position(completed_chunks as u64);
+
         let session = GmfSession::new(gmf_file, self.completed_chunks);
         self.session = Some(session);
 
@@ -94,11 +108,6 @@ impl RemoteRunner {
                 .json(&start_payload),
         )?;
 
-        println!("等待服务端事件...");
-        if self.completed_chunks > 0 {
-            println!("请求从分块 ID {} 继续传输。", self.completed_chunks + 1);
-        }
-
         let mut worker_handles = Vec::new();
 
         loop {
@@ -115,6 +124,7 @@ impl RemoteRunner {
                                 if chunk_id <= self.completed_chunks {
                                     continue;
                                 }
+                                self.download_pb.inc(1);
                                 let handle = session.handle_chunk(
                                     chunk_id,
                                     passphrase_b64,
@@ -122,7 +132,7 @@ impl RemoteRunner {
                                 worker_handles.push(handle);
 
                             } else if let TaskEvent::TaskCompleted = task_event {
-                                println!("服务端报告任务完成，等待所有本地 worker 结束...");
+                                self.download_pb.finish_with_message("Completed");
                                 event_source.close();
                                 break;
                             } else if let TaskEvent::Error { message } = task_event {
@@ -147,7 +157,7 @@ impl RemoteRunner {
 
         for handle in worker_handles {
             match handle.await? {
-                ChunkResult::Success(_id) => {},
+                ChunkResult::Success(_id) => {}
                 ChunkResult::Failure(id, e) => return Err(e.context(format!("Worker {id} 失败"))),
             }
         }
@@ -262,7 +272,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     }
 
     println!("gmf-remote 连接成功");
-
+    let mp = MultiProgress::new();
     Ok(RemoteRunner {
         cfg: cfg.clone(),
         pid,
@@ -270,6 +280,8 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         forward_child,
         session: None,
         completed_chunks: 0,
+        multi_progress: mp,
+        download_pb: ProgressBar::new(0),
     })
 }
 
