@@ -12,6 +12,7 @@ PKG_VERSION="1.0.0" # <-- 修改为你当前的版本
 TARGET_TRIPLE="x86_64-pc-windows-gnu"
 EXECUTABLE_NAME="${PKG_NAME}.exe"
 SOURCE_PATH="target/${TARGET_TRIPLE}/release/${EXECUTABLE_NAME}"
+REMOTE_PATH="target/x86_64-unknown-linux-musl/release/gmf-remote"
 
 # 如果版本号不为空，则加入到压缩包名称中
 if [ -n "$PKG_VERSION" ]; then
@@ -36,10 +37,10 @@ fi
 echo "✅ 依赖工具检查通过。"
 
 echo "🚀 步骤 1/4: 构建依赖 'gmf-remote' (release)..."
-cargo br-r
+cargo build -p gmf-remote --release --target x86_64-unknown-linux-musl
 
 echo "🚀 步骤 2/4: 构建 Windows 目标 'gmf' (release)..."
-cargo b-win
+cargo build -p gmf --release --target x86_64-pc-windows-gnu
 
 echo "✅ 构建完成: ${SOURCE_PATH}"
 
@@ -53,9 +54,6 @@ echo "📦 步骤 3/4: 正在使用 zip 进行极限压缩..."
 
 FILES_TO_PACKAGE=("${SOURCE_PATH}")
 
-# 你可以在这里添加更多需要打包的文件
-# 示例: if [ -f "README.md" ]; then FILES_TO_PACKAGE+=("README.md"); fi
-
 zip -9 -j "${ZIP_NAME}" "${FILES_TO_PACKAGE[@]}"
 
 echo "🚀 步骤 4/4: 完成打包！"
@@ -64,5 +62,5 @@ echo "🎉 成功！压缩包已创建: ${ZIP_NAME}"
 # 打印文件大小
 echo ""
 echo "--- 文件大小 ---"
-ls -lh "${SOURCE_PATH}" "${ZIP_NAME}"
+ls -lh "${SOURCE_PATH}" "${ZIP_NAME}" "${REMOTE_PATH}"
 echo "----------------"

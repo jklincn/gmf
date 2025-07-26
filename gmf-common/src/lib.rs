@@ -23,6 +23,7 @@ pub enum TaskEvent {
 pub struct SetupRequestPayload {
     pub path: String,
     pub chunk_size: usize,
+    pub concurrency: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -37,4 +38,14 @@ pub struct SetupResponse {
 pub struct StartRequestPayload {
     // 服务端从哪个 chunk_id (1-based) 开始发送
     pub resume_from_chunk_id: u32,
+}
+
+pub fn format_size(mut size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut unit = 0;
+    while size >= 1024 && unit < UNITS.len() - 1 {
+        size /= 1024;
+        unit += 1;
+    }
+    format!("{} {}", size, UNITS[unit])
 }

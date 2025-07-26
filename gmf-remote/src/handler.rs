@@ -10,7 +10,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
+use gmf_common::{format_size, SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::{
@@ -25,16 +25,6 @@ use tracing::{error, info, instrument, warn};
 pub async fn healthy() -> StatusCode {
     info!("健康检查接口被调用");
     StatusCode::OK
-}
-
-fn format_size(mut size: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut unit = 0;
-    while size >= 1024 && unit < UNITS.len() - 1 {
-        size /= 1024;
-        unit += 1;
-    }
-    format!("{} {}", size, UNITS[unit])
 }
 
 fn calculate_sha256(path: &Path) -> Result<String, std::io::Error> {
@@ -120,6 +110,7 @@ pub async fn setup(
         chunk_size: payload.chunk_size,
         total_chunks,
         sha256: source_sha256.clone(),
+        concurrency: payload.concurrency,
     };
 
     // 更新全局状态

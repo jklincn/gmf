@@ -13,9 +13,6 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tracing::{error, info, instrument};
 
-// --- 配置常量 ---
-const CONCURRENCY: usize = 2;
-
 pub struct ChunkJob {
     pub id: u32,
     pub data: Vec<u8>,
@@ -27,7 +24,7 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Res
     info!("Worker 任务已启动");
 
     // 1. 初始化
-    let (metadata, sender, chunk_size) = {
+    let (metadata, sender, chunk_size, concurrency) = {
         let context = state.0.lock().unwrap();
         let metadata = context
             .metadata
@@ -38,7 +35,8 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Res
             .clone()
             .expect("Sender should be set by start");
         let chunk_size = metadata.chunk_size;
-        (metadata, sender, chunk_size)
+        let concurrency = metadata.concurrency;
+        (metadata, sender, chunk_size, concurrency)
     };
 
     let _ = sender.send(TaskEvent::ProcessingStart);
@@ -97,7 +95,7 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Res
     // 3. 并发调度与执行，并收集所有结果
     let final_chunk_states: Vec<ChunkState> = file_reader_stream
         .map(|job| process_single_chunk(state.clone(), job))
-        .buffered(CONCURRENCY)
+        .buffered(concurrency)
         .collect()
         .await;
 

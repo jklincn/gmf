@@ -64,7 +64,6 @@ fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
 
     // 4. Gzip 压缩 tar 归档
     let compression_level = if profile == "release" {
-        println!("cargo:warning=gmf-remote: Using max compression for release build.");
         Compression::best()
     } else {
         Compression::none()

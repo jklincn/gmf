@@ -26,6 +26,7 @@ pub struct TaskMetadata {
     pub sha256: String,
     pub chunk_size: usize,
     pub total_chunks: u32,
+    pub concurrency: usize,
 }
 
 /// 整个任务的上下文，包含所有状态和通信渠道。

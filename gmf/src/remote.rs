@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::gmf_file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
+use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, format_size};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
@@ -32,7 +32,12 @@ pub struct RemoteRunner {
 }
 
 impl RemoteRunner {
-    pub async fn setup(&mut self, file_path: &str, chunk_size: usize) -> Result<()> {
+    pub async fn setup(
+        &mut self,
+        file_path: &str,
+        chunk_size: usize,
+        concurrency: usize,
+    ) -> Result<()> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(10))
@@ -42,6 +47,7 @@ impl RemoteRunner {
         let payload = SetupRequestPayload {
             path: file_path.to_string(),
             chunk_size,
+            concurrency,
         };
         let url = format!("{}/setup", self.url);
 
@@ -53,7 +59,11 @@ impl RemoteRunner {
             .error_for_status()?;
         let setup_info = response.json::<SetupResponse>().await?;
 
-        println!("文件名: {}, 大小: {}", setup_info.filename, setup_info.size);
+        println!(
+            "文件名: {}, 大小: {}",
+            setup_info.filename,
+            format_size(setup_info.size)
+        );
 
         let (gmf_file, completed_chunks) = GMFFile::new(
             &setup_info.filename,
@@ -203,6 +213,7 @@ impl RemoteRunner {
 pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     ensure_remote(cfg).await?;
 
+    println!("正在启动 gmf-remote...");
     // 启动 gmf‑remote
     let mut ssh_child = {
         let mut cmd = Command::new("ssh");
@@ -298,10 +309,13 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
     println!("远程服务器 {} 连接成功", cfg.host);
 
+    println!("正在检验命令");
     for cmd in &["sha256sum", "cut", "tar"] {
         ensure_cmd_exists(cfg, cmd).await?;
     }
 
+    println!("命令检查通过");
+    println!("正在检查 gmf-remote 是否已安装");
     let sha = ssh_once(
         cfg,
         "sha256sum ~/.local/bin/gmf-remote 2>/dev/null | cut -d' ' -f1",
