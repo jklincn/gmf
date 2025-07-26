@@ -1,25 +1,8 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use gmf_common::TaskEvent;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum TaskEvent {
-    ProcessingStart,
-    ChunkReadyForDownload {
-        chunk_id: u32,
-        passphrase_b64: String,
-    },
-    ChunkAcknowledged {
-        chunk_id: u32,
-    },
-    TaskCompleted,
-    Error {
-        message: String,
-    },
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ChunkProcessingStatus {
@@ -40,15 +23,15 @@ pub struct TaskMetadata {
     pub source_path: PathBuf,
     pub source_filename: String,
     pub source_size: u64,
-    pub total_chunks: u32,
     pub sha256: String,
+    pub chunk_size: usize,
+    pub total_chunks: u32,
 }
 
 /// 整个任务的上下文，包含所有状态和通信渠道。
 #[derive(Debug)]
 pub struct TaskContext {
     pub metadata: Option<TaskMetadata>,
-    pub chunks: HashMap<u32, ChunkState>,
     pub event_sender: Option<broadcast::Sender<TaskEvent>>,
 }
 
@@ -56,7 +39,6 @@ impl TaskContext {
     pub fn new() -> Self {
         Self {
             metadata: None,
-            chunks: HashMap::new(),
             event_sender: None,
         }
     }

@@ -47,15 +47,3 @@ pub async fn put_object(path: &str, content: &[u8]) -> Result<()> {
 
     Ok(())
 }
-
-/// 从存储桶中删除一个对象。
-pub async fn delete_object(path: &str) -> Result<()> {
-    let bucket = get_bucket().await?;
-
-    bucket
-        .delete_object(path)
-        .await
-        .context(format!("从存储桶删除对象 '{}' 失败", path))?;
-
-    Ok(())
-}

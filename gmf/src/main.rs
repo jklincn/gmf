@@ -1,11 +1,14 @@
 mod config;
+mod gmf_file;
 mod r2;
 mod remote;
-mod gmf_file;
 
 use anyhow::Result;
 use clap::Parser;
 use remote::start_remote;
+
+const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -22,7 +25,7 @@ async fn main() -> Result<()> {
 
     // 主逻辑
     let logic_result: Result<()> = async {
-        remote.setup(&filepath).await?;
+        remote.setup(&filepath, CHUNK_SIZE).await?;
         remote.start().await?;
         Ok(())
     }
@@ -33,9 +36,9 @@ async fn main() -> Result<()> {
     }
 
     // 清理 Bucket
-    // if let Err(e) = r2::delete_bucket().await {
-    //     eprintln!("删除 Bucket 时发生错误: {}", e);
-    // }
+    if let Err(e) = r2::delete_bucket().await {
+        eprintln!("删除 Bucket 时发生错误: {}", e);
+    }
 
     logic_result?;
 

@@ -31,6 +31,8 @@ indicatif = "0.18.0"
 rust-s3 = { version = "0.35.1", default-features = false, features = ["tokio-rustls-tls"] }
 aes-gcm = "0.10.3"
 base64 = "0.22.1"
+gmf-common = { path = "../gmf-common" }
+sha2 = "0.10.9"
 
 [build-dependencies]
 flate2 = "1.1.2"

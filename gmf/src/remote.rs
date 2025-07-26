@@ -1,16 +1,16 @@
 use crate::config::Config;
-use crate::{gmf_file, r2};
+use crate::gmf_file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode};
+use gmf_common::{SetupRequestPayload, SetupResponse, TaskEvent};
+use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+
 use tokio::time::sleep;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
@@ -19,53 +19,25 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const SSE_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum TaskEvent {
-    ProcessingStart,
-    ChunkReadyForDownload {
-        chunk_id: u32,
-        passphrase_b64: String,
-    },
-    ChunkAcknowledged {
-        chunk_id: u32,
-    },
-    TaskCompleted,
-    Error {
-        message: String,
-    },
-}
-
 pub struct RemoteRunner {
     cfg: Config,
     pid: u32,
     url: String,
     forward_child: tokio::process::Child,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct SetupResponse {
-    pub filename: String,
-    pub size: u64,
-    pub sha256: String,
+    session: Option<GmfSession>,
 }
 
 impl RemoteRunner {
-    // 设置文件路径
-    pub async fn setup(&self, file_path: &str) -> Result<SetupResponse> {
-        #[derive(serde::Serialize)]
-        struct Payload {
-            path: String,
-        }
-
+    pub async fn setup(&mut self, file_path: &str, chunk_size: usize) -> Result<()> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(10))
             .build()
             .context("创建 reqwest 客户端失败")?;
 
-        let payload = Payload {
+        let payload = SetupRequestPayload {
             path: file_path.to_string(),
+            chunk_size,
         };
         let url = format!("{}/setup", self.url);
 
@@ -73,153 +45,95 @@ impl RemoteRunner {
             .post(&url)
             .json(&payload)
             .send()
-            .await
-            .context("发送 setup 请求失败")?;
+            .await?
+            .error_for_status()?;
+        let setup_info = response.json::<SetupResponse>().await?;
 
-        let status = response.status();
+        println!("成功获取文件元数据: {:?}", setup_info);
 
-        if status != StatusCode::OK {
-            let error_body = response.text().await.context("读取错误响应体失败")?;
-            match status {
-                StatusCode::BAD_REQUEST => {
-                    bail!("远程文件查找失败 (请求错误 400): {}", error_body);
-                }
-                StatusCode::INTERNAL_SERVER_ERROR => {
-                    bail!("远程服务器处理失败 (错误 500): {}", error_body);
-                }
-                _ => {
-                    bail!("远程请求失败，状态码: {}, 响应: {}", status, error_body);
-                }
-            }
-        }
-        
-        // --- 修改点：将响应体解析为 JSON ---
-        // 使用 .json::<T>() 方法自动解析 JSON 并反序列化到 SetupResponse 结构体
-        let setup_info = response
-            .json::<SetupResponse>()
-            .await
-            .context("解析服务器响应 JSON 失败")?;
+        let gmf_file = GMFFile::new(
+            &setup_info.filename,
+            setup_info.size,
+            &setup_info.sha256,
+            setup_info.total_chunks,
+        )?;
 
-        // 现在你可以访问结构化的数据了
-        println!("成功获取文件元数据:");
-        println!("  - 文件名: {}", setup_info.filename);
-        println!("  - 大小: {}", setup_info.size); // 你可能还想用 format_size
-        println!("  - SHA256: {}", setup_info.sha256);
+        // 创建会话，这会自动启动后台的 writer 任务
+        let session = GmfSession::new(gmf_file);
+        self.session = Some(session);
 
-        Ok(setup_info)
+        Ok(())
     }
 
     // 开始处理
     pub async fn start(&mut self) -> Result<()> {
+        let session = self
+            .session
+            .take()
+            .ok_or_else(|| anyhow!("必须先调用 setup() 方法才能开始任务"))?;
+
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
-
-        let url = format!("{}/start", self.url);
-
-        // --- 设置通道和事件源 ---
-        let (worker_done_tx, mut worker_done_rx) =
-            mpsc::channel::<Result<u32, (u32, anyhow::Error)>>(128);
-
+        let sse_url = format!("{}/start", self.url);
         let mut event_source =
-            EventSource::new(client.get(&url).header("Accept", "text/event-stream"))?;
-
-        // --- 主事件循环 ---
-        let mut server_task_finished = false;
+            EventSource::new(client.get(&sse_url).header("Accept", "text/event-stream"))?;
 
         println!("等待服务端事件...");
 
+        let mut worker_handles = Vec::new();
+
         loop {
             tokio::select! {
-                // --- 分支一：监听来自服务端的 SSE 事件 ---
                 Some(event) = event_source.next() => {
                     match event {
-                        Ok(Event::Open) => {
-                            println!("成功连接到服务端事件流。");
-                        },
                         Ok(Event::Message(message)) => {
-                            let task_event: TaskEvent = match serde_json::from_str(&message.data) {
-                                Ok(event) => event,
-                                Err(e) => {
-                                    eprintln!("无法解析 SSE 消息: {}, 数据: '{}'", e, message.data);
-                                    continue;
-                                }
-                            };
+                            let task_event: TaskEvent = serde_json::from_str(&message.data)
+                                .context("解析服务端事件失败")?;
 
-                            match task_event {
-                                TaskEvent::ProcessingStart => {
-                                    println!("服务端已开始处理任务。");
-                                }
-                                TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
-                                    println!("分块 {} 已就绪，开始下载和处理...", chunk_id);
+                            if let TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } = task_event {
+                                println!("分块 {} 已就绪，派发处理任务...", chunk_id);
+                                let handle = session.handle_chunk(
+                                    chunk_id,
+                                    passphrase_b64,
+                                );
+                                worker_handles.push(handle);
 
-                                    let task_client = client.clone();
-                                    let base_url = self.url.clone();
-                                    let tx_clone = worker_done_tx.clone();
-
-                                    tokio::spawn(async move {
-                                        let result = process_and_acknowledge_chunk(
-                                            task_client,
-                                            base_url,
-                                            chunk_id,
-                                            passphrase_b64,
-                                        ).await;
-                                        if let Err(e) = tx_clone.send(result).await {
-                                            eprintln!("[Worker {}] 无法将结果发送回主循环: {}", chunk_id, e);
-                                        }
-                                    });
-                                }
-                                TaskEvent::TaskCompleted => {
-                                    println!("服务端报告任务已全部完成！等待所有本地任务结束...");
-                                    server_task_finished = true;
-                                    event_source.close();
-                                }
-                                TaskEvent::Error { message } => {
-                                    event_source.close();
-                                    return Err(anyhow!("服务端错误: {}", message));
-                                }
-                                _ => {}
+                            } else if let TaskEvent::TaskCompleted = task_event {
+                                println!("服务端报告任务完成，等待所有本地 worker 结束...");
+                                event_source.close();
+                                break;
+                            } else if let TaskEvent::Error { message } = task_event {
+                                bail!("服务端错误: {}", message);
                             }
                         }
                         Err(e) => {
-                            if !server_task_finished {
-                                return Err(anyhow!("SSE 流错误: {}", e));
-                            }
-                            break;
+                            return Err(anyhow!("SSE 流意外断开: {}", e));
                         }
+                        _ => {}
                     }
                 }
-
-                // --- 分支二：处理已完成的 worker 任务 ---
-                Some(result) = worker_done_rx.recv() => {
-                    match result {
-                        Ok(chunk_id) => {
-                            println!("分块 {} 已成功处理和确认。", chunk_id);
-                        }
-                        Err((chunk_id, e)) => {
-                             eprintln!("处理分块 {} 时发生严重错误: {}", chunk_id, e);
-                             event_source.close();
-                             return Err(e.context(format!("分块 {} 处理失败", chunk_id)));
-                        }
+                 _ = sleep(SSE_TIMEOUT) => {
+                    if worker_handles.is_empty() {
+                        bail!("SSE 事件流超时：超过 {:?} 未收到任何事件", SSE_TIMEOUT);
                     }
-                }
-
-                // --- 3. 新增分支：处理 SSE 超时 ---
-                _ = sleep(SSE_TIMEOUT) => {
-                    if !server_task_finished {
-                        event_source.close();
-                        return Err(anyhow!("SSE 事件流超时：超过 {} 秒未收到新事件", SSE_TIMEOUT.as_secs()));
-                    }
-                }
-            }
-
-            // --- 检查退出条件 ---
-            if server_task_finished {
-                println!("所有分块已成功下载和确认！");
-                break;
+                 }
             }
         }
 
+        // --- 收尾阶段 ---
+        println!("等待所有分块处理任务完成...");
+        for handle in worker_handles {
+            match handle.await? {
+                ChunkResult::Success(id) => println!("Worker {} 完成下载和解密。", id),
+                ChunkResult::Failure(id, e) => return Err(e.context(format!("Worker {} 失败", id))),
+            }
+        }
+
+        println!("所有 worker 已完成。现在等待文件写入器完成...");
+        session.wait_for_completion().await?;
+
+        println!("所有任务完成！");
         Ok(())
     }
 
@@ -254,39 +168,6 @@ impl RemoteRunner {
     }
 }
 
-/// 辅助函数：处理单个分块的完整流程（下载、解密、确认）
-async fn process_and_acknowledge_chunk(
-    client: Client,
-    base_url: String,
-    chunk_id: u32,
-    passphrase_b64: String,
-) -> Result<u32, (u32, anyhow::Error)> {
-    // 模拟下载
-    println!("[Chunk {}] 开始下载...", chunk_id);
-
-    // let data = r2::get_object(&chunk_id.to_string())
-    //     .await
-    //     .map_err(|e| (chunk_id, e.into()))?;
-
-    println!("[Chunk {}] 下载完成。", chunk_id);
-
-    // 模拟解密
-    // gmf_file::chunk_handle(chunk_id, &data, &passphrase_b64)
-    //     .map_err(|e| (chunk_id, e.into()))
-    //     .context(format!("分块 {} 解密失败", chunk_id))?;
-
-    println!("[Chunk {}] 解密完成。", chunk_id);
-
-    // 发送确认
-    println!("[Chunk {}] 发送确认...", chunk_id);
-    // let ack_url = format!("{}/acknowledge/{}", base_url, chunk_id);
-    // if let Err(e) = client.post(&ack_url).send().await {
-    //     return Err((chunk_id, anyhow::Error::new(e).context("发送确认请求失败")));
-    // }
-    println!("[Chunk {}] 确认成功。", chunk_id);
-
-    Ok(chunk_id)
-}
 // 启动远端并返回 Runner
 pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     ensure_remote(cfg).await?;
@@ -366,6 +247,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         pid,
         url,
         forward_child,
+        session: None,
     })
 }
 

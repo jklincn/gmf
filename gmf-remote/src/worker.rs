@@ -1,24 +1,21 @@
 use crate::r2;
-use crate::state::{AppState, ChunkProcessingStatus, ChunkState, TaskEvent};
+use crate::state::{AppState, ChunkProcessingStatus, ChunkState};
 use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose;
 use futures::stream::{self, StreamExt};
-use std::time::{Duration, Instant};
+use gmf_common::NONCE_SIZE;
+use gmf_common::TaskEvent;
+use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::broadcast;
-use tokio::time::sleep;
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument};
 
 // --- 配置常量 ---
 const CONCURRENCY: usize = 2;
-const NONCE_SIZE: usize = 12;
-pub const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
-// --- 作业定义 ---
 pub struct ChunkJob {
     pub id: u32,
     pub data: Vec<u8>,
@@ -30,7 +27,7 @@ pub async fn run_task(state: AppState) -> anyhow::Result<()> {
     info!("Worker 任务已启动");
 
     // 1. 初始化
-    let (metadata, sender) = {
+    let (metadata, sender, chunk_size) = {
         let context = state.0.lock().unwrap();
         let metadata = context
             .metadata
@@ -40,30 +37,22 @@ pub async fn run_task(state: AppState) -> anyhow::Result<()> {
             .event_sender
             .clone()
             .expect("Sender should be set by start");
-        (metadata, sender)
+        let chunk_size = metadata.chunk_size;
+        (metadata, sender, chunk_size)
     };
 
     let _ = sender.send(TaskEvent::ProcessingStart);
     info!("已发送 ProcessingStart 事件");
 
-    let expected = ((metadata.source_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as usize;
-    if expected != metadata.total_chunks as usize {
-        warn!(
-            expected = expected,
-            meta_total = metadata.total_chunks,
-            "metadata.total_chunks 与实际计算不一致，将以实际读取为准"
-        );
-    }
-
     let file = File::open(&metadata.source_path).await?;
     let reader = BufReader::new(file);
     let file_reader_stream = stream::unfold((reader, 1u32), |(mut reader, chunk_id)| async move {
-        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut buf = vec![0u8; chunk_size];
         let mut filled = 0;
 
         // read 不保证每次都读取 CHUNK_SIZE 字节，因此需要循环读取直到填满或 EOF
         loop {
-            if filled == CHUNK_SIZE {
+            if filled == chunk_size {
                 break;
             }
             match reader.read(&mut buf[filled..]).await {
@@ -128,7 +117,6 @@ pub async fn run_task(state: AppState) -> anyhow::Result<()> {
             message: message.clone(),
         });
         bail!(message);
-        // 或者：bail!(message);
     }
 }
 
@@ -144,7 +132,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
         context.event_sender.clone().expect("Sender must exist")
     };
 
-    // --- 1. 加密 ---
+    // --- 加密 ---
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
     let passphrase_b64 = general_purpose::STANDARD.encode(&key);
@@ -160,7 +148,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
         }
     };
 
-    // --- 2. 上传 ---
+    // --- 上传 ---
     if let Err(e) = upload_chunk(chunk_id, &encrypted_data).await {
         let reason = format!("上传失败: {}", e);
         error!("{}", reason);
@@ -177,29 +165,6 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
         passphrase_b64,
     });
 
-    // // --- 4. 等待客户端确认 ---
-    // if wait_for_acknowledgement(&sender, chunk_id).await.is_err() {
-    //     let reason = "等待客户端确认超时".to_string();
-    //     error!("{}", reason);
-    //     return ChunkState {
-    //         id: chunk_id,
-    //         status: ChunkProcessingStatus::Failed { reason },
-    //     };
-    // }
-    // info!("收到确认");
-
-    // // --- 5. 删除远程对象 ---
-    // if let Err(e) = delete_chunk(chunk_id).await {
-    //     let reason = format!("删除远程对象失败: {}", e);
-    //     error!("{}", reason);
-    //     warn!("未能清理远程对象: {}", chunk_id);
-    //     return ChunkState {
-    //         id: chunk_id,
-    //         status: ChunkProcessingStatus::Failed { reason },
-    //     };
-    // }
-    // info!("远程对象删除成功");
-
     // --- 6. 成功完成 ---
     info!("分块处理完成");
     ChunkState {
@@ -210,36 +175,11 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
 // --- 辅助函数 ---
 
-// /// 等待特定分块的确认消息
-// async fn wait_for_acknowledgement(
-//     sender: &broadcast::Sender<TaskEvent>,
-//     chunk_id: u32,
-// ) -> Result<(), tokio::time::error::Elapsed> {
-//     let mut ack_receiver = sender.subscribe();
-//     tokio::time::timeout(Duration::from_secs(10), async {
-//         loop {
-//             // 忽略接收错误，只关心是否收到正确的 ack
-//             if let Ok(TaskEvent::ChunkAcknowledged { chunk_id: ack_id }) = ack_receiver.recv().await
-//             {
-//                 if ack_id == chunk_id {
-//                     break;
-//                 }
-//             }
-//         }
-//     })
-//     .await
-// }
-
 async fn upload_chunk(chunk_id: u32, data: &[u8]) -> Result<()> {
     let start = Instant::now();
     r2::put_object(&chunk_id.to_string(), data).await?;
     let duration = start.elapsed();
     info!("上传耗时（秒）: {} s", duration.as_secs_f32());
-    Ok(())
-}
-
-async fn delete_chunk(chunk_id: u32) -> Result<()> {
-    r2::delete_object(&chunk_id.to_string()).await?;
     Ok(())
 }
 

@@ -35,3 +35,4 @@ aes-gcm = "0.10.3"
 rust-s3 = { version = "0.35.1", default-features = false, features = ["tokio-rustls-tls"] }
 sha2 = "0.10.9"
 hex = "0.4.3"
+gmf-common = { path = "../gmf-common" }

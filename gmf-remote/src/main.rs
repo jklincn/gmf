@@ -1,7 +1,7 @@
 mod handler;
+mod r2;
 mod state;
 mod worker;
-mod r2;
 
 use anyhow::anyhow;
 use axum::{
@@ -62,7 +62,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(handler::healthy))
         .route("/setup", post(handler::setup))
         .route("/start", get(handler::start))
-        // .route("/acknowledge/{chunk_id}", post(handler::acknowledge))
         .with_state(app_state)
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
