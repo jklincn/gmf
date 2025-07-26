@@ -1,9 +1,25 @@
-use r2::TaskEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum TaskEvent {
+    ProcessingStart,
+    ChunkReadyForDownload {
+        chunk_id: u32,
+        passphrase_b64: String,
+    },
+    ChunkAcknowledged {
+        chunk_id: u32,
+    },
+    TaskCompleted,
+    Error {
+        message: String,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ChunkProcessingStatus {
@@ -25,6 +41,7 @@ pub struct TaskMetadata {
     pub source_filename: String,
     pub source_size: u64,
     pub total_chunks: u32,
+    pub sha256: String,
 }
 
 /// 整个任务的上下文，包含所有状态和通信渠道。

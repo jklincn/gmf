@@ -1,8 +1,10 @@
 mod config;
+mod r2;
 mod remote;
+mod gmf_file;
+
 use anyhow::Result;
 use clap::Parser;
-use r2;
 use remote::start_remote;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -17,15 +19,6 @@ async fn main() -> Result<()> {
     let config = config::load_or_create_config()?;
 
     let mut remote = start_remote(&config).await?;
-    let s3_client = r2::get_client(Some((
-        config.endpoint.as_ref(),
-        config.access_key_id.as_ref(),
-        config.secret_access_key.as_ref(),
-    )))
-    .await?;
-
-    // 创建 Bucket
-    r2::create_bucket(&s3_client).await?;
 
     // 主逻辑
     let logic_result: Result<()> = async {
@@ -40,9 +33,9 @@ async fn main() -> Result<()> {
     }
 
     // 清理 Bucket
-    if let Err(e) = r2::delete_bucket(&s3_client).await {
-        eprintln!("删除 Bucket 时发生错误: {}", e);
-    }
+    // if let Err(e) = r2::delete_bucket().await {
+    //     eprintln!("删除 Bucket 时发生错误: {}", e);
+    // }
 
     logic_result?;
 

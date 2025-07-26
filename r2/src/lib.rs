@@ -52,34 +52,6 @@ pub enum TaskEvent {
     },
 }
 
-pub fn generate_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    key
-}
-
-// === 加密文件 ===
-pub fn encrypt_chunk(key_bytes: &[u8; 32], input_data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    // 生成随机 nonce（每个文件都唯一）
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-
-    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, input_data)
-        .map_err(|e| anyhow::anyhow!("加密失败: {:?}", e))?;
-
-    // 输出格式：nonce || ciphertext
-    let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes[..]);
-    result.extend_from_slice(&ciphertext);
-
-    Ok(result)
-}
-
 // === 解密文件 ===
 pub fn decrypt_chunk(key_bytes: &[u8; 32], encrypted_data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if encrypted_data.len() < NONCE_SIZE {
@@ -150,93 +122,5 @@ pub fn decrypt_and_merge(manifest: &Manifest, output_path: impl AsRef<Path>) -> 
     fs::rename(&temp_output_path, &restored_path)?;
     println!("解密完成，文件已保存为: {:?}", restored_path);
 
-    Ok(())
-}
-
-pub async fn get_client<'a>(
-    cfg: Option<(&'a str, &'a str, &'a str)>,
-) -> anyhow::Result<s3::Client> {
-    let endpoint;
-    let access_key_id;
-    let secret_access_key;
-    if let Some((ep, akid, sak)) = cfg {
-        endpoint = ep.to_string();
-        access_key_id = akid.to_string();
-        secret_access_key = sak.to_string();
-    } else {
-        endpoint = env::var("ENDPOINT").unwrap();
-        access_key_id = env::var("ACCESS_KEY_ID").unwrap();
-        secret_access_key = env::var("SECRET_ACCESS_KEY").unwrap();
-    }
-    let config = aws_config::from_env()
-        .endpoint_url(endpoint)
-        .credentials_provider(aws_sdk_s3::config::Credentials::new(
-            access_key_id,
-            secret_access_key,
-            None,
-            None,
-            "R2",
-        ))
-        .region("auto")
-        .load()
-        .await;
-
-    let client = s3::Client::new(&config);
-    Ok(client)
-}
-
-pub async fn create_bucket(client: &s3::Client) -> Result<()> {
-    client
-        .create_bucket()
-        .bucket(BUCKETNAME)
-        .create_bucket_configuration(s3::types::CreateBucketConfiguration::builder().build())
-        .send()
-        .await
-        .context(format!("向 S3 发送创建 Bucket '{}' 的请求失败", BUCKETNAME))?;
-
-    let mut buckets = client.list_buckets().into_paginator().send();
-
-    while let Some(page) = buckets.next().await {
-        let output = page.context("从 S3 获取 Bucket 列表页面失败")?;
-        for bucket in output.buckets() {
-            if bucket.name.as_deref() == Some(BUCKETNAME) {
-                return Ok(());
-            }
-        }
-    }
-
-    bail!("Bucket '{}' 创建后验证失败，未在列表中找到。", BUCKETNAME);
-}
-
-pub async fn delete_bucket(client: &s3::Client) -> Result<()> {
-    client
-        .delete_bucket()
-        .bucket(BUCKETNAME)
-        .send()
-        .await
-        .context(format!("删除 Bucket '{}' 失败", BUCKETNAME))?;
-
-    Ok(())
-}
-
-pub async fn upload_object(client: &s3::Client, data: &[u8], key: &str) -> Result<()> {
-    let body = ByteStream::from(data.to_vec());
-    client
-        .put_object()
-        .bucket(BUCKETNAME)
-        .key(key)
-        .body(body)
-        .send()
-        .await?;
-    Ok(())
-}
-
-pub async fn remove_object(client: &s3::Client, key: &str) -> Result<()> {
-    client
-        .delete_object()
-        .bucket(BUCKETNAME)
-        .key(key)
-        .send()
-        .await?;
     Ok(())
 }

@@ -1,10 +1,10 @@
 use crate::config::Config;
+use crate::{gmf_file, r2};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use r2::TaskEvent;
 use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Event, EventSource};
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -13,11 +13,28 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-include!(concat!(env!("OUT_DIR"), "/gmf-remote.rs"));
+include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const SSE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum TaskEvent {
+    ProcessingStart,
+    ChunkReadyForDownload {
+        chunk_id: u32,
+        passphrase_b64: String,
+    },
+    ChunkAcknowledged {
+        chunk_id: u32,
+    },
+    TaskCompleted,
+    Error {
+        message: String,
+    },
+}
 
 pub struct RemoteRunner {
     cfg: Config,
@@ -26,16 +43,24 @@ pub struct RemoteRunner {
     forward_child: tokio::process::Child,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct SetupResponse {
+    pub filename: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
 impl RemoteRunner {
     // 设置文件路径
-    pub async fn setup(&self, file_path: &str) -> Result<String> {
+    pub async fn setup(&self, file_path: &str) -> Result<SetupResponse> {
         #[derive(serde::Serialize)]
         struct Payload {
             path: String,
         }
 
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(10))
             .build()
             .context("创建 reqwest 客户端失败")?;
 
@@ -53,24 +78,35 @@ impl RemoteRunner {
 
         let status = response.status();
 
-        let body = response.text().await.context("读取响应体失败")?;
-
         if status != StatusCode::OK {
+            let error_body = response.text().await.context("读取错误响应体失败")?;
             match status {
                 StatusCode::BAD_REQUEST => {
-                    bail!("远程文件查找失败 (请求错误 400): {}", body);
+                    bail!("远程文件查找失败 (请求错误 400): {}", error_body);
                 }
                 StatusCode::INTERNAL_SERVER_ERROR => {
-                    bail!("远程服务器处理失败 (错误 500): {}", body);
+                    bail!("远程服务器处理失败 (错误 500): {}", error_body);
                 }
                 _ => {
-                    bail!("远程请求失败，状态码: {}, 响应: {}", status, body);
+                    bail!("远程请求失败，状态码: {}, 响应: {}", status, error_body);
                 }
             }
         }
-        // 这会打印文件信息
-        println!("{}", body);
-        Ok(body)
+        
+        // --- 修改点：将响应体解析为 JSON ---
+        // 使用 .json::<T>() 方法自动解析 JSON 并反序列化到 SetupResponse 结构体
+        let setup_info = response
+            .json::<SetupResponse>()
+            .await
+            .context("解析服务器响应 JSON 失败")?;
+
+        // 现在你可以访问结构化的数据了
+        println!("成功获取文件元数据:");
+        println!("  - 文件名: {}", setup_info.filename);
+        println!("  - 大小: {}", setup_info.size); // 你可能还想用 format_size
+        println!("  - SHA256: {}", setup_info.sha256);
+
+        Ok(setup_info)
     }
 
     // 开始处理
@@ -228,22 +264,25 @@ async fn process_and_acknowledge_chunk(
     // 模拟下载
     println!("[Chunk {}] 开始下载...", chunk_id);
 
-    sleep(Duration::from_secs(3)).await; // 模拟下载延迟
+    // let data = r2::get_object(&chunk_id.to_string())
+    //     .await
+    //     .map_err(|e| (chunk_id, e.into()))?;
 
     println!("[Chunk {}] 下载完成。", chunk_id);
 
     // 模拟解密
-    println!("[Chunk {}] 正在使用密码解密...", chunk_id);
+    // gmf_file::chunk_handle(chunk_id, &data, &passphrase_b64)
+    //     .map_err(|e| (chunk_id, e.into()))
+    //     .context(format!("分块 {} 解密失败", chunk_id))?;
 
-    sleep(Duration::from_millis(500)).await;
     println!("[Chunk {}] 解密完成。", chunk_id);
 
     // 发送确认
     println!("[Chunk {}] 发送确认...", chunk_id);
-    let ack_url = format!("{}/acknowledge/{}", base_url, chunk_id);
-    if let Err(e) = client.post(&ack_url).send().await {
-        return Err((chunk_id, anyhow::Error::new(e).context("发送确认请求失败")));
-    }
+    // let ack_url = format!("{}/acknowledge/{}", base_url, chunk_id);
+    // if let Err(e) = client.post(&ack_url).send().await {
+    //     return Err((chunk_id, anyhow::Error::new(e).context("发送确认请求失败")));
+    // }
     println!("[Chunk {}] 确认成功。", chunk_id);
 
     Ok(chunk_id)
@@ -255,15 +294,16 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     // 启动 gmf‑remote
     let mut ssh_child = {
         let mut cmd = Command::new("ssh");
+        let remote_command = format!(
+            "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' ~/.local/bin/gmf-remote",
+            cfg.endpoint, cfg.access_key_id, cfg.secret_access_key,
+        );
         add_ssh_args(&mut cmd, &cfg)
-            .arg("~/.local/bin/gmf-remote")
-            .env("ENDPOINT", cfg.endpoint.clone())
-            .env("ACCESS_KEY_ID", cfg.access_key_id.clone())
-            .env("SECRET_ACCESS_KEY", cfg.secret_access_key.clone())
+            .arg(&remote_command)
             .kill_on_drop(true);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
-        cmd.spawn().context("无法启动 ssh 进程 (gmf-remote)")?
+        cmd.spawn().context("无法启动 gmf-remote")?
     };
 
     println!("gmf-remote 启动成功");
@@ -346,7 +386,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
     println!("远程服务器连接成功");
 
-    for cmd in &["sha256sum", "cut", "gunzip"] {
+    for cmd in &["sha256sum", "cut", "tar"] {
         ensure_cmd_exists(cfg, cmd).await?;
     }
 
@@ -355,31 +395,31 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
         "sha256sum ~/.local/bin/gmf-remote 2>/dev/null | cut -d' ' -f1",
     )
     .await?;
-    if sha.trim() == REMOTE_ELF_SHA256 {
+    if sha.trim() == GMF_REMOTE_SHA256 {
         return Ok(());
     }
 
     // 上传 gzip
     println!("正在安装 gmf-remote 至 ~/.local/bin 目录");
-    let tmp = std::env::temp_dir().join("gmf-remote.gz");
-    tokio::fs::write(&tmp, REMOTE_ELF_GZ).await?;
-    scp_send(cfg, &tmp, "~/gmf-remote.gz").await?;
+    let tmp = std::env::temp_dir().join("gmf-remote.tar.gz");
+    tokio::fs::write(&tmp, GMF_REMOTE_TAR_GZ).await?;
+    scp_send(cfg, &tmp, "~/gmf-remote.tar.gz").await?;
     tokio::fs::remove_file(&tmp).await.ok();
 
     // 解压 + chmod
     let cmd = r#"
         mkdir -p ~/.local/bin &&
-        gunzip -c ~/gmf-remote.gz > ~/.local/bin/gmf-remote &&
+        tar -xzf ~/gmf-remote.tar.gz -C ~/.local/bin &&
         chmod +x ~/.local/bin/gmf-remote &&
-        rm ~/gmf-remote.gz
+        rm ~/gmf-remote.tar.gz
     "#;
     ssh_once(cfg, cmd).await?;
 
     // 再次校验
     let new_sha = ssh_once(cfg, "sha256sum ~/.local/bin/gmf-remote | cut -d' ' -f1").await?;
-    if new_sha.trim() != REMOTE_ELF_SHA256 {
+    if new_sha.trim() != GMF_REMOTE_SHA256 {
         Err(anyhow!(
-            "安装失败：数据完整性校验失败：实际值 {} 与期望值 {REMOTE_ELF_SHA256} 不符",
+            "安装失败：数据完整性校验失败：实际值 {} 与期望值 {GMF_REMOTE_SHA256} 不符",
             new_sha.trim()
         ))
     } else {

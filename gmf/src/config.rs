@@ -22,7 +22,6 @@ pub fn load_or_create_config() -> Result<Config> {
     if path.exists() {
         let content = fs::read_to_string(path).context("读取配置文件失败")?;
         let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
-        println!("已加载配置文件: {}", CONFIG_FILE_NAME);
         Ok(cfg)
     } else {
         // 创建一个默认配置的实例

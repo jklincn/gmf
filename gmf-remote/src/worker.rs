@@ -1,10 +1,12 @@
-use crate::state::{AppState, ChunkProcessingStatus, ChunkState};
+use crate::r2;
+use crate::state::{AppState, ChunkProcessingStatus, ChunkState, TaskEvent};
+use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose;
 use futures::stream::{self, StreamExt};
-use r2::{self, CHUNK_SIZE, TaskEvent};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::broadcast;
@@ -12,7 +14,9 @@ use tokio::time::sleep;
 use tracing::{error, info, instrument, warn};
 
 // --- 配置常量 ---
-const CONCURRENCY: usize = 4; // 并发worker数量
+const CONCURRENCY: usize = 2;
+const NONCE_SIZE: usize = 12;
+pub const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
 // --- 作业定义 ---
 pub struct ChunkJob {
@@ -89,7 +93,7 @@ pub async fn run_task(state: AppState) -> anyhow::Result<()> {
     // 3. 并发调度与执行，并收集所有结果
     let final_chunk_states: Vec<ChunkState> = file_reader_stream
         .map(|job| process_single_chunk(state.clone(), job))
-        .buffer_unordered(CONCURRENCY)
+        .buffered(CONCURRENCY)
         .collect()
         .await;
 
@@ -141,9 +145,10 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     };
 
     // --- 1. 加密 ---
-    let key = r2::generate_key();
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
     let passphrase_b64 = general_purpose::STANDARD.encode(&key);
-    let encrypted_data = match r2::encrypt_chunk(&key, &job.data) {
+    let encrypted_data = match encrypt_chunk(&key, &job.data) {
         Ok(data) => data,
         Err(e) => {
             let reason = format!("加密失败: {}", e);
@@ -172,28 +177,28 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
         passphrase_b64,
     });
 
-    // --- 4. 等待客户端确认 ---
-    if wait_for_acknowledgement(&sender, chunk_id).await.is_err() {
-        let reason = "等待客户端确认超时".to_string();
-        error!("{}", reason);
-        return ChunkState {
-            id: chunk_id,
-            status: ChunkProcessingStatus::Failed { reason },
-        };
-    }
-    info!("收到确认");
+    // // --- 4. 等待客户端确认 ---
+    // if wait_for_acknowledgement(&sender, chunk_id).await.is_err() {
+    //     let reason = "等待客户端确认超时".to_string();
+    //     error!("{}", reason);
+    //     return ChunkState {
+    //         id: chunk_id,
+    //         status: ChunkProcessingStatus::Failed { reason },
+    //     };
+    // }
+    // info!("收到确认");
 
-    // --- 5. 删除远程对象 ---
-    if let Err(e) = delete_chunk(chunk_id).await {
-        let reason = format!("删除远程对象失败: {}", e);
-        error!("{}", reason);
-        warn!("未能清理远程对象: {}", chunk_id);
-        return ChunkState {
-            id: chunk_id,
-            status: ChunkProcessingStatus::Failed { reason },
-        };
-    }
-    info!("远程对象删除成功");
+    // // --- 5. 删除远程对象 ---
+    // if let Err(e) = delete_chunk(chunk_id).await {
+    //     let reason = format!("删除远程对象失败: {}", e);
+    //     error!("{}", reason);
+    //     warn!("未能清理远程对象: {}", chunk_id);
+    //     return ChunkState {
+    //         id: chunk_id,
+    //         status: ChunkProcessingStatus::Failed { reason },
+    //     };
+    // }
+    // info!("远程对象删除成功");
 
     // --- 6. 成功完成 ---
     info!("分块处理完成");
@@ -205,38 +210,56 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
 // --- 辅助函数 ---
 
-/// 等待特定分块的确认消息
-async fn wait_for_acknowledgement(
-    sender: &broadcast::Sender<TaskEvent>,
-    chunk_id: u32,
-) -> Result<(), tokio::time::error::Elapsed> {
-    let mut ack_receiver = sender.subscribe();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            // 忽略接收错误，只关心是否收到正确的 ack
-            if let Ok(TaskEvent::ChunkAcknowledged { chunk_id: ack_id }) = ack_receiver.recv().await
-            {
-                if ack_id == chunk_id {
-                    break;
-                }
-            }
-        }
-    })
-    .await
-}
+// /// 等待特定分块的确认消息
+// async fn wait_for_acknowledgement(
+//     sender: &broadcast::Sender<TaskEvent>,
+//     chunk_id: u32,
+// ) -> Result<(), tokio::time::error::Elapsed> {
+//     let mut ack_receiver = sender.subscribe();
+//     tokio::time::timeout(Duration::from_secs(10), async {
+//         loop {
+//             // 忽略接收错误，只关心是否收到正确的 ack
+//             if let Ok(TaskEvent::ChunkAcknowledged { chunk_id: ack_id }) = ack_receiver.recv().await
+//             {
+//                 if ack_id == chunk_id {
+//                     break;
+//                 }
+//             }
+//         }
+//     })
+//     .await
+// }
 
 async fn upload_chunk(chunk_id: u32, data: &[u8]) -> Result<()> {
-    // loop {}
-    // let chunk_id = chunk_id.to_string();
-    // let client = r2::get_client(None).await?;
-    // r2::upload_object(&client, data, &chunk_id).await?;
+    let start = Instant::now();
+    r2::put_object(&chunk_id.to_string(), data).await?;
+    let duration = start.elapsed();
+    info!("上传耗时（秒）: {} s", duration.as_secs_f32());
     Ok(())
 }
 
 async fn delete_chunk(chunk_id: u32) -> Result<()> {
-    // loop {}
-    // let chunk_id = chunk_id.to_string();
-    // let client = r2::get_client(None).await?;
-    // r2::remove_object(&client, &chunk_id).await?;
+    r2::delete_object(&chunk_id.to_string()).await?;
     Ok(())
+}
+
+fn encrypt_chunk(key_bytes: &[u8; 32], input_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // 生成随机 nonce（每个文件都唯一）
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, input_data)
+        .map_err(|e| anyhow::anyhow!("加密失败: {:?}", e))?;
+
+    // 输出格式：nonce || ciphertext
+    let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+    result.extend_from_slice(&nonce_bytes[..]);
+    result.extend_from_slice(&ciphertext);
+
+    Ok(result)
 }

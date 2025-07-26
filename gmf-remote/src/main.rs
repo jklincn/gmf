@@ -1,13 +1,16 @@
 mod handler;
 mod state;
 mod worker;
+mod r2;
 
+use anyhow::anyhow;
 use axum::{
     Router,
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rustls::crypto::{CryptoProvider, ring};
 use time::macros::format_description;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing_subscriber::{
@@ -39,30 +42,37 @@ async fn main() -> anyhow::Result<()> {
     set_log();
 
     let pid = std::process::id();
-    println!("{}", pid);
+    println!("{pid}");
+    CryptoProvider::install_default(ring::default_provider())
+        .map_err(|e| anyhow!("Failed to install default rustls crypto provider: {:?}", e))?;
 
     let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec!["localhost".to_string()])?;
+        generate_simple_self_signed(vec!["localhost".to_string()])
+            .map_err(|e| anyhow!("generate self-signed cert failed: {:?}", e))?;
+
     let tls_config = RustlsConfig::from_pem(
         cert.pem().into_bytes(),
         signing_key.serialize_pem().into_bytes(),
     )
     .await?;
+
     let app_state = state::AppState::new();
 
     let app = Router::new()
         .route("/", get(handler::healthy))
         .route("/setup", post(handler::setup))
         .route("/start", get(handler::start))
-        .route("/acknowledge/{chunk_id}", post(handler::acknowledge))
+        // .route("/acknowledge/{chunk_id}", post(handler::acknowledge))
         .with_state(app_state)
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
 
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
     println!("{}", listener.local_addr()?.port());
+
     axum_server::from_tcp_rustls(listener, tls_config)
         .serve(app.into_make_service())
         .await?;
+
     Ok(())
 }
