@@ -4,7 +4,6 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use gmf_common::NONCE_SIZE;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -14,33 +13,44 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 const MAGIC: &[u8; 13] = b"gmf temp file";
-const HEADER_SIZE: u64 = 24;
+const HEADER_SIZE: u64 = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Header {
     pub magic: [u8; 13],
     _padding: [u8; 3],
-    pub chunk_count: u32,
-    pub written_count: u32,
+    pub chunk_count: u64,
+    pub written_count: u64,
 }
 
 impl Header {
+    /// 将 Header 序列化为字节数组
     fn to_bytes(self) -> [u8; HEADER_SIZE as usize] {
         let mut buf = [0u8; HEADER_SIZE as usize];
-        buf[..13].copy_from_slice(&self.magic);
-        buf[16..20].copy_from_slice(&self.chunk_count.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.written_count.to_le_bytes());
+
+        // magic: 0..13
+        buf[0..13].copy_from_slice(&self.magic);
+
+        // padding: 13..16
+
+        buf[16..24].copy_from_slice(&self.chunk_count.to_le_bytes());
+
+        buf[24..32].copy_from_slice(&self.written_count.to_le_bytes());
+
         buf
     }
 
     /// 从字节数组创建 Header
     fn from_bytes(bytes: [u8; HEADER_SIZE as usize]) -> Self {
         let mut magic = [0u8; 13];
-        magic.copy_from_slice(&bytes[..13]);
+        magic.copy_from_slice(&bytes[0..13]);
 
-        let chunk_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let written_count = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let chunk_count_bytes: [u8; 8] = bytes[16..24].try_into().unwrap();
+        let chunk_count = u64::from_le_bytes(chunk_count_bytes);
+
+        let written_count_bytes: [u8; 8] = bytes[24..32].try_into().unwrap();
+        let written_count = u64::from_le_bytes(written_count_bytes);
 
         Self {
             magic,
@@ -64,8 +74,8 @@ impl GMFFile {
         source_filename: &str,
         source_size: u64,
         source_sha256: &str,
-        chunk_count: u32,
-    ) -> Result<(Self, u32)> {
+        chunk_count: u64,
+    ) -> Result<(Self, u64)> {
         let gmf_filename = PathBuf::from(format!(".{source_sha256}.gmf"));
 
         if gmf_filename.exists() {
@@ -78,10 +88,7 @@ impl GMFFile {
             ) {
                 Ok(gmf_file) => {
                     let completed_chunks = gmf_file.header.written_count;
-                    println!(
-                        "检测到未完成的下载任务，从第 {}/{} 个分块继续。",
-                        completed_chunks, gmf_file.header.chunk_count
-                    );
+                    println!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
                     return Ok((gmf_file, completed_chunks));
                 }
                 Err(e) => {
@@ -102,10 +109,10 @@ impl GMFFile {
         Ok((gmf_file, 0)) // 新文件，已完成 0 个
     }
 
-    // --- 新增: 打开并验证现有文件 ---
+    // 打开并验证现有文件 ---
     fn open_and_validate<P: AsRef<Path>>(
         path: P,
-        expected_chunk_count: u32,
+        expected_chunk_count: u64,
         source_filename: &str,
         source_size: u64,
         source_sha256: &str,
@@ -156,7 +163,7 @@ impl GMFFile {
 
     fn create<P: AsRef<Path>>(
         path: P,
-        chunk_count: u32,
+        chunk_count: u64,
         source_filename: &str,
         source_size: u64,
         source_sha256: &str,
@@ -180,7 +187,7 @@ impl GMFFile {
         })
     }
 
-    pub fn write_chunk(&mut self, idx: u32, data: &[u8]) -> Result<()> {
+    pub fn write_chunk(&mut self, idx: u64, data: &[u8]) -> Result<()> {
         if idx != self.header.written_count {
             bail!(
                 "写入顺序错误：期望写入块 {}, 但收到了块 {}",
@@ -203,7 +210,7 @@ impl GMFFile {
 
         self.header.written_count += 1;
         self.file
-            .seek(SeekFrom::Start(20))
+            .seek(SeekFrom::Start(24))
             .context("移动文件指针到头部失败")?;
         self.file
             .write_all(&self.header.written_count.to_le_bytes())
@@ -214,14 +221,14 @@ impl GMFFile {
 }
 
 struct DecryptedChunk {
-    id: u32,
+    id: u64,
     data: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub enum ChunkResult {
-    Success(u32),
-    Failure(u32, anyhow::Error),
+    Success(u64),
+    Failure(u64, anyhow::Error),
 }
 
 pub struct GmfSession {
@@ -231,7 +238,7 @@ pub struct GmfSession {
 }
 
 impl GmfSession {
-    pub fn new(gmf_file: GMFFile, completed_chunks: u32) -> Self {
+    pub fn new(gmf_file: GMFFile, completed_chunks: u64) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
@@ -248,7 +255,7 @@ impl GmfSession {
         }
     }
 
-    pub fn handle_chunk(&self, chunk_id: u32, passphrase_b64: String) -> JoinHandle<ChunkResult> {
+    pub fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> JoinHandle<ChunkResult> {
         let decrypted_tx = self.decrypted_tx.clone();
 
         tokio::spawn(async move {
@@ -284,7 +291,7 @@ impl GmfSession {
                 // 3. 将解密后的数据发送给写入器任务
                 decrypted_tx
                     .send(DecryptedChunk {
-                        id: chunk_id - 1, // todo：目前服务端是从 1 开始计数，这里减 1 以匹配 GMFFile 的索引
+                        id: chunk_id,
                         data: plain_data,
                     })
                     .await
@@ -368,7 +375,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     }
 
     println!("正在校验最终文件...");
-    let mut final_file = File::open(&temp_filename)
+    let final_file = File::open(&temp_filename)
         .with_context(|| format!("无法打开最终文件 '{temp_filename}' 进行校验"))?;
 
     let final_size = final_file.metadata()?.len();
@@ -380,16 +387,14 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         );
     }
 
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut final_file, &mut hasher).context("计算文件 SHA256 哈希值失败")?;
+    let sha256 = gmf_common::calc_sha256(temp_filename.as_ref())
+        .with_context(|| format!("计算最终文件 '{temp_filename}' 的 SHA256 失败"))?;
 
-    let calculated_sha = format!("{:x}", hasher.finalize());
-
-    if calculated_sha.to_lowercase() != gmf_file.source_sha256.to_lowercase() {
+    if sha256 != gmf_file.source_sha256 {
         bail!(
             "文件 SHA256 校验失败：\n  期望值: {}\n  计算值: {}",
             gmf_file.source_sha256,
-            calculated_sha
+            sha256
         );
     }
 
@@ -404,7 +409,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
 async fn run_writer_task(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
-    completed_chunks: u32,
+    completed_chunks: u64,
 ) -> Result<()> {
     let mut buffer = BTreeMap::new();
     let mut next_chunk_to_write = completed_chunks;

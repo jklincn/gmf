@@ -1,24 +1,23 @@
 mod config;
-mod gmf_file;
+mod file;
 mod r2;
 mod remote;
 
 use anyhow::Result;
 use clap::Parser;
-use remote::start_remote;
+use tokio::signal;
 
-// 1. 定义自定义的解析函数
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
-fn parse_chunk_size(s: &str) -> Result<usize, String> {
+fn parse_chunk_size(s: &str) -> Result<u64, String> {
     let s_lower = s.to_lowercase();
-    let (num_str, multiplier) = if let Some(stripped) = s_lower.strip_suffix("gb") {
-        (stripped, 1024 * 1024 * 1024)
+
+    let (num_str, multiplier): (&str, u64) = if let Some(stripped) = s_lower.strip_suffix("gb") {
+        (stripped.trim(), 1024 * 1024 * 1024)
     } else if let Some(stripped) = s_lower.strip_suffix("mb") {
-        (stripped, 1024 * 1024)
+        (stripped.trim(), 1024 * 1024)
     } else if let Some(stripped) = s_lower.strip_suffix("kb") {
-        (stripped, 1024)
+        (stripped.trim(), 1024)
     } else {
-        // 如果没有单位，则整个字符串都是数字，乘数为 1
         (s_lower.as_str(), 1)
     };
 
@@ -28,13 +27,11 @@ fn parse_chunk_size(s: &str) -> Result<usize, String> {
         .parse::<u64>()
         .map_err(|_| format!("无效的数字部分: '{}'", num_str))?;
 
-    // 计算最终的字节数，并检查溢出
     let bytes = num
         .checked_mul(multiplier)
-        .ok_or_else(|| "计算出的数值太大，导致溢出".to_string())?;
+        .ok_or_else(|| "计算出的数值太大，导致溢出 (超过 u64::MAX)".to_string())?;
 
-    // 将 u64 转换为 usize，这在 32 位系统上是必要的安全检查
-    usize::try_from(bytes).map_err(|_| "数值对于当前系统架构过大 (超过 usize)".to_string())
+    Ok(bytes)
 }
 
 #[derive(Parser, Debug)]
@@ -42,7 +39,7 @@ fn parse_chunk_size(s: &str) -> Result<usize, String> {
     author,
     version,
     about,
-    long_about = "GMF(Get My File): 使用运营商白名单绕开限速获取我的文件"
+    long_about = "\nGMF(Get My File): 使用 Cloudflare 绕开运营商限速来获取远程服务器上的文件"
 )]
 struct Args {
     /// 要上传的文件路径
@@ -57,7 +54,7 @@ struct Args {
         default_value_t = 10 * 1024 * 1024, // 默认值: 10 MiB
         value_parser = parse_chunk_size
     )]
-    chunk_size: usize,
+    chunk_size: u64,
 
     /// 设置并发上传的任务数量
     #[arg(
@@ -66,7 +63,9 @@ struct Args {
         value_name = "NUMBER",
         default_value_t = 4 // 默认值: 4
     )]
-    concurrency: usize,
+    concurrency: u64,
+    #[arg(long, short = 'v', default_value_t = false)]
+    debug: bool,
 }
 
 #[tokio::main]
@@ -76,18 +75,28 @@ async fn main() -> Result<()> {
     let filepath = args.path;
     let config = config::load_or_create_config()?;
 
-    let mut remote = start_remote(&config).await?;
+    let mut remote = remote::start_remote(&config).await?;
 
     // 主逻辑
-    let logic_result: Result<()> = async {
-        // 4. 使用从 args 中获取的值，而不是 const 常量
-        remote
-            .setup(&filepath, args.chunk_size, args.concurrency)
-            .await?;
-        remote.start().await?;
-        Ok(())
-    }
-    .await;
+    let logic_result: Result<()> = tokio::select! {
+        // 分支 1: 正常执行业务逻辑
+        res = async {
+            remote
+                .setup(&filepath, args.chunk_size, args.concurrency)
+                .await?;
+            remote.start().await?;
+            Ok(())
+        } => {
+            res
+        },
+
+        // 分支 2: 监听 Ctrl+C 信号
+        // BUG: 远程服务未正确关闭
+        _ = signal::ctrl_c() => {
+            println!("\n接收到 Ctrl+C 信号，开始清理工作");
+            Ok(())
+        }
+    };
 
     if let Err(e) = remote.shutdown().await {
         eprintln!("清理 gmf-remote 时发生错误: {e}");

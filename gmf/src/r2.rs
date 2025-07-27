@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream;
+use s3::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
-use s3::{Bucket, BucketConfiguration};
 use tokio::sync::OnceCell;
 
 use crate::config;
@@ -12,7 +14,6 @@ pub const BUCKET_NAME: &str = "gmf";
 // 用于对象操作的共享存储桶实例
 static BUCKET_INSTANCE: OnceCell<Box<Bucket>> = OnceCell::const_new();
 
-// 内部函数，用于获取或初始化共享的 Bucket 实例，用于对象操作
 async fn get_bucket() -> Result<&'static Box<Bucket>> {
     BUCKET_INSTANCE
         .get_or_try_init(|| async {
@@ -31,11 +32,8 @@ async fn get_bucket() -> Result<&'static Box<Bucket>> {
                 None,
             )
             .context("无法创建 R2 凭证")?;
-            let config = BucketConfiguration::default();
 
-            let create_bucket_response =
-                Bucket::create(BUCKET_NAME, region, credentials, config).await?;
-            let bucket = create_bucket_response.bucket;
+            let bucket = Bucket::new(BUCKET_NAME, region, credentials)?;
 
             let result: Result<Box<Bucket>> = Ok(bucket);
             result
@@ -76,13 +74,46 @@ pub async fn get_object(path: &str) -> Result<Bytes> {
     Ok(response.into_bytes())
 }
 
-pub async fn delete_bucket() -> Result<()> {
+async fn clear_bucket() -> Result<()> {
     let bucket = get_bucket().await?;
 
+    // 获取存储桶中的所有对象
+    let list_results = bucket.list("/".to_string(), None).await?;
+    let all_keys: Vec<String> = list_results
+        .into_iter()
+        .flat_map(|page| page.contents)
+        .map(|object| object.key)
+        .collect();
+
+    if all_keys.is_empty() {
+        return Ok(());
+    }
+
+    let delete_futures = stream::iter(all_keys).map(|key| async move {
+        match bucket.delete_object(&key).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                eprintln!("删除对象 '{}' 失败: {}", key, e);
+                Err(anyhow::anyhow!("删除对象 '{}' 失败", key))
+            }
+        }
+    });
+
+    let results: Vec<Result<()>> = delete_futures.buffer_unordered(10).collect().await;
+
+    for result in results {
+        result?;
+    }
+
+    Ok(())
+}
+
+pub async fn delete_bucket() -> Result<()> {
+    let bucket = get_bucket().await?;
+    clear_bucket().await?;
     bucket
         .delete()
         .await
         .context(format!("删除存储桶 '{BUCKET_NAME}' 失败"))?;
-
     Ok(())
 }

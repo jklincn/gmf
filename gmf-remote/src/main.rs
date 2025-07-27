@@ -13,15 +13,14 @@ use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::crypto::{CryptoProvider, ring};
 use time::macros::format_description;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
-use tracing_subscriber::{
-    EnvFilter, fmt::time::UtcTime, layer::SubscriberExt, util::SubscriberInitExt,
-};
+use tracing_subscriber::{fmt::time::UtcTime, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn set_log() {
     let log_file_path = ".gmf-remote.log";
     let log_file = std::fs::File::create(log_file_path).expect("无法创建日志文件");
 
-    let filter = EnvFilter::new("info");
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     let timer_format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
     let timer = UtcTime::new(timer_format);
@@ -29,11 +28,18 @@ fn set_log() {
     tracing_subscriber::registry()
         .with(filter)
         .with(
+            // 文件日志配置
             tracing_subscriber::fmt::layer()
                 .with_writer(log_file)
                 .with_ansi(false)
-                .with_timer(timer),
+                .with_timer(timer.clone()),
         )
+        // .with(
+        //     // 控制台日志配置，用于本地debug
+        //     tracing_subscriber::fmt::layer()
+        //         .with_writer(std::io::stderr)
+        //         .with_timer(timer),
+        // )
         .init();
 }
 

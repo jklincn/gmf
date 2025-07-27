@@ -1,7 +1,8 @@
 use crate::config::Config;
-use crate::gmf_file::{ChunkResult, GMFFile, GmfSession};
+use crate::file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, format_size};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
@@ -16,33 +17,34 @@ use tokio::time::sleep;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const SSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct RemoteRunner {
     cfg: Config,
-    pid: u32,
+    pid: u64,
     url: String,
     forward_child: tokio::process::Child,
     session: Option<GmfSession>,
-    completed_chunks: u32,
+    completed_chunks: u64,
     multi_progress: MultiProgress,
-    download_pb: ProgressBar,
+    upload_pb: ProgressBar,
+    chunk_size: Option<u64>,
 }
 
 impl RemoteRunner {
     pub async fn setup(
         &mut self,
         file_path: &str,
-        chunk_size: usize,
-        concurrency: usize,
+        chunk_size: u64,
+        concurrency: u64,
     ) -> Result<()> {
-        let client = Client::builder()
+        let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
-            .timeout(Duration::from_secs(10))
-            .build()
-            .context("创建 reqwest 客户端失败")?;
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()?;
 
         let payload = SetupRequestPayload {
             path: file_path.to_string(),
@@ -51,7 +53,7 @@ impl RemoteRunner {
         };
         let url = format!("{}/setup", self.url);
 
-        println!("正在发送 setup 请求到 {}", url);
+        println!("正在取得文件信息...");
         let response = client
             .post(&url)
             .json(&payload)
@@ -75,17 +77,18 @@ impl RemoteRunner {
 
         // 存储已完成的分块数
         self.completed_chunks = completed_chunks;
+        self.chunk_size = Some(chunk_size as u64);
 
-        self.download_pb = self
+        self.upload_pb = self
             .multi_progress
             .add(ProgressBar::new(setup_info.total_chunks as u64));
-        self.download_pb.set_style(
+        self.upload_pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} 上传进度 [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+                .template("上传进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
         // 如果是断点续传，设置初始进度
-        self.download_pb.set_position(completed_chunks as u64);
+        self.upload_pb.set_position(completed_chunks as u64);
 
         let session = GmfSession::new(gmf_file, self.completed_chunks);
         self.session = Some(session);
@@ -95,21 +98,16 @@ impl RemoteRunner {
 
     // 开始处理
     pub async fn start(&mut self) -> Result<()> {
-        let session = self
-            .session
-            .take()
-            .ok_or_else(|| anyhow!("必须先调用 setup() 方法才能开始任务"))?;
+        let session = self.session.take().unwrap();
 
-        let client = Client::builder()
+        let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            .connect_timeout(Duration::from_secs(20))
             .build()?;
         let sse_url = format!("{}/start", self.url);
 
-        // 服务端 chunk_id 从 1 开始，而我们的 completed_chunks 是 0-based 计数
-        // 如果 completed_chunks 是 5，表示 0,1,2,3,4 已完成，下一个需要的是 5 (对应服务器的 chunk_id 6)
-        // 所以，请求服务器从 completed_chunks + 1 开始发送。
         let start_payload = StartRequestPayload {
-            resume_from_chunk_id: self.completed_chunks + 1,
+            resume_from_chunk_id: self.completed_chunks,
         };
 
         let mut event_source = EventSource::new(
@@ -119,57 +117,93 @@ impl RemoteRunner {
                 .json(&start_payload),
         )?;
 
-        let mut worker_handles = Vec::new();
+        let mut worker_handles = FuturesUnordered::new();
+        let mut task_completed_signal = false; // 用于标记是否收到了服务端的完成信号
 
         loop {
             tokio::select! {
-                Some(event) = event_source.next() => {
+            // 偏向于优先处理已完成的任务，避免积压
+                biased;
+
+                // 分支1: 处理已完成的 worker 任务
+                // 当 worker_handles 不为空时，这个分支才会被轮询
+                Some(result) = worker_handles.next(), if !worker_handles.is_empty() => {
+                    // 明确告诉编译器 result 的类型
+                    let result: Result<ChunkResult, tokio::task::JoinError> = result;
+
+                    match result {
+                        Ok(ChunkResult::Success(_id)) => {
+                        }
+                        Ok(ChunkResult::Failure(id, e)) => {
+                        }
+                        Err(join_error) => {
+                            if join_error.is_panic() {
+                                let panic_payload = join_error.into_panic();
+                                if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                                    bail!("一个 Worker 任务发生 Panic: {s:?}");
+                                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                    bail!("一个 Worker 任务发生 Panic: {s:?}");
+                                } else {
+                                    bail!("一个 Worker 任务发生未知类型的 Panic");
+                                }
+                            } else {
+                                return Err(anyhow!("Worker 任务被终止: {}", join_error));
+                            }
+                        }
+                    }
+                }
+
+                // 分支2: 从服务端接收新任务
+                // 仅当服务端尚未发出完成信号时，才接收新事件
+                event = event_source.next(), if !task_completed_signal => {
                     match event {
-                        Ok(Event::Message(message)) => {
+                        Some(Ok(Event::Message(message))) => {
                             let task_event: TaskEvent = serde_json::from_str(&message.data)
                                 .context("解析服务端事件失败")?;
 
                             if let TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } = task_event {
-                                // 如果这个块已经下载过了，就跳过
-                                // 注意：服务端 chunk_id 是 1-based
-                                if chunk_id <= self.completed_chunks {
+                                if chunk_id < self.completed_chunks {
                                     continue;
                                 }
-                                self.download_pb.inc(1);
-                                let handle = session.handle_chunk(
-                                    chunk_id,
-                                    passphrase_b64,
-                                );
+                                self.upload_pb.inc(1);
+                                let handle = session.handle_chunk(chunk_id, passphrase_b64);
+                                // 将新任务推入 FuturesUnordered
                                 worker_handles.push(handle);
-
                             } else if let TaskEvent::TaskCompleted = task_event {
-                                self.download_pb.finish_with_message("Completed");
+                                self.upload_pb.finish_with_message("服务端上传完成");
+                                task_completed_signal = true; // 标记服务端任务已全部派发
                                 event_source.close();
-                                break;
                             } else if let TaskEvent::Error { message } = task_event {
                                 bail!("服务端错误: {}", message);
                             }
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
+                            self.upload_pb.abandon_with_message("发送错误中断");
                             return Err(anyhow!("SSE 流意外断开: {}", e));
+                        }
+                        None => {
+                            // SSE 流正常关闭
+                            task_completed_signal = true;
                         }
                         _ => {}
                     }
                 }
-                 _ = sleep(SSE_TIMEOUT) => {
-                    // 如果已经有完成的分块，并且没有新的 worker 在运行，这可能是正常的，因为我们可能在等待服务器跳过已完成的块
-                    // 只有当一个 worker 都没有启动过，才认为是超时
-                    if worker_handles.is_empty() && self.completed_chunks == 0 {
-                        bail!("SSE 事件流超时：超过 {:?} 未收到任何事件", SSE_TIMEOUT);
-                    }
-                 }
-            }
-        }
 
-        for handle in worker_handles {
-            match handle.await? {
-                ChunkResult::Success(_id) => {}
-                ChunkResult::Failure(id, e) => return Err(e.context(format!("Worker {id} 失败"))),
+                // 分支3: 超时检查
+                _ = sleep(SSE_TIMEOUT), if worker_handles.is_empty() && !task_completed_signal => {
+                        if self.completed_chunks == 0 {
+                        bail!("SSE 事件流超时：超过 {:?} 未收到任何事件", SSE_TIMEOUT);
+                        }
+                }
+
+                // 循环退出条件
+                else => {
+                    // 当其他分支都无法再取得进展时，进入此分支
+                    // 如果服务端已发完任务，并且所有 worker 都已处理完毕，则退出循环
+                    if task_completed_signal && worker_handles.is_empty() {
+                        break;
+                    }
+                }
             }
         }
 
@@ -244,7 +278,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("gmf-remote 未输出 PID"))?;
-    let pid: u32 = pid_line.trim().parse().context("PID 解析失败")?;
+    let pid: u64 = pid_line.trim().parse().context("PID 解析失败")?;
 
     // 读取端口
     let port_line = reader
@@ -293,11 +327,13 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         session: None,
         completed_chunks: 0,
         multi_progress: mp,
-        download_pb: ProgressBar::new(0),
+        upload_pb: ProgressBar::new(0),
+        chunk_size: None,
     })
 }
 
 async fn ensure_remote(cfg: &Config) -> Result<()> {
+    println!("正常尝试连接远程服务器 {}", cfg.host);
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
     println!("远程服务器 {} 连接成功", cfg.host);
 
@@ -395,6 +431,7 @@ async fn scp_send(cfg: &Config, local: &Path, remote: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("scp 上传失败"))
 }
 
+// TODO: 切换到 russh 库（设置超时等）
 async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
     let output = {
         let mut cmd = Command::new("ssh");

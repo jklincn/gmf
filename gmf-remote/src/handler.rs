@@ -1,5 +1,6 @@
 use crate::state::{AppState, TaskMetadata};
 use crate::worker::run_task;
+use anyhow::Context;
 use async_stream::stream;
 use axum::{
     Json,
@@ -10,14 +11,10 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use gmf_common::{format_size, SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent};
-use sha2::{Digest, Sha256};
-use std::io;
-use std::{
-    convert::Infallible,
-    fs::File,
-    path::{Path, PathBuf},
+use gmf_common::{
+    SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, file_size, format_size,
 };
+use std::{convert::Infallible, path::PathBuf};
 use tokio::sync::broadcast;
 use tracing::{error, info, instrument, warn};
 
@@ -27,27 +24,27 @@ pub async fn healthy() -> StatusCode {
     StatusCode::OK
 }
 
-fn calculate_sha256(path: &Path) -> Result<String, std::io::Error> {
-    let mut input = File::open(path)?;
-    let mut hasher = Sha256::new();
-
-    io::copy(&mut input, &mut hasher)?;
-
-    let hash = hasher.finalize();
-
-    Ok(hex::encode(hash))
-}
-
-#[instrument(skip(state, payload), fields(path = %payload.path, chunk_size = payload.chunk_size))]
+// curl -k -X POST -H "Content-Type: application/json" -d '{"path": "~/Breaking.Bad.S01E04.2008.2160p.WEBrip.x265.10bit.AC3￡cXcY@FRDS.mkv","chunk_size": 10485760,"concurrency": 4}' https://localhost:46105/setup
+#[instrument(skip(state, payload))]
 pub async fn setup(
     State(state): State<AppState>,
     Json(payload): Json<SetupRequestPayload>,
 ) -> Result<impl IntoResponse, Response> {
+    info!(
+        "设置任务: 文件路径 = {}, 分块大小 = {}, 并发数 = {}",
+        payload.path,
+        format_size(payload.chunk_size),
+        payload.concurrency
+    );
     if payload.chunk_size == 0 {
         let msg = "chunk_size 不能为 0".to_string();
         return Err((StatusCode::BAD_REQUEST, msg).into_response());
     }
 
+    info!(
+        "正在处理文件路径: {}",
+        shellexpand::tilde(&payload.path).to_string()
+    );
     // 路径处理和验证
     let source_path: PathBuf = match shellexpand::tilde(&payload.path).to_string().parse() {
         Ok(p) => p,
@@ -57,6 +54,7 @@ pub async fn setup(
         }
     };
 
+    info!("已解析文件路径: {}", source_path.display());
     let source_filename = match source_path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name.to_string(),
         None => {
@@ -65,32 +63,31 @@ pub async fn setup(
         }
     };
 
-    // 文件元数据
-    let file_metadata = match File::open(&source_path) {
-        Ok(file) => match file.metadata() {
-            Ok(meta) => meta,
-            Err(e) => {
-                let msg = format!("无法获取文件 '{}' 的元数据: {}", source_path.display(), e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, msg).into_response());
-            }
-        },
-        Err(e) => {
-            let msg = format!("无法打开文件 `{}`: {}", source_path.display(), e);
-            return Err((StatusCode::BAD_REQUEST, msg).into_response());
-        }
-    };
+    info!(
+        "源文件名: {}, 正在获取文件大小和 SHA256 哈希",
+        source_filename
+    );
 
-    if !file_metadata.is_file() {
-        let msg = format!("提供的路径 '{}' 不是一个文件", source_path.display());
-        return Err((StatusCode::BAD_REQUEST, msg).into_response());
-    }
+    let source_size = file_size(&source_path)
+        .with_context(|| format!("获取文件 '{}' 的大小失败", source_path.display()))
+        .map_err(|e| {
+            let msg = e.to_string();
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        })?;
 
-    let source_size = file_metadata.len();
+    let total_chunks = (source_size as f64 / payload.chunk_size as f64).ceil() as u64;
 
-    let total_chunks = (source_size as f64 / payload.chunk_size as f64).ceil() as u32;
+    info!(
+        "源文件大小: {}, 分块大小: {}, 总分块数: {}",
+        format_size(source_size),
+        format_size(payload.chunk_size),
+        total_chunks
+    );
 
     // 计算文件的 SHA256 哈希
-    let source_sha256 = match calculate_sha256(&source_path) {
+    info!("正在计算源文件 '{}' 的 SHA256 哈希", source_path.display());
+    let start_time = std::time::Instant::now();
+    let source_sha256 = match gmf_common::calc_sha256(&source_path) {
         Ok(hash) => hash,
         Err(e) => {
             let msg = format!(
@@ -101,7 +98,10 @@ pub async fn setup(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, msg).into_response());
         }
     };
+    let elapsed = start_time.elapsed();
+    info!("SHA256 哈希计算完成，耗时: {:.2?}", elapsed);
 
+    info!("源文件 SHA256 哈希: {}", source_sha256);
     // 初始化 TaskMetadata
     let task_metadata = TaskMetadata {
         source_path,
@@ -109,10 +109,10 @@ pub async fn setup(
         source_size,
         chunk_size: payload.chunk_size,
         total_chunks,
-        sha256: source_sha256.clone(),
         concurrency: payload.concurrency,
     };
 
+    info!("任务元数据已创建，正在初始化全局状态");
     // 更新全局状态
     {
         let mut context = state.0.lock().unwrap();
@@ -120,7 +120,6 @@ pub async fn setup(
         info!(
             file = %task_metadata.source_filename,
             size = %format_size(task_metadata.source_size),
-            sha256 = %task_metadata.sha256,
             chunk_size = %format_size(task_metadata.chunk_size.try_into().unwrap()), // 记录分块大小
             total_chunks = task_metadata.total_chunks,
             "任务元数据已创建，正在初始化全局状态"
@@ -128,6 +127,7 @@ pub async fn setup(
         context.metadata = Some(task_metadata);
     }
 
+    info!("全局状态已更新，准备返回响应");
     let response_data = SetupResponse {
         filename: source_filename,
         size: source_size,
@@ -138,6 +138,7 @@ pub async fn setup(
     Ok((StatusCode::OK, Json(response_data)))
 }
 
+/// curl -v -N -k -H "Content-Type: application/json" -H "Accept: text/event-stream" -d '{"resume_from_chunk_id": 0}' https://127.0.0.1:39567/start
 #[instrument(skip(state, payload), name = "start_task_sse_stream", fields(resume_from = %payload.resume_from_chunk_id))]
 pub async fn start(
     State(state): State<AppState>,

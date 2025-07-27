@@ -14,13 +14,13 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tracing::{error, info, instrument};
 
 pub struct ChunkJob {
-    pub id: u32,
+    pub id: u64,
     pub data: Vec<u8>,
 }
 
 // --- 主任务调度器 ---
 #[instrument(skip_all, name = "run_task", fields(resume_from = resume_from_chunk_id))]
-pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Result<()> {
+pub async fn run_task(state: AppState, resume_from_chunk_id: u64) -> anyhow::Result<()> {
     info!("Worker 任务已启动");
 
     // 1. 初始化
@@ -44,12 +44,11 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Res
 
     // 处理断点续传的 seek 逻辑 ---
     let mut file = File::open(&metadata.source_path).await?;
-    if resume_from_chunk_id > 1 {
-        // chunk_id 是 1-based, seek offset 是 0-based.
-        // 如果从第 6 块开始，需要跳过前 5 块。
-        let offset = (resume_from_chunk_id as u64 - 1) * chunk_size as u64;
+    if resume_from_chunk_id > 0 {
+        // 如果从第 1 块(ID=1)或之后开始，才需要 seek。ID=0 是第一个块，不需要 seek。
+        let offset = resume_from_chunk_id as u64 * chunk_size as u64;
         info!(
-            "恢复任务，从分块 {} 开始，跳过文件前 {} 字节",
+            "恢复任务，从分块 #{} 开始，跳过文件前 {} 字节",
             resume_from_chunk_id, offset
         );
         file.seek(tokio::io::SeekFrom::Start(offset)).await?;
@@ -59,12 +58,12 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Res
     let file_reader_stream = stream::unfold(
         (reader, resume_from_chunk_id),
         |(mut reader, chunk_id)| async move {
-            let mut buf = vec![0u8; chunk_size];
-            let mut filled = 0;
+            let mut buf = vec![0u8; chunk_size as usize];
+            let mut filled: usize = 0;
 
             // read 不保证每次都读取 CHUNK_SIZE 字节，因此需要循环读取直到填满或 EOF
             loop {
-                if filled == chunk_size {
+                if filled == chunk_size as usize {
                     break;
                 }
                 match reader.read(&mut buf[filled..]).await {
@@ -95,47 +94,44 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u32) -> anyhow::Res
     // 3. 并发调度与执行，并收集所有结果
     let final_chunk_states: Vec<ChunkState> = file_reader_stream
         .map(|job| process_single_chunk(state.clone(), job))
-        .buffered(concurrency)
+        .buffered(concurrency as usize)
         .collect()
         .await;
 
-    // 4. 最终状态检查：基于收集到的结果
-    let mut completed_count = 0;
-    let mut failed_count = 0;
+    let mut failed_reasons = Vec::new();
     for chunk_state in &final_chunk_states {
-        match chunk_state.status {
-            ChunkProcessingStatus::Completed => completed_count += 1,
-            ChunkProcessingStatus::Failed { .. } => failed_count += 1,
+        if let ChunkProcessingStatus::Failed { reason } = &chunk_state.status {
+            // 将每个失败分块的 ID 和具体原因收集起来
+            failed_reasons.push(format!("分块 #{}: {}", chunk_state.id, reason));
         }
     }
 
-    // 计算本次任务预期应该处理多少个分块
-    let expected_chunks_to_process = metadata
-        .total_chunks
-        .saturating_sub(resume_from_chunk_id - 1);
-
     info!(
-        total_in_this_run = expected_chunks_to_process,
-        completed = completed_count,
-        failed = failed_count,
+        total_in_this_run = metadata.total_chunks.saturating_sub(resume_from_chunk_id),
+        completed = final_chunk_states.len() - failed_reasons.len(),
+        failed = failed_reasons.len(),
         "所有分块处理完毕"
     );
 
-    if failed_count == 0 && completed_count as u32 == expected_chunks_to_process {
+    // 根据是否有失败来发送最终事件
+    if !failed_reasons.is_empty() {
+        // 如果有任何失败，构造一个详细的错误报告
+        let error_summary = format!(
+            "任务处理失败，以下分块出错:\n- {}",
+            failed_reasons.join("\n- ")
+        );
+        error!("{}", error_summary);
+
+        // 发送详细的错误事件给客户端
+        let _ = sender.send(TaskEvent::Error {
+            message: error_summary,
+        });
+    } else {
         info!("任务成功结束");
         let _ = sender.send(TaskEvent::TaskCompleted);
-        Ok(())
-    } else {
-        let message = format!(
-            "任务处理失败。本次运行应处理 {} 个分块，成功 {} 个，失败 {} 个。",
-            expected_chunks_to_process, completed_count, failed_count
-        );
-        error!("{}", message);
-        let _ = sender.send(TaskEvent::Error {
-            message: message.clone(),
-        });
-        bail!(message);
     }
+
+    Ok(())
 }
 
 // --- 单个分块处理器 (Worker) ---
@@ -168,8 +164,8 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
     // --- 上传 ---
     if let Err(e) = upload_chunk(chunk_id, &encrypted_data).await {
-        let reason = format!("上传失败: {e}");
-        error!("{}", reason);
+        let reason = format!("上传失败: {:?}", e);
+        error!("分块处理失败: {}", reason);
         return ChunkState {
             id: chunk_id,
             status: ChunkProcessingStatus::Failed { reason },
@@ -193,7 +189,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
 // --- 辅助函数 ---
 
-async fn upload_chunk(chunk_id: u32, data: &[u8]) -> Result<()> {
+async fn upload_chunk(chunk_id: u64, data: &[u8]) -> Result<()> {
     let start = Instant::now();
     r2::put_object(&chunk_id.to_string(), data).await?;
     let duration = start.elapsed();

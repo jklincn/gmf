@@ -13,7 +13,7 @@ pub enum ChunkProcessingStatus {
 // ChunkState 现在只记录最终结果
 #[derive(Debug, Clone, Serialize)]
 pub struct ChunkState {
-    pub id: u32,
+    pub id: u64,
     pub status: ChunkProcessingStatus,
 }
 
@@ -23,10 +23,9 @@ pub struct TaskMetadata {
     pub source_path: PathBuf,
     pub source_filename: String,
     pub source_size: u64,
-    pub sha256: String,
-    pub chunk_size: usize,
-    pub total_chunks: u32,
-    pub concurrency: usize,
+    pub chunk_size: u64,
+    pub total_chunks: u64,
+    pub concurrency: u64,
 }
 
 /// 整个任务的上下文，包含所有状态和通信渠道。
