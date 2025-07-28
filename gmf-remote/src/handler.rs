@@ -45,6 +45,7 @@ pub async fn setup(
         "正在处理文件路径: {}",
         shellexpand::tilde(&payload.path).to_string()
     );
+    
     // 路径处理和验证
     let source_path: PathBuf = match shellexpand::tilde(&payload.path).to_string().parse() {
         Ok(p) => p,
@@ -78,24 +79,6 @@ pub async fn setup(
         total_chunks
     );
 
-    // 计算文件的 SHA256 哈希
-    info!("正在计算源文件 '{}' 的 SHA256 哈希", source_path.display());
-    let start_time = std::time::Instant::now();
-    let source_sha256 = match gmf_common::calc_sha256(&source_path) {
-        Ok(hash) => hash,
-        Err(e) => {
-            let msg = format!(
-                "计算文件 '{}' 的 SHA256 哈希失败: {}",
-                source_path.display(),
-                e
-            );
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, msg).into_response());
-        }
-    };
-    let elapsed = start_time.elapsed();
-    info!("SHA256 哈希计算完成，耗时: {:.2?}", elapsed);
-
-    info!("源文件 SHA256 哈希: {}", source_sha256);
     // 初始化 TaskMetadata
     let task_metadata = TaskMetadata {
         source_path,
@@ -123,7 +106,6 @@ pub async fn setup(
     let response_data = SetupResponse {
         filename: source_filename,
         size: source_size,
-        sha256: source_sha256,
         total_chunks,
     };
 

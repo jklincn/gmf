@@ -1,19 +1,21 @@
 mod config;
 mod file;
-mod r2;
 mod remote;
 
+use anyhow::Ok;
 use anyhow::Result;
+use anyhow::anyhow;
 use clap::Parser;
+use config::Config;
 use env_logger::Builder;
+use env_logger::Env;
+use gmf_common::r2;
 use log::{debug, error, info, trace, warn};
 use std::io::Write;
 use tokio::signal;
-use env_logger::Env;
-
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
-fn parse_chunk_size(s: &str) -> Result<u64, String> {
+fn parse_chunk_size(s: &str) -> Result<u64> {
     let s_lower = s.to_lowercase();
 
     let (num_str, multiplier): (&str, u64) = if let Some(stripped) = s_lower.strip_suffix("gb") {
@@ -30,11 +32,11 @@ fn parse_chunk_size(s: &str) -> Result<u64, String> {
     let num = num_str
         .trim()
         .parse::<u64>()
-        .map_err(|_| format!("无效的数字部分: '{}'", num_str))?;
+        .map_err(|_| anyhow!("无效的数字部分: '{}'", num_str))?;
 
     let bytes = num
         .checked_mul(multiplier)
-        .ok_or_else(|| "计算出的数值太大，导致溢出 (超过 u64::MAX)".to_string())?;
+        .ok_or_else(|| anyhow!("计算出的数值太大，导致溢出 (超过 u64::MAX)"))?;
 
     Ok(bytes)
 }
@@ -74,22 +76,38 @@ struct Args {
     verbose: u8,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let default_log_level = match args.verbose {
+fn set_log() {
+    let default_log_level = match Args::parse().verbose {
         0 => "info",
         _ => "debug",
     };
     let env = Env::default().default_filter_or(default_log_level);
     Builder::from_env(env)
-        .format(|buf, record| {
-            // 只输出级别和消息，不带时间戳
-            writeln!(buf, "{}", record.args())
-        })
+        .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
+}
+
+async fn set_s3(cfg: &Config) -> Result<()> {
+    let s3_config = r2::S3Config {
+        endpoint: cfg.endpoint.clone(),
+        access_key_id: cfg.access_key_id.clone(),
+        secret_access_key: cfg.secret_access_key.clone(),
+    };
+    r2::init_s3_client(Some(s3_config)).await?;
+    r2::create_bucket().await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    set_log();
+
+    let args = Args::parse();
 
     let config = config::load_or_create_config()?;
+
+    set_s3(&config).await?;
+
     let mut remote = remote::start_remote(&config).await?;
 
     // 主逻辑
@@ -106,23 +124,26 @@ async fn main() -> Result<()> {
         },
 
         // 分支 2: 监听 Ctrl+C 信号
-        // BUG: 远程服务未正确关闭
         _ = signal::ctrl_c() => {
             warn!("\n接收到 Ctrl+C 信号，开始清理工作");
             Ok(())
         }
     };
 
+    // 1. 如果主逻辑出错，先打印错误信息
+    if let Err(e) = &logic_result {
+        error!("执行失败: {:#}", e);
+    }
+
+    // 2. 无论主逻辑是否成功，都执行清理操作
     if let Err(e) = remote.shutdown().await {
         error!("清理 gmf-remote 时发生错误: {:#}", e);
     }
-    
+
     // 清理 Bucket
     if let Err(e) = r2::delete_bucket().await {
         error!("删除 Bucket 时发生错误: {:#}", e);
     }
-
-    logic_result?;
 
     Ok(())
 }

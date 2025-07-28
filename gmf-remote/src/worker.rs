@@ -1,18 +1,17 @@
-use crate::r2;
 use crate::state::{AppState, ChunkProcessingStatus, ChunkState};
 use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose;
 use futures::stream::{self, StreamExt};
 use gmf_common::NONCE_SIZE;
 use gmf_common::TaskEvent;
+use gmf_common::r2::put_object;
 use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tracing::{error, info, instrument};
-
 pub struct ChunkJob {
     pub id: u64,
     pub data: Vec<u8>,
@@ -135,7 +134,6 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u64) -> anyhow::Res
 }
 
 // --- 单个分块处理器 (Worker) ---
-// 函数签名现在返回一个 ChunkState
 #[instrument(skip(state, job), fields(chunk_id = job.id))]
 async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     let chunk_id = job.id;
@@ -164,7 +162,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     };
 
     // --- 上传 ---
-    if let Err(e) = upload_chunk(chunk_id, &encrypted_data).await {
+    if let Err(e) = upload_chunk(chunk_id, encrypted_data).await {
         let reason = format!("上传失败: {:?}", e);
         error!("分块处理失败: {}", reason);
         return ChunkState {
@@ -190,9 +188,10 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
 // --- 辅助函数 ---
 
-async fn upload_chunk(chunk_id: u64, data: &[u8]) -> Result<()> {
+// TODO: 超时
+async fn upload_chunk(chunk_id: u64, data: Vec<u8>) -> Result<()> {
     let start = Instant::now();
-    r2::put_object(&chunk_id.to_string(), data).await?;
+    put_object(&chunk_id.to_string(), data).await?;
     let duration = start.elapsed();
     info!("上传耗时（秒）: {} s", duration.as_secs_f32());
     Ok(())

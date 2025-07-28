@@ -3,6 +3,8 @@
 # 当任何命令失败时立即退出脚本
 set -e
 
+export CARGO_BUILD_JOBS=6
+
 # --- 配置 ---
 # 这是你要打包的那个包 (crate) 的名字
 PKG_NAME="gmf" 

@@ -1,9 +1,9 @@
-use crate::r2::{self, delete_object};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use gmf_common::NONCE_SIZE;
+use gmf_common::r2;
 use log::{debug, info, warn};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use xxhash_rust::xxh3::xxh3_64;
 
 const MAGIC: &[u8; 13] = b"gmf temp file";
 const HEADER_SIZE: u64 = 32;
@@ -67,26 +68,21 @@ pub struct GMFFile {
     header: Header,
     pub filename: String,
     pub size: u64,
-    pub sha256: String,
+    pub temp_path: PathBuf,
 }
 
 impl GMFFile {
-    pub fn new(
-        filename: &str,
-        size: u64,
-        sha256: &str,
-        chunk_count: u64,
-    ) -> Result<(Self, u64)> {
-        let gmf_filename = PathBuf::from(format!(".{sha256}.gmf"));
+    pub fn new(filename: &str, size: u64, chunk_count: u64) -> Result<(Self, u64)> {
+        let combined_string = format!("{}:{}", filename, size);
+
+        let combined_hash = xxh3_64(combined_string.as_bytes());
+        let combined_hash_hex = format!("{:x}", combined_hash);
+
+        // 使用这个组合哈希来命名临时文件
+        let gmf_filename = PathBuf::from(format!(".{}.gmf", combined_hash_hex));
 
         if gmf_filename.exists() {
-            match Self::open_and_validate(
-                &gmf_filename,
-                chunk_count,
-                filename,
-                size,
-                sha256,
-            ) {
+            match Self::open_and_validate(&gmf_filename, chunk_count, filename, size) {
                 Ok(gmf_file) => {
                     let completed_chunks = gmf_file.header.written_count;
                     info!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
@@ -100,23 +96,16 @@ impl GMFFile {
         }
 
         // 如果文件不存在或验证失败，则创建新文件
-        let gmf_file = Self::create(
-            &gmf_filename,
-            chunk_count,
-            filename,
-            size,
-            sha256,
-        )?;
+        let gmf_file = Self::create(&gmf_filename, chunk_count, filename, size)?;
         Ok((gmf_file, 0)) // 新文件，已完成 0 个
     }
 
-    // 打开并验证现有文件 ---
+    // `open_and_validate` 函数的签名和实现保持不变，因为它已经接收了所有需要的参数。
     fn open_and_validate<P: AsRef<Path>>(
         path: P,
         expected_chunk_count: u64,
         filename: &str,
         size: u64,
-        sha256: &str,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -158,33 +147,33 @@ impl GMFFile {
             header,
             filename: filename.to_string(),
             size,
-            sha256: sha256.to_string(),
+            temp_path: path.as_ref().to_path_buf(),
         })
     }
 
     fn create<P: AsRef<Path>>(
         path: P,
         chunk_count: u64,
-        source_filename: &str,
-        source_size: u64,
-        source_sha256: &str,
+        filename: &str,
+        size: u64,
     ) -> Result<Self> {
+        let path_ref = path.as_ref();
         let header = Header {
             magic: *MAGIC,
             _padding: [0; 3],
             chunk_count,
             written_count: 0,
         };
-        let mut file = File::create(path).context("创建 GMF 临时文件失败")?;
+        let mut file = File::create(path_ref).context("创建 GMF 临时文件失败")?;
         file.write_all(&header.to_bytes())
             .context("写入 GMF 文件头失败")?;
 
         Ok(Self {
             file,
             header,
-            filename: source_filename.to_string(),
-            size: source_size,
-            sha256: source_sha256.to_string(),
+            filename: filename.to_string(),
+            size,
+            temp_path: path.as_ref().to_path_buf(),
         })
     }
 
@@ -285,7 +274,7 @@ impl GmfSession {
                 .await
                 .context("解密任务本身发生错误 (例如 panic)")??;
 
-                delete_object(&chunk_id.to_string())
+                r2::delete_object(&chunk_id.to_string())
                     .await
                     .context("删除已下载的分块对象失败")?;
 
@@ -338,8 +327,8 @@ impl GmfSession {
 }
 
 fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
-    let temp_filename = format!(".{}.gmf", gmf_file.sha256);
-    let target_filename = gmf_file.filename.clone();
+    let temp_path = &gmf_file.temp_path;
+    let target_filename = &gmf_file.filename;
 
     // 显式 drop 文件句柄，以便后续可以安全地进行截断和重命名
     drop(gmf_file.file);
@@ -349,8 +338,8 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&temp_filename)
-            .with_context(|| format!("无法重新打开临时文件 '{temp_filename}' 进行最终化"))?;
+            .open(&temp_path)
+            .with_context(|| format!("无法重新打开临时文件 '{temp_path:?}' 进行最终化"))?;
 
         let total_size = file.metadata()?.len();
         if total_size < HEADER_SIZE {
@@ -375,8 +364,8 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     }
 
     debug!("正在校验最终文件...");
-    let final_file = File::open(&temp_filename)
-        .with_context(|| format!("无法打开最终文件 '{temp_filename}' 进行校验"))?;
+    let final_file = File::open(&temp_path)
+        .with_context(|| format!("无法打开最终文件 '{temp_path:?}' 进行校验"))?;
 
     let final_size = final_file.metadata()?.len();
     if final_size != gmf_file.size {
@@ -387,19 +376,8 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         );
     }
 
-    let sha256 = gmf_common::calc_sha256(temp_filename.as_ref())
-        .with_context(|| format!("计算最终文件 '{temp_filename}' 的 SHA256 失败"))?;
-
-    if sha256 != gmf_file.sha256 {
-        bail!(
-            "文件 SHA256 校验失败：\n  期望值: {}\n  计算值: {}",
-            gmf_file.sha256,
-            sha256
-        );
-    }
-
-    fs::rename(&temp_filename, &target_filename)
-        .with_context(|| format!("重命名文件从 '{temp_filename}' 到 '{target_filename}' 失败"))?;
+    fs::rename(&temp_path, &target_filename)
+        .with_context(|| format!("重命名文件从 '{temp_path:?}' 到 '{target_filename}' 失败"))?;
 
     info!("文件 '{target_filename}' 已成功下载并校验！");
     Ok(())

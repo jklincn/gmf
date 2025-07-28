@@ -3,10 +3,7 @@ use crate::file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use gmf_common::{
-    SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent,
-    format_size,
-};
+use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, format_size};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, info};
 use reqwest::Client;
@@ -32,7 +29,7 @@ pub struct TaskContext {
 impl TaskContext {
     pub fn new(info: &SetupResponse) -> Result<Self> {
         let (gmf_file, completed_chunks) =
-            GMFFile::new(&info.filename, info.size, &info.sha256, info.total_chunks)?;
+            GMFFile::new(&info.filename, info.size, info.total_chunks)?;
         let progress_bar = AllProgressBar::new(info.total_chunks, completed_chunks)?;
         let session = GmfSession::new(gmf_file, completed_chunks);
 
@@ -144,7 +141,6 @@ impl RemoteRunner {
         let (gmf_file, completed_chunks) = GMFFile::new(
             &setup_info.filename,
             setup_info.size,
-            &setup_info.sha256,
             setup_info.total_chunks,
         )?;
 
@@ -298,6 +294,31 @@ impl RemoteRunner {
 
         client.post(&url).send().await?.error_for_status()?;
 
+        // 等待远端服务完全关闭
+        // BUG
+        const MAX_POLL_ATTEMPTS: u32 = 20;
+        const POLL_INTERVAL: Duration = Duration::from_millis(500);
+        let mut server_confirmed_down = false;
+
+        for _ in 0..MAX_POLL_ATTEMPTS {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            match client.get(&self.url).send().await {
+                Ok(_) => {}
+                Err(_) => {
+                    // BUG: 会出现 channel 2: open failed: connect failed: Connection refused
+                    server_confirmed_down = true;
+                    break;
+                }
+            }
+        }
+
+        if !server_confirmed_down {
+            return Err(anyhow!(
+                "等待远端服务关闭超时 ({} 秒后)",
+                (MAX_POLL_ATTEMPTS as u128 * POLL_INTERVAL.as_millis()) / 1000
+            ));
+        }
+
         // 关闭 ssh 端口转发进程
         self.forward_child
             .kill()
@@ -387,7 +408,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
 }
 
 async fn ensure_remote(cfg: &Config) -> Result<()> {
-    info!("正常尝试连接远程服务器 {}", cfg.host);
+    info!("正在尝试连接远程服务器 {}", cfg.host);
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
     info!("远程服务器 {} 连接成功", cfg.host);
 

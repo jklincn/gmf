@@ -1,7 +1,11 @@
+pub mod r2;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{fs::File, io, path::Path};
+use std::hash::Hasher;
+use std::io;
+use std::{fs::File, path::Path};
+use xxhash_rust::xxh3::Xxh3;
 
 pub const NONCE_SIZE: usize = 12;
 
@@ -33,7 +37,6 @@ pub struct SetupRequestPayload {
 pub struct SetupResponse {
     pub filename: String,
     pub size: u64,
-    pub sha256: String,
     pub total_chunks: u64,
 }
 
@@ -60,18 +63,19 @@ pub fn format_size(size: u64) -> String {
     format!("{:.2} {}", size, UNITS[unit])
 }
 
-/// 计算指定文件的 SHA256 哈希值
-pub fn calc_sha256(path: &Path) -> Result<String> {
+/// 计算指定文件的 xxh3 哈希值
+pub fn calc_xxh3(path: &Path) -> Result<String> {
     let mut input = File::open(path)
-        .with_context(|| format!("打开文件 '{}' 失败用于计算 SHA256", path.display()))?;
-    let mut hasher = Sha256::new();
+        .with_context(|| format!("打开文件 '{}' 失败用于计算 XXH3", path.display()))?;
+
+    let mut hasher = Xxh3::new();
 
     io::copy(&mut input, &mut hasher)
-        .with_context(|| format!("读取文件 '{}' 内容失败用于计算 SHA256", path.display()))?;
+        .with_context(|| format!("读取文件 '{}' 内容失败用于计算 XXH3", path.display()))?;
 
-    let hash = hasher.finalize();
+    let hash = hasher.finish();
 
-    Ok(hex::encode(hash))
+    Ok(format!("{:x}", hash))
 }
 
 /// 获取指定文件的大小
