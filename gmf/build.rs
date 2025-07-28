@@ -1,12 +1,11 @@
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::{env, fs, path::PathBuf};
 use tar::Builder;
 
-// 用于在函数间传递生成的资源信息
 struct AssetInfo {
     // 将在生成的 Rust 代码中使用的常量名前缀，例如 "REMOTE_ELF"
     const_prefix: String,
@@ -19,8 +18,6 @@ struct AssetInfo {
 /// 处理本地构建的 gmf-remote ELF 文件。
 /// 它会找到 ELF，将其打包成 tar，然后用 Gzip 压缩。
 fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
-    println!("cargo:rerun-if-changed=crates/gmf-remote"); // 依赖 gmf-remote crate
-
     let workspace_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
         .parent()
         .unwrap()
@@ -32,6 +29,7 @@ fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
         .join(profile)
         .join("gmf-remote");
 
+    // Cargo 会在 remote_elf_path 文件变动时才重新运行此 build.rs
     println!("cargo:rerun-if-changed={}", remote_elf_path.display());
 
     if !remote_elf_path.exists() {
@@ -42,14 +40,33 @@ fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
         );
     }
 
-    // 1. 读取原始 ELF 文件
+    // 读取原始 ELF 文件并计算其哈希
     let original_bytes = fs::read(&remote_elf_path).expect("Failed to read gmf-remote ELF");
+    let new_sha256 = Sha256::digest(&original_bytes);
+    let new_sha256_hex = format!("{new_sha256:x}");
 
-    // 2. 计算原始文件的 SHA256
-    let sha256 = Sha256::digest(&original_bytes);
-    let sha256_hex = format!("{sha256:x}");
+    // 缓存检查逻辑
+    let targz_path = out_dir.join("gmf-remote.tar.gz");
+    let sha256_marker_path = out_dir.join("gmf-remote.sha256");
 
-    // 3. 将 ELF 打包进 tar 归档
+    // 尝试读取上一次保存的哈希值
+    let old_sha256_hex = fs::read_to_string(&sha256_marker_path).unwrap_or_default();
+
+    // 如果哈希值未变，并且输出文件确实存在，则跳过所有生成步骤
+    if old_sha256_hex == new_sha256_hex && targz_path.exists() {
+        println!("cargo:info=gmf-remote executable unchanged, skipping asset generation.");
+        // 直接返回信息，使用已存在的文件
+        return AssetInfo {
+            const_prefix: "GMF_REMOTE".to_string(),
+            targz_path,
+            sha256_hex: new_sha256_hex,
+        };
+    }
+
+    // 如果哈希值变了或文件不存在，则执行生成流程
+    println!("cargo:info=gmf-remote executable changed, regenerating asset.");
+
+    // 将 ELF 打包进 tar 归档
     let mut tar_builder = Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
     header.set_size(original_bytes.len() as u64);
@@ -62,7 +79,7 @@ fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
         .into_inner()
         .expect("Failed to finalize tar archive");
 
-    // 4. Gzip 压缩 tar 归档
+    // Gzip 压缩 tar 归档
     let compression_level = if profile == "release" {
         Compression::best()
     } else {
@@ -72,14 +89,16 @@ fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
     enc.write_all(&tar_bytes).unwrap();
     let targz_bytes = enc.finish().unwrap();
 
-    // 5. 将压缩文件写入 OUT_DIR
-    let targz_path = out_dir.join("gmf-remote.tar.gz");
+    // 将压缩文件写入 OUT_DIR
     fs::write(&targz_path, &targz_bytes).expect("Failed to write gmf-remote.tar.gz");
+
+    // 更新哈希标记文件
+    fs::write(&sha256_marker_path, &new_sha256_hex).expect("Failed to write SHA256 marker file");
 
     AssetInfo {
         const_prefix: "GMF_REMOTE".to_string(),
         targz_path,
-        sha256_hex,
+        sha256_hex: new_sha256_hex,
     }
 }
 

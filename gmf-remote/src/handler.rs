@@ -21,7 +21,7 @@ use tracing::{error, info, instrument, warn};
 
 #[instrument]
 pub async fn healthy() -> Result<impl IntoResponse, Response> {
-    info!("健康检查接口被调用");
+    info!("健康检查请求");
     Ok(StatusCode::OK)
 }
 
@@ -54,7 +54,6 @@ pub async fn setup(
         }
     };
 
-    info!("已解析文件路径: {}", source_path.display());
     let source_filename = match source_path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name.to_string(),
         None => {
@@ -62,11 +61,6 @@ pub async fn setup(
             return Err((StatusCode::BAD_REQUEST, msg).into_response());
         }
     };
-
-    info!(
-        "源文件名: {}, 正在获取文件大小和 SHA256 哈希",
-        source_filename
-    );
 
     let source_size = file_size(&source_path)
         .with_context(|| format!("获取文件 '{}' 的大小失败", source_path.display()))
@@ -112,7 +106,6 @@ pub async fn setup(
         concurrency: payload.concurrency,
     };
 
-    info!("任务元数据已创建，正在初始化全局状态");
     // 更新全局状态
     {
         let mut context = state.0.lock().unwrap();
@@ -201,11 +194,7 @@ pub async fn start(
 pub async fn shutdown(State(state): State<AppState>) -> Result<impl IntoResponse, Response> {
     let context = state.0.lock().unwrap();
 
-    let connection_count = context.shutdown_handle.connection_count();
-    info!(
-        "Shutdown endpoint called. Active connections: {}. Triggering graceful shutdown with 5s timeout...",
-        connection_count
-    );
+    info!("正在关闭服务...");
 
     context
         .shutdown_handle
