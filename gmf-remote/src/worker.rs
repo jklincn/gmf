@@ -147,6 +147,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
     };
 
     // --- 加密 ---
+    // TODO: 减小加密的额外空间占用
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
     let passphrase_b64 = general_purpose::STANDARD.encode(key);

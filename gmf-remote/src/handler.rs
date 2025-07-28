@@ -12,7 +12,8 @@ use axum::{
     },
 };
 use gmf_common::{
-    SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, file_size, format_size,
+    SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent,
+    file_size, format_size,
 };
 use std::{convert::Infallible, path::PathBuf};
 use tokio::sync::broadcast;

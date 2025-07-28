@@ -4,6 +4,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use gmf_common::NONCE_SIZE;
+use log::{debug, info, warn};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -64,35 +65,35 @@ impl Header {
 pub struct GMFFile {
     file: File,
     header: Header,
-    pub source_filename: String,
-    pub source_size: u64,
-    pub source_sha256: String,
+    pub filename: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 impl GMFFile {
     pub fn new(
-        source_filename: &str,
-        source_size: u64,
-        source_sha256: &str,
+        filename: &str,
+        size: u64,
+        sha256: &str,
         chunk_count: u64,
     ) -> Result<(Self, u64)> {
-        let gmf_filename = PathBuf::from(format!(".{source_sha256}.gmf"));
+        let gmf_filename = PathBuf::from(format!(".{sha256}.gmf"));
 
         if gmf_filename.exists() {
             match Self::open_and_validate(
                 &gmf_filename,
                 chunk_count,
-                source_filename,
-                source_size,
-                source_sha256,
+                filename,
+                size,
+                sha256,
             ) {
                 Ok(gmf_file) => {
                     let completed_chunks = gmf_file.header.written_count;
-                    println!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
+                    info!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
                     return Ok((gmf_file, completed_chunks));
                 }
                 Err(e) => {
-                    println!("警告：发现旧的临时文件，但验证失败：{}。将重新创建。", e);
+                    warn!("发现旧的临时文件，但验证失败：{}。将重新创建。", e);
                     fs::remove_file(&gmf_filename).context("删除无效的临时文件失败")?;
                 }
             }
@@ -102,9 +103,9 @@ impl GMFFile {
         let gmf_file = Self::create(
             &gmf_filename,
             chunk_count,
-            source_filename,
-            source_size,
-            source_sha256,
+            filename,
+            size,
+            sha256,
         )?;
         Ok((gmf_file, 0)) // 新文件，已完成 0 个
     }
@@ -113,9 +114,9 @@ impl GMFFile {
     fn open_and_validate<P: AsRef<Path>>(
         path: P,
         expected_chunk_count: u64,
-        source_filename: &str,
-        source_size: u64,
-        source_sha256: &str,
+        filename: &str,
+        size: u64,
+        sha256: &str,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -155,9 +156,9 @@ impl GMFFile {
         Ok(Self {
             file,
             header,
-            source_filename: source_filename.to_string(),
-            source_size,
-            source_sha256: source_sha256.to_string(),
+            filename: filename.to_string(),
+            size,
+            sha256: sha256.to_string(),
         })
     }
 
@@ -181,9 +182,9 @@ impl GMFFile {
         Ok(Self {
             file,
             header,
-            source_filename: source_filename.to_string(),
-            source_size,
-            source_sha256: source_sha256.to_string(),
+            filename: source_filename.to_string(),
+            size: source_size,
+            sha256: source_sha256.to_string(),
         })
     }
 
@@ -315,7 +316,6 @@ impl GmfSession {
         drop(self.decrypted_tx);
 
         // 2. 等待写入器任务完成，确保所有分块都已写入磁盘
-        println!("等待写入器任务完成所有缓冲写入...");
         match self.writer_handle.await {
             Ok(Ok(_)) => { /* 写入器成功退出 */ }
             Ok(Err(e)) => return Err(e), // 写入器任务内部返回错误
@@ -338,8 +338,8 @@ impl GmfSession {
 }
 
 fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
-    let temp_filename = format!(".{}.gmf", gmf_file.source_sha256);
-    let target_filename = gmf_file.source_filename.clone();
+    let temp_filename = format!(".{}.gmf", gmf_file.sha256);
+    let target_filename = gmf_file.filename.clone();
 
     // 显式 drop 文件句柄，以便后续可以安全地进行截断和重命名
     drop(gmf_file.file);
@@ -374,15 +374,15 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         file.set_len(content_size).context("截断临时文件失败")?;
     }
 
-    println!("正在校验最终文件...");
+    debug!("正在校验最终文件...");
     let final_file = File::open(&temp_filename)
         .with_context(|| format!("无法打开最终文件 '{temp_filename}' 进行校验"))?;
 
     let final_size = final_file.metadata()?.len();
-    if final_size != gmf_file.source_size {
+    if final_size != gmf_file.size {
         bail!(
             "文件大小校验失败：期望大小 {}, 实际大小 {}",
-            gmf_file.source_size,
+            gmf_file.size,
             final_size
         );
     }
@@ -390,10 +390,10 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     let sha256 = gmf_common::calc_sha256(temp_filename.as_ref())
         .with_context(|| format!("计算最终文件 '{temp_filename}' 的 SHA256 失败"))?;
 
-    if sha256 != gmf_file.source_sha256 {
+    if sha256 != gmf_file.sha256 {
         bail!(
             "文件 SHA256 校验失败：\n  期望值: {}\n  计算值: {}",
-            gmf_file.source_sha256,
+            gmf_file.sha256,
             sha256
         );
     }
@@ -401,7 +401,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     fs::rename(&temp_filename, &target_filename)
         .with_context(|| format!("重命名文件从 '{temp_filename}' 到 '{target_filename}' 失败"))?;
 
-    println!("文件 '{target_filename}' 已成功下载并校验！");
+    info!("文件 '{target_filename}' 已成功下载并校验！");
     Ok(())
 }
 
@@ -417,7 +417,7 @@ async fn run_writer_task(
     while let Some(chunk) = decrypted_rx.recv().await {
         // 如果收到的块是已经写入过的，直接丢弃
         if chunk.id < next_chunk_to_write {
-            println!("丢弃已处理过的分块 {}", chunk.id);
+            warn!("丢弃已处理过的分块 {}", chunk.id);
             continue;
         }
 
@@ -438,6 +438,6 @@ async fn run_writer_task(
             missing_chunks.join(", ")
         );
     }
-
+    debug!("所有分块已成功写入");
     Ok(())
 }

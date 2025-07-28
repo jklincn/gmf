@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -67,7 +68,7 @@ secret_access_key = "{}"
         );
 
         fs::write(path, config_content).context("写入默认配置失败")?;
-        println!("未找到配置文件：已生成默认配置文件 '{CONFIG_FILE_NAME}', 请根据实际修改");
+        info!("未找到配置文件：已生成默认配置文件 '{CONFIG_FILE_NAME}', 请根据实际修改");
         std::process::exit(0);
     }
 }

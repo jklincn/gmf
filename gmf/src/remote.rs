@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, format_size};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use log::{debug, info};
 use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
 use std::path::Path;
@@ -12,7 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
-
 use tokio::time::sleep;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
@@ -20,6 +20,78 @@ include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 const TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const SSE_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub struct TaskContext {
+    progress_bar: AllProgressBar,
+    session: GmfSession,
+}
+
+impl TaskContext {
+    pub fn new(info: &SetupResponse) -> Result<Self> {
+        let (gmf_file, completed_chunks) =
+            GMFFile::new(&info.filename, info.size, &info.sha256, info.total_chunks)?;
+        let progress_bar = AllProgressBar::new(info.total_chunks, completed_chunks)?;
+        let session = GmfSession::new(gmf_file, completed_chunks);
+
+        Ok(TaskContext {
+            progress_bar,
+            session,
+        })
+    }
+}
+
+pub struct AllProgressBar {
+    upload: ProgressBar,
+    download: ProgressBar,
+    writer: ProgressBar,
+}
+
+impl AllProgressBar {
+    pub fn new(total_chunks: u64, completed_chunks: u64) -> Result<Self> {
+        let mp = MultiProgress::new();
+        let upload = mp.add(ProgressBar::new(total_chunks));
+        let download = mp.add(ProgressBar::new(total_chunks));
+        let writer = mp.add(ProgressBar::new(total_chunks));
+
+        upload.set_style(
+            ProgressStyle::default_bar()
+                .template("上传进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .progress_chars("#>-"),
+        );
+
+        download.set_style(
+            ProgressStyle::default_bar()
+                .template("下载进度 [{bar:40.green/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .progress_chars("#>-"),
+        );
+
+        writer.set_style(
+            ProgressStyle::default_bar()
+                .template("写入进度 [{bar:40.green/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .progress_chars("#>-"),
+        );
+
+        upload.set_position(completed_chunks);
+        download.set_position(completed_chunks);
+        writer.set_position(completed_chunks);
+
+        Ok(AllProgressBar {
+            upload,
+            download,
+            writer,
+        })
+    }
+
+    pub fn update_upload(&self) {
+        self.upload.inc(1);
+    }
+    pub fn update_download(&self) {
+        self.download.inc(1);
+    }
+    pub fn update_writer(&self) {
+        self.writer.inc(1);
+    }
+}
 
 pub struct RemoteRunner {
     cfg: Config,
@@ -53,7 +125,7 @@ impl RemoteRunner {
         };
         let url = format!("{}/setup", self.url);
 
-        println!("正在取得文件信息...");
+        info!("正在取得文件信息...");
         let response = client
             .post(&url)
             .json(&payload)
@@ -62,7 +134,7 @@ impl RemoteRunner {
             .error_for_status()?;
         let setup_info = response.json::<SetupResponse>().await?;
 
-        println!(
+        info!(
             "文件名: {}, 大小: {}",
             setup_info.filename,
             format_size(setup_info.size)
@@ -87,7 +159,7 @@ impl RemoteRunner {
                 .template("上传进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
-        // 如果是断点续传，设置初始进度
+
         self.upload_pb.set_position(completed_chunks as u64);
 
         let session = GmfSession::new(gmf_file, self.completed_chunks);
@@ -170,7 +242,7 @@ impl RemoteRunner {
                                 // 将新任务推入 FuturesUnordered
                                 worker_handles.push(handle);
                             } else if let TaskEvent::TaskCompleted = task_event {
-                                self.upload_pb.finish_with_message("服务端上传完成");
+                                self.upload_pb.finish();
                                 task_completed_signal = true; // 标记服务端任务已全部派发
                                 event_source.close();
                             } else if let TaskEvent::Error { message } = task_event {
@@ -178,7 +250,7 @@ impl RemoteRunner {
                             }
                         }
                         Some(Err(e)) => {
-                            self.upload_pb.abandon_with_message("发送错误中断");
+                            self.upload_pb.abandon();
                             return Err(anyhow!("SSE 流意外断开: {}", e));
                         }
                         None => {
@@ -207,7 +279,7 @@ impl RemoteRunner {
             }
         }
 
-        println!("所有 worker 已完成。现在等待文件写入器完成...");
+        debug!("所有 worker 已完成。现在等待文件写入器完成...");
         session.wait_for_completion().await?;
 
         Ok(())
@@ -248,7 +320,7 @@ impl RemoteRunner {
 pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     ensure_remote(cfg).await?;
 
-    println!("正在启动 gmf-remote...");
+    debug!("正在启动 gmf-remote...");
     // 启动 gmf‑remote
     let mut ssh_child = {
         let mut cmd = Command::new("ssh");
@@ -264,7 +336,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         cmd.spawn().context("无法启动 gmf-remote")?
     };
 
-    println!("gmf-remote 启动成功");
+    debug!("gmf-remote 启动成功");
 
     // 获取输出
     let stdout = ssh_child
@@ -317,7 +389,7 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         }
     }
 
-    println!("gmf-remote 连接成功");
+    info!("gmf-remote 连接成功");
     let mp = MultiProgress::new();
     Ok(RemoteRunner {
         cfg: cfg.clone(),
@@ -333,9 +405,9 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
 }
 
 async fn ensure_remote(cfg: &Config) -> Result<()> {
-    println!("正常尝试连接远程服务器 {}", cfg.host);
+    info!("正常尝试连接远程服务器 {}", cfg.host);
     ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
-    println!("远程服务器 {} 连接成功", cfg.host);
+    info!("远程服务器 {} 连接成功", cfg.host);
 
     let check_cmd = r#"
         set -e
@@ -358,7 +430,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
     }
 
     // 上传 gzip
-    println!("正在安装 gmf-remote 至 ~/.local/bin 目录");
+    info!("正在安装 gmf-remote 至 ~/.local/bin 目录");
     let tmp = std::env::temp_dir().join("gmf-remote.tar.gz");
     tokio::fs::write(&tmp, GMF_REMOTE_TAR_GZ).await?;
     scp_send(cfg, &tmp, "~/gmf-remote.tar.gz").await?;
@@ -395,7 +467,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
         .await
         .context("在远程服务器上安装或校验 gmf-remote 时发生错误")?;
 
-    println!("gmf-remote 安装成功");
+    info!("gmf-remote 安装成功");
     Ok(())
 }
 
@@ -414,6 +486,7 @@ fn private_key_args(cfg: &Config) -> Vec<String> {
     }
 }
 
+// TODO：使用 russh-sftp 重构
 async fn scp_send(cfg: &Config, local: &Path, remote: &str) -> Result<()> {
     let status = {
         let mut cmd = Command::new("scp");
@@ -431,7 +504,7 @@ async fn scp_send(cfg: &Config, local: &Path, remote: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("scp 上传失败"))
 }
 
-// TODO: 切换到 russh 库（设置超时等）
+// TODO: 使用 russh 重构
 async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
     let output = {
         let mut cmd = Command::new("ssh");

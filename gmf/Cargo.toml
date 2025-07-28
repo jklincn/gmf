@@ -14,11 +14,13 @@ anyhow = "1.0.98"
 base64 = "0.22.1"
 bytes = "1.10.1"
 clap = { version = "4.5.41", features = ["derive"] }
+env_logger = "0.11.8"
 eventsource-stream = "0.2.3"
 futures = "0.3.31"
 futures-util = "0.3.31"
 gmf-common = { path = "../gmf-common" }
 indicatif = { version = "0.18.0", features = ["tokio"] }
+log = "0.4.27"
 reqwest = { version = "0.12.22", default-features = false, features = [
     "stream",
     "json",
