@@ -3,7 +3,10 @@ use crate::file::{ChunkResult, GMFFile, GmfSession};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, format_size};
+use gmf_common::{
+    SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent,
+    format_size,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, info};
 use reqwest::Client;
@@ -94,8 +97,6 @@ impl AllProgressBar {
 }
 
 pub struct RemoteRunner {
-    cfg: Config,
-    pid: u64,
     url: String,
     forward_child: tokio::process::Child,
     session: Option<GmfSession>,
@@ -287,32 +288,22 @@ impl RemoteRunner {
 
     // 关闭远程服务
     pub async fn shutdown(&mut self) -> Result<()> {
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()?;
+
+        let url = format!("{}/shutdown", self.url);
+
+        client.post(&url).send().await?.error_for_status()?;
+
+        // 关闭 ssh 端口转发进程
         self.forward_child
             .kill()
             .await
             .context("无法关闭 ssh 端口转发进程")?;
-
-        let cfg = &self.cfg;
-        let output = Command::new("ssh")
-            .arg("-T")
-            .arg("-p")
-            .arg(cfg.port.to_string())
-            .args(private_key_args(cfg))
-            .arg(format!("{}@{}", cfg.user, cfg.host))
-            .arg(format!("kill {}", self.pid))
-            .output()
-            .await
-            .context("执行远程 kill 命令失败")?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "远程 kill 命令返回非零状态 ({}): {}",
-                output.status,
-                stderr.trim()
-            )
-        }
+        Ok(())
     }
 }
 
@@ -344,13 +335,6 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
         .take()
         .ok_or_else(|| anyhow!("无法获得 ssh stdout"))?;
     let mut reader = BufReader::new(stdout).lines();
-
-    // 读取 PID
-    let pid_line = reader
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow!("gmf-remote 未输出 PID"))?;
-    let pid: u64 = pid_line.trim().parse().context("PID 解析失败")?;
 
     // 读取端口
     let port_line = reader
@@ -392,8 +376,6 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
     info!("gmf-remote 连接成功");
     let mp = MultiProgress::new();
     Ok(RemoteRunner {
-        cfg: cfg.clone(),
-        pid,
         url,
         forward_child,
         session: None,

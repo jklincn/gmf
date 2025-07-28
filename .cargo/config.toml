@@ -1,4 +1,4 @@
 [alias]
-br = "build -p gmf-remote --profile release --target x86_64-unknown-linux-musl"
-b = "build -p gmf --profile release --target x86_64-unknown-linux-musl"
-r = "run -p gmf --profile release --target x86_64-unknown-linux-musl"
+br = "build -p gmf-remote --profile dev --target x86_64-unknown-linux-musl"
+b = "build -p gmf --profile dev --target x86_64-unknown-linux-musl"
+r = "run -p gmf --profile dev --target x86_64-unknown-linux-musl"

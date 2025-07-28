@@ -8,6 +8,7 @@ use axum::{
     Router,
     routing::{get, post},
 };
+use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::crypto::{CryptoProvider, ring};
@@ -47,8 +48,6 @@ fn set_log() {
 async fn main() -> anyhow::Result<()> {
     set_log();
 
-    let pid = std::process::id();
-    println!("{pid}");
     CryptoProvider::install_default(ring::default_provider())
         .map_err(|e| anyhow!("Failed to install default rustls crypto provider: {:?}", e))?;
 
@@ -62,12 +61,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let app_state = state::AppState::new();
+    let handle = Handle::new();
+    let app_state = state::AppState::new(handle.clone());
 
     let app = Router::new()
         .route("/", get(handler::healthy))
         .route("/setup", post(handler::setup))
         .route("/start", post(handler::start))
+        .route("/shutdown", post(handler::shutdown))
         .with_state(app_state)
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http());
@@ -76,8 +77,11 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", listener.local_addr()?.port());
 
     axum_server::from_tcp_rustls(listener, tls_config)
+        .handle(handle)
         .serve(app.into_make_service())
         .await?;
+
+    tracing::info!("Server process is about to exit.");
 
     Ok(())
 }

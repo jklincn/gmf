@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+use axum_server::Handle;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ChunkProcessingStatus {
@@ -33,22 +34,24 @@ pub struct TaskMetadata {
 pub struct TaskContext {
     pub metadata: Option<TaskMetadata>,
     pub event_sender: Option<broadcast::Sender<TaskEvent>>,
+    pub shutdown_handle: Handle,
 }
 
 impl TaskContext {
-    pub fn new() -> Self {
+    pub fn new(shutdown_handle: Handle) -> Self {
         Self {
             metadata: None,
             event_sender: None,
+            shutdown_handle,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppState(pub Arc<Mutex<TaskContext>>);
 
 impl AppState {
-    pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(TaskContext::new())))
+    pub fn new(shutdown_handle: Handle) -> Self {
+        Self(Arc::new(Mutex::new(TaskContext::new(shutdown_handle))))
     }
 }
