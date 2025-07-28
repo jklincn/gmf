@@ -1,7 +1,7 @@
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 use std::{env, fs, path::PathBuf};
 use tar::Builder;

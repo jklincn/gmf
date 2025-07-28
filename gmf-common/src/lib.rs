@@ -75,7 +75,7 @@ pub fn calc_xxh3(path: &Path) -> Result<String> {
 
     let hash = hasher.finish();
 
-    Ok(format!("{:x}", hash))
+    Ok(format!("{hash:x}"))
 }
 
 /// 获取指定文件的大小

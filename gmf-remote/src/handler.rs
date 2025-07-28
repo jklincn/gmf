@@ -45,7 +45,7 @@ pub async fn setup(
         "正在处理文件路径: {}",
         shellexpand::tilde(&payload.path).to_string()
     );
-    
+
     // 路径处理和验证
     let source_path: PathBuf = match shellexpand::tilde(&payload.path).to_string().parse() {
         Ok(p) => p,

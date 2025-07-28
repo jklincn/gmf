@@ -146,7 +146,7 @@ impl RemoteRunner {
 
         // 存储已完成的分块数
         self.completed_chunks = completed_chunks;
-        self.chunk_size = Some(chunk_size as u64);
+        self.chunk_size = Some(chunk_size);
 
         self.upload_pb = self
             .multi_progress
@@ -157,7 +157,7 @@ impl RemoteRunner {
                 .progress_chars("#>-"),
         );
 
-        self.upload_pb.set_position(completed_chunks as u64);
+        self.upload_pb.set_position(completed_chunks);
 
         let session = GmfSession::new(gmf_file, self.completed_chunks);
         self.session = Some(session);
@@ -449,7 +449,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
         BIN_DIR=~/.local/bin
         REMOTE_FILE="$BIN_DIR/gmf-remote"
         ARCHIVE=~/gmf-remote.tar.gz
-        EXPECTED_SHA="{}"
+        EXPECTED_SHA="{GMF_REMOTE_SHA256}"
 
         # 核心操作
         mkdir -p "$BIN_DIR"
@@ -462,8 +462,7 @@ async fn ensure_remote(cfg: &Config) -> Result<()> {
 
         # 如果校验失败，直接以非零状态码退出
         [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]
-    "#,
-        GMF_REMOTE_SHA256
+    "#
     );
 
     ssh_once(cfg, &install_and_verify_cmd)

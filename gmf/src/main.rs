@@ -10,7 +10,7 @@ use config::Config;
 use env_logger::Builder;
 use env_logger::Env;
 use gmf_common::r2;
-use log::{debug, error, info, trace, warn};
+use log::{error, warn};
 use std::io::Write;
 use tokio::signal;
 
@@ -132,17 +132,17 @@ async fn main() -> Result<()> {
 
     // 1. 如果主逻辑出错，先打印错误信息
     if let Err(e) = &logic_result {
-        error!("执行失败: {:#}", e);
+        error!("执行失败: {e:#}");
     }
 
     // 2. 无论主逻辑是否成功，都执行清理操作
     if let Err(e) = remote.shutdown().await {
-        error!("清理 gmf-remote 时发生错误: {:#}", e);
+        error!("清理 gmf-remote 时发生错误: {e:#}");
     }
 
     // 清理 Bucket
     if let Err(e) = r2::delete_bucket().await {
-        error!("删除 Bucket 时发生错误: {:#}", e);
+        error!("删除 Bucket 时发生错误: {e:#}");
     }
 
     Ok(())

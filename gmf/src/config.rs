@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;

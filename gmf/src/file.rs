@@ -73,13 +73,13 @@ pub struct GMFFile {
 
 impl GMFFile {
     pub fn new(filename: &str, size: u64, chunk_count: u64) -> Result<(Self, u64)> {
-        let combined_string = format!("{}:{}", filename, size);
+        let combined_string = format!("{filename}:{size}");
 
         let combined_hash = xxh3_64(combined_string.as_bytes());
-        let combined_hash_hex = format!("{:x}", combined_hash);
+        let combined_hash_hex = format!("{combined_hash:x}");
 
         // 使用这个组合哈希来命名临时文件
-        let gmf_filename = PathBuf::from(format!(".{}.gmf", combined_hash_hex));
+        let gmf_filename = PathBuf::from(format!(".{combined_hash_hex}.gmf"));
 
         if gmf_filename.exists() {
             match Self::open_and_validate(&gmf_filename, chunk_count, filename, size) {
@@ -89,7 +89,7 @@ impl GMFFile {
                     return Ok((gmf_file, completed_chunks));
                 }
                 Err(e) => {
-                    warn!("发现旧的临时文件，但验证失败：{}。将重新创建。", e);
+                    warn!("发现旧的临时文件，但验证失败：{e}。将重新创建。");
                     fs::remove_file(&gmf_filename).context("删除无效的临时文件失败")?;
                 }
             }
@@ -338,7 +338,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&temp_path)
+            .open(temp_path)
             .with_context(|| format!("无法重新打开临时文件 '{temp_path:?}' 进行最终化"))?;
 
         let total_size = file.metadata()?.len();
@@ -364,7 +364,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     }
 
     debug!("正在校验最终文件...");
-    let final_file = File::open(&temp_path)
+    let final_file = File::open(temp_path)
         .with_context(|| format!("无法打开最终文件 '{temp_path:?}' 进行校验"))?;
 
     let final_size = final_file.metadata()?.len();
@@ -376,7 +376,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         );
     }
 
-    fs::rename(&temp_path, &target_filename)
+    fs::rename(temp_path, target_filename)
         .with_context(|| format!("重命名文件从 '{temp_path:?}' 到 '{target_filename}' 失败"))?;
 
     info!("文件 '{target_filename}' 已成功下载并校验！");

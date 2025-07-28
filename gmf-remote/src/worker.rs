@@ -45,7 +45,7 @@ pub async fn run_task(state: AppState, resume_from_chunk_id: u64) -> anyhow::Res
     let mut file = File::open(&metadata.source_path).await?;
     if resume_from_chunk_id > 0 {
         // 如果从第 1 块(ID=1)或之后开始，才需要 seek。ID=0 是第一个块，不需要 seek。
-        let offset = resume_from_chunk_id as u64 * chunk_size as u64;
+        let offset = resume_from_chunk_id * chunk_size;
         info!(
             "恢复任务，从分块 #{} 开始，跳过文件前 {} 字节",
             resume_from_chunk_id, offset
@@ -163,7 +163,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
     // --- 上传 ---
     if let Err(e) = upload_chunk(chunk_id, encrypted_data).await {
-        let reason = format!("上传失败: {:?}", e);
+        let reason = format!("上传失败: {e:?}");
         error!("分块处理失败: {}", reason);
         return ChunkState {
             id: chunk_id,
@@ -188,7 +188,7 @@ async fn process_single_chunk(state: AppState, job: ChunkJob) -> ChunkState {
 
 // --- 辅助函数 ---
 
-// TODO: 超时
+// TODO: 超时与错误重试（达到重试次数则退出）
 async fn upload_chunk(chunk_id: u64, data: Vec<u8>) -> Result<()> {
     let start = Instant::now();
     put_object(&chunk_id.to_string(), data).await?;
