@@ -363,19 +363,6 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
         file.set_len(content_size).context("截断临时文件失败")?;
     }
 
-    debug!("正在校验最终文件...");
-    let final_file = File::open(temp_path)
-        .with_context(|| format!("无法打开最终文件 '{temp_path:?}' 进行校验"))?;
-
-    let final_size = final_file.metadata()?.len();
-    if final_size != gmf_file.size {
-        bail!(
-            "文件大小校验失败：期望大小 {}, 实际大小 {}",
-            gmf_file.size,
-            final_size
-        );
-    }
-
     fs::rename(temp_path, target_filename)
         .with_context(|| format!("重命名文件从 '{temp_path:?}' 到 '{target_filename}' 失败"))?;
 

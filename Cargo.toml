@@ -2,6 +2,12 @@
 members = ["gmf", "gmf-common", "gmf-remote"]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.0"
+authors = ["jklincn <jklincn@foxmail.com>"]
+edition = "2024"
+repository = "https://github.com/jklincn/gmf"
+
 [profile.release]
 opt-level = "z"
 lto = true

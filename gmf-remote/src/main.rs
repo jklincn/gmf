@@ -9,12 +9,18 @@ use axum::{
 };
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
+use clap::Parser;
 use gmf_common::r2::init_s3_client;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::crypto::{CryptoProvider, ring};
 use time::macros::format_description;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing_subscriber::{fmt::time::UtcTime, layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Args {}
+
 fn set_log() {
     let log_file_path = ".gmf-remote.log";
     let log_file = std::fs::File::create(log_file_path).expect("无法创建日志文件");
@@ -45,6 +51,8 @@ fn set_log() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    Args::parse();
+    
     set_log();
 
     init_s3_client(None).await?;

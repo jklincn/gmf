@@ -1,7 +1,8 @@
 [package]
 name = "gmf-remote"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "gmf-remote"
@@ -14,6 +15,7 @@ async-stream = "0.3.6"
 axum = "0.8.4"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 base64 = "0.22.1"
+clap = { version = "4.5.41", features = ["derive"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
 gmf-common = { path = "../gmf-common" }

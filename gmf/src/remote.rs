@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
+use crate::{remote, ssh};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -396,6 +397,66 @@ pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
 
     info!("gmf-remote 连接成功");
     let mp = MultiProgress::new();
+    Ok(RemoteRunner {
+        url,
+        forward_child,
+        session: None,
+        completed_chunks: 0,
+        multi_progress: mp,
+        upload_pb: ProgressBar::new(0),
+        chunk_size: None,
+    })
+}
+
+pub async fn start_remote_new(cfg: &Config) -> Result<RemoteRunner> {
+    info!("正在尝试连接远程服务器 {}:{}", cfg.host, cfg.port);
+    let mut ssh = ssh::Session::connect(&cfg).await?;
+    info!("远程服务器连接成功");
+
+    let get_home_cmd = "sh -c 'echo $HOME'";
+    let (exit_code, home_dir_output) = ssh.call(get_home_cmd).await?;
+    if exit_code != 0 {
+        return Err(anyhow!(
+            "获取远程家目录失败, exit_code: {}, output: {}",
+            exit_code,
+            home_dir_output
+        ));
+    }
+    let home_dir = home_dir_output.trim();
+    let remote_path = format!("{home_dir}/.local/bin/gmf-remote");
+    let command = format!("sh -c '{remote_path} -V'");
+    let (exit_code, remote_version) = ssh.call(&command).await?;
+    if exit_code != 0 || !remote_version.contains(env!("CARGO_PKG_VERSION")) {
+        info!("正在安装（更新）gmf-remote 至远程服务器 ~/.local/bin 目录");
+        ssh.upload_file(remote_path.as_str(), GMF_REMOTE_TAR_GZ);
+        let command = format!(
+            r#"
+        # 任何命令失败则立即退出
+        set -e
+
+        # 定义常量和路径
+        BIN_DIR=~/.local/bin
+        REMOTE_FILE="$BIN_DIR/gmf-remote"
+        ARCHIVE=~/gmf-remote.tar.gz
+
+        # 核心操作
+        mkdir -p "$BIN_DIR"
+        tar -xzf "$ARCHIVE" -C "$BIN_DIR"
+        chmod +x "$REMOTE_FILE"
+        rm "$ARCHIVE"
+    "#
+        );
+        let (exit_code, output) = ssh.call(&command).await?;
+        if exit_code != 0 {
+            return Err(anyhow!(
+                "安装 gmf-remote 失败, exit_code: {}, output: {}",
+                exit_code,
+                output
+            ));
+        }
+        info!("gmf-remote 安装成功");
+    }
+
     Ok(RemoteRunner {
         url,
         forward_child,
