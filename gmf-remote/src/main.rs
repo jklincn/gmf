@@ -1,96 +1,74 @@
-mod handler;
-mod state;
-mod worker;
+mod logging;
+mod server;
 
-use anyhow::anyhow;
-use axum::{
-    Router,
-    routing::{get, post},
-};
-use axum_server::Handle;
-use axum_server::tls_rustls::RustlsConfig;
-use clap::Parser;
-use gmf_common::r2::init_s3_client;
-use rcgen::{CertifiedKey, generate_simple_self_signed};
-use rustls::crypto::{CryptoProvider, ring};
-use time::macros::format_description;
-use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
-use tracing_subscriber::{fmt::time::UtcTime, layer::SubscriberExt, util::SubscriberInitExt};
-
-#[derive(Parser, Debug)]
-#[command(version)]
-struct Args {}
-
-fn set_log() {
-    let log_file_path = ".gmf-remote.log";
-    let log_file = std::fs::File::create(log_file_path).expect("无法创建日志文件");
-
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    let timer_format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    let timer = UtcTime::new(timer_format);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            // 文件日志配置
-            tracing_subscriber::fmt::layer()
-                .with_writer(log_file)
-                .with_ansi(false)
-                .with_timer(timer.clone()),
-        )
-        // .with(
-        //     // 控制台日志配置，用于本地debug
-        //     tracing_subscriber::fmt::layer()
-        //         .with_writer(std::io::stderr)
-        //         .with_timer(timer),
-        // )
-        .init();
-}
-
+use crate::logging::init_logging;
+use crate::server::{AppState, SharedState};
+use anyhow::Result;
+use gmf_common::interface::{Message, ServerResponse};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{Mutex, mpsc};
+use tracing::info;
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    Args::parse();
-    
-    set_log();
+async fn main() -> Result<()> {
+    let _guard = init_logging().expect("无法初始化文件日志系统");
 
-    init_s3_client(None).await?;
+    let state: SharedState = Arc::new(Mutex::new(AppState::default()));
 
-    CryptoProvider::install_default(ring::default_provider())
-        .map_err(|e| anyhow!("Failed to install default rustls crypto provider: {:?}", e))?;
+    let (tx, mut rx) = mpsc::channel::<Message>(100);
 
-    let CertifiedKey { cert, signing_key } =
-        generate_simple_self_signed(vec!["localhost".to_string()])
-            .map_err(|e| anyhow!("generate self-signed cert failed: {:?}", e))?;
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if let Ok(json) = message.to_json() {
+                println!("{}", json);
+            }
+        }
+    });
 
-    let tls_config = RustlsConfig::from_pem(
-        cert.pem().into_bytes(),
-        signing_key.serialize_pem().into_bytes(),
-    )
-    .await?;
+    let ready = ServerResponse::Ready;
+    tx.send(ready.into()).await?;
 
-    let handle = Handle::new();
-    let app_state = state::AppState::new(handle.clone());
+    info!("服务端启动成功，开始监听 stdin...");
+    info!("服务端启动成功，开始监听 stdin...");
 
-    let app = Router::new()
-        .route("/", get(handler::healthy))
-        .route("/setup", post(handler::setup))
-        .route("/start", post(handler::start))
-        .route("/shutdown", post(handler::shutdown))
-        .with_state(app_state)
-        .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http());
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut line_buffer = String::new();
 
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
-    println!("{}", listener.local_addr()?.port());
+    loop {
+        line_buffer.clear();
+        match stdin.read_line(&mut line_buffer).await {
+            Ok(0) => break, // 读到 0 字节表示 EOF，客户端已关闭输入，正常退出循环。
+            Ok(_) => {
+                let line = line_buffer.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match Message::from_json(line) {
+                    Ok(message) => {
+                        let _ = server::handle_message(message, state.clone(), tx.clone()).await;
+                    }
+                    Err(e) => {
+                        let error_response =
+                            ServerResponse::InvalidRequest(format!("无法解析的JSON: {}", e));
 
-    axum_server::from_tcp_rustls(listener, tls_config)
-        .handle(handle)
-        .serve(app.into_make_service())
-        .await?;
+                        if tx.send(error_response.into()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let fatal_error_response =
+                    ServerResponse::Error(format!("致命 I/O 错误，服务端将退出: {}", e));
+                let _ = tx.send(fatal_error_response.into()).await;
+                break;
+            }
+        }
+    }
 
-    tracing::info!("Server process is about to exit.");
+    drop(tx);
+
+    writer_task.await?;
 
     Ok(())
 }
