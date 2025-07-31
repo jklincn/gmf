@@ -1,19 +1,14 @@
 use crate::config::Config;
-use crate::file::{ChunkResult, GMFFile, GmfSession};
-use crate::ssh::{self, CallResult, ExecutionMode};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::file::GmfSession;
+use crate::io_actor::IoActor;
+use crate::ssh::{self};
+use anyhow::{Context, Result, anyhow};
+use gmf_common::interface::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{debug, info};
-use reqwest_eventsource::{Event, EventSource};
-use russh::*;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener;
+use log::{error, info, warn};
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::task::JoinHandle;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
@@ -139,8 +134,18 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
 }
 
 pub struct InteractiveSession {
-    channel: Channel<client::Msg>,
+    // 用于向 IoActor 发送命令
+    command_tx: mpsc::Sender<ClientRequest>,
+    // 用于从 IoActor 接收响应
+    response_rx: mpsc::Receiver<ServerResponse>,
+    // IoActor 任务的句柄，用于在 shutdown 时等待它结束
+    actor_handle: JoinHandle<()>,
+    // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::Session,
+    // 进度条
+    progress_bar: Option<AllProgressBar>,
+    // GMF 文件管理
+    file: Option<GmfSession>,
 }
 
 impl InteractiveSession {
@@ -155,7 +160,7 @@ impl InteractiveSession {
             config.endpoint, config.access_key_id, config.secret_access_key, remote_path
         );
         // 以交互模式调用远程程序
-        let channel = match ssh_session
+        let ssh_channel = match ssh_session
             .call(&command, ssh::ExecutionMode::Interactive)
             .await?
         {
@@ -172,87 +177,109 @@ impl InteractiveSession {
                 ));
             }
         };
+
+        let (command_tx, command_rx) = mpsc::channel(100);
+        let (response_tx, response_rx) = mpsc::channel(100);
+
+        let actor = IoActor::new(ssh_channel, command_rx, response_tx);
+        let actor_handle = tokio::spawn(actor.run());
+
         Ok(Self {
-            channel,
+            command_tx,
+            response_rx,
+            actor_handle,
             ssh_session,
+            progress_bar: None,
+            file: None,
         })
     }
 
-    /// 向远程程序发送一条指令，并自动添加换行符。
-    pub async fn send_command(&mut self, command: &str) -> Result<()> {
-        info!("-> 发送: {}", command);
-        let data_to_send = format!("{}\n", command);
-        self.channel.data(data_to_send.as_bytes()).await?;
+    pub async fn setup(
+        &mut self,
+        file_path: &str,
+        chunk_size: u64,
+        concurrency: u64,
+    ) -> Result<()> {
+        // 做一个检查
+        match self.next_response().await? {
+            Some(response) => {
+                if let ServerResponse::Ready = response {
+                    info!("远程程序已准备就绪");
+                }
+            }
+            _ => {
+                return Err(anyhow!("未收到 Setup 响应"));
+            }
+        }
+
+        let client_request = ClientRequest::Setup(SetupRequestPayload {
+            path: file_path.to_string(),
+            chunk_size,
+            concurrency,
+        });
+
+        info!("正在取得文件信息...");
+        self.send_request(&client_request).await?;
+
+        match self.next_response().await? {
+            Some(response) => {
+                if let ServerResponse::SetupSuccess(setup_response) = response {
+                    info!(
+                        "文件 {} 已准备就绪，大小: {} 字节，总分片数: {}",
+                        setup_response.file_name,
+                        setup_response.file_size,
+                        setup_response.total_chunks
+                    );
+                }
+            }
+            _ => {
+                return Err(anyhow!("未收到 Setup 响应"));
+            }
+        }
+
         Ok(())
     }
 
-    /// 等待并接收远程程序的响应，直到满足某个条件（例如看到特定的提示符）。
-    ///
-    /// # Arguments
-    /// * `read_timeout` - 等待响应的总超时时间。
-    /// * `end_of_response_marker` - 一个字符串，当在输出中看到它时，就认为响应结束了。
-    ///
-    /// # Returns
-    /// 返回从远程接收到的所有数据，直到标记出现。
-    pub async fn receive_response(
-        &mut self,
-        read_timeout: Duration,
-        end_of_response_marker: &str,
-    ) -> Result<String> {
-        info!("<- 接收 (等待标记: '{}')", end_of_response_marker);
-        let mut buffer = Vec::new();
+    /// 向远程程序发送一条指令，并自动添加换行符。
+    pub async fn send_request(&self, request: &ClientRequest) -> Result<()> {
+        self.command_tx
+            .send(request.clone())
+            .await
+            .context("向 I/O Actor 发送命令失败，通道可能已关闭")
+    }
 
-        // 使用 tokio::time::timeout 来防止无限等待
-        let processing_fut = async {
-            loop {
-                match self.channel.wait().await {
-                    Some(ChannelMsg::Data { data }) => {
-                        buffer.extend_from_slice(&data);
-                        // 检查当前缓冲区的内容是否包含结束标记
-                        if String::from_utf8_lossy(&buffer).contains(end_of_response_marker) {
-                            break;
-                        }
-                    }
-                    Some(ChannelMsg::ExitStatus { exit_status }) => {
-                        return Err(anyhow!("远程程序意外退出，退出码: {}", exit_status));
-                    }
-                    None => {
-                        return Err(anyhow!("通道在预期响应完成前被关闭"));
-                    }
-                    _ => {} // 忽略其他消息
-                }
-            }
-            Ok(String::from_utf8(buffer)?)
-        };
-
-        match timeout(read_timeout, processing_fut).await {
-            Ok(Ok(output)) => {
-                info!("<- 接收完成");
-                Ok(output)
-            }
-            Ok(Err(e)) => Err(e), // 内部逻辑错误 (如退出或通道关闭)
-            Err(_) => Err(anyhow!("等待响应超时 (超过 {:?})", read_timeout)), // 超时错误
+    pub async fn next_response(&mut self) -> Result<Option<ServerResponse>> {
+        match tokio::time::timeout(Duration::from_secs(5), self.response_rx.recv()).await {
+            Ok(Some(response)) => Ok(Some(response)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(anyhow::anyhow!("等待响应超时 (超过 5秒)",)),
         }
     }
 
     /// 发送退出指令，并等待程序结束。
     pub async fn shutdown(mut self) -> Result<()> {
-        info!("正在关闭会话...");
+        info!("开始执行优雅关闭流程...");
 
-        // 发送 EOF
-        self.channel.eof().await?;
+        // 步骤 1: 停止发送新命令
+        // 通过拿走 self 的所有权并 drop command_tx，来通知 IoActor 不会再有新任务。
+        // IoActor 的 command_rx.recv() 会返回 None，使其退出主循环。
+        drop(self.command_tx);
+        info!("命令通道已关闭。");
 
-        // 等待远程程序退出
-        loop {
-            match self.channel.wait().await {
-                Some(ChannelMsg::ExitStatus { .. }) | None => break,
-                _ => {}
-            }
+        // 步骤 2: 等待后台 I/O Actor 任务处理完所有缓冲并正常退出
+        // 我们给它一个合理的超时时间，以防它卡住。
+        match tokio::time::timeout(Duration::from_secs(5), self.actor_handle).await {
+            Ok(Ok(_)) => info!("I/O Actor 已成功退出。"),
+            Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {:?}", e),
+            Err(_) => warn!("等待 I/O Actor 退出超时！"),
         }
 
-        // 关闭 SSH 连接
+        // 步骤 3: 现在 Actor 已经停止，可以安全地、主动地关闭 SSH 连接
+        // 这里调用您自己封装的 ssh::Session::close 方法
+        info!("正在主动关闭 SSH 连接...");
         self.ssh_session.close().await?;
-        info!("会话已成功关闭。");
+        info!("SSH 连接已成功关闭。");
+
         Ok(())
     }
 }

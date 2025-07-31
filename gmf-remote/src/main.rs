@@ -29,7 +29,6 @@ async fn main() -> Result<()> {
     tx.send(ready.into()).await?;
 
     info!("服务端启动成功，开始监听 stdin...");
-    info!("服务端启动成功，开始监听 stdin...");
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line_buffer = String::new();

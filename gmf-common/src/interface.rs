@@ -98,9 +98,6 @@ pub struct StartRequestPayload {
 
 // --- Message 创建助手 ---
 impl Message {
-    pub fn create_request(request: ClientRequest) -> Self {
-        Message::Request(request)
-    }
     pub fn create_debug_log(log: Vec<DebugMessage>) -> Self {
         Message::DebugLog(log)
     }
@@ -116,6 +113,12 @@ impl Message {
 impl From<ServerResponse> for Message {
     fn from(response: ServerResponse) -> Self {
         Message::Response(response)
+    }
+}
+
+impl From<ClientRequest> for Message {
+    fn from(request: ClientRequest) -> Self {
+        Message::Request(request)
     }
 }
 

@@ -1,5 +1,6 @@
 mod config;
 mod file;
+mod io_actor;
 mod remote_new;
 mod ssh;
 
@@ -159,9 +160,13 @@ async fn main() -> Result<()> {
 
     let cfg = config::load_or_create_config()?;
 
-    let i = remote_new::InteractiveSession::start(&cfg).await?;
+    let mut session = remote_new::InteractiveSession::start(&cfg).await?;
 
-    i.shutdown().await?;
+    session
+        .setup(&args.path, args.chunk_size, args.concurrency)
+        .await?;
+
+    session.shutdown().await?;
 
     Ok(())
 }

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow};
+use gmf_common::utils::format_size;
 use log::info;
 use russh::keys::*;
 use russh::*;
@@ -146,7 +147,7 @@ impl Session {
 
     // 流式解压会因为缓冲区大小限制而失败，因此改为先上传到临时文件再解压
     pub async fn untar_from_memory(&mut self, data: &[u8], remote_dest_dir: &str) -> Result<()> {
-        info!("远程文件大小: {}", data.len());
+        info!("远程文件大小: {}", format_size(data.len() as u64));
         // 1. 生成临时文件名
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
