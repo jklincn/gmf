@@ -43,7 +43,7 @@ pub async fn handle_message(
                 let result = setup(payload, state).await;
                 let response_message = match result {
                     Ok(res) => res.into(),
-                    Err(e) => ServerResponse::Error(format!("Setup 失败: {}", e)).into(),
+                    Err(e) => ServerResponse::Error(format!("Setup 失败: {e}")).into(),
                 };
                 sender.send(response_message).await?;
             }
@@ -188,15 +188,14 @@ async fn process_single_chunk(job: ChunkJob, sender: mpsc::Sender<Message>) {
     let chunk_id = job.id;
 
     let result: Result<(), anyhow::Error> = async {
-
         // 加密
         let (encrypted_data, passphrase_b64) =
-            encrypt_chunk(&job.data).with_context(|| format!("分块 #{} 加密失败", chunk_id))?;
+            encrypt_chunk(&job.data).with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
 
         // 上传
         upload_chunk(chunk_id, encrypted_data)
             .await
-            .with_context(|| format!("分块 #{} 上传失败", chunk_id))?;
+            .with_context(|| format!("分块 #{chunk_id} 上传失败"))?;
 
         // 发送成功消息
         let ready = ServerResponse::ChunkReadyForDownload {
@@ -213,15 +212,11 @@ async fn process_single_chunk(job: ChunkJob, sender: mpsc::Sender<Message>) {
     .await;
 
     if let Err(e) = result {
-
         let fatal_error_response =
-            ServerResponse::FatalError(format!("处理分块 #{} 时发生错误: {}", chunk_id, e));
+            ServerResponse::FatalError(format!("处理分块 #{chunk_id} 时发生错误: {e}"));
 
         if sender.send(fatal_error_response.into()).await.is_err() {
-            eprintln!(
-                "[ERROR] Channel closed. Could not send FatalError for chunk #{}.",
-                chunk_id
-            );
+            eprintln!("[ERROR] Channel closed. Could not send FatalError for chunk #{chunk_id}.");
         }
     }
 }

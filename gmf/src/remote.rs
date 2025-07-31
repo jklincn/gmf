@@ -24,13 +24,12 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
     // 检查远程程序 SHA256 的命令
     let check_sha_cmd = format!(
         r#"
-        if [ -f "{}" ]; then
-            sha256sum "{}" | cut -d' ' -f1
+        if [ -f "{REMOTE_PATH}" ]; then
+            sha256sum "{REMOTE_PATH}" | cut -d' ' -f1
         else
             echo ""
         fi
-    "#,
-        REMOTE_PATH, REMOTE_PATH
+    "#
     );
 
     let needs_install = match ssh.call_once(&check_sha_cmd).await {
@@ -46,11 +45,10 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
 
     // 如果需要，则进行安装/更新
     if needs_install {
-        info!("正在安装 gmf-remote 至远程目录: {}", REMOTE_BIN_DIR);
+        info!("正在安装 gmf-remote 至远程目录: {REMOTE_BIN_DIR}");
 
         // 创建远程目录
-        ssh.call_once(&format!("mkdir -p {}", REMOTE_BIN_DIR))
-            .await?;
+        ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
 
         // 上传并解压
         ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
@@ -241,13 +239,13 @@ impl InteractiveSession {
                             Some(res) = join_set.join_next() => {
                                 match res {
                                     Ok(ChunkResult::Success(id)) => {
-                                        progress_bar.log_debug(&format!("分块 {} 处理成功", id));
+                                        progress_bar.log_debug(&format!("分块 {id} 处理成功"));
                                     },
                                     Ok(ChunkResult::Failure(id, err)) => {
-                                        progress_bar.log_debug(&format!("分块 {} 处理失败: {:?}", id, err));
+                                        progress_bar.log_debug(&format!("分块 {id} 处理失败: {err:?}"));
                                     },
                                     Err(join_err) => {
-                                        progress_bar.log_debug(&format!("任务 panic: {:?}", join_err));
+                                        progress_bar.log_debug(&format!("任务 panic: {join_err:?}"));
                                     },
                                 }
                             }
@@ -256,13 +254,13 @@ impl InteractiveSession {
                     while let Some(res) = join_set.join_next().await {
                         match res {
                             Ok(ChunkResult::Success(id)) => {
-                                progress_bar.log_debug(&format!("分块 {} 处理成功", id));
+                                progress_bar.log_debug(&format!("分块 {id} 处理成功"));
                             }
                             Ok(ChunkResult::Failure(id, err)) => {
-                                progress_bar.log_debug(&format!("分块 {} 处理失败: {:?}", id, err));
+                                progress_bar.log_debug(&format!("分块 {id} 处理失败: {err:?}"));
                             }
                             Err(join_err) => {
-                                progress_bar.log_debug(&format!("任务 panic: {:?}", join_err));
+                                progress_bar.log_debug(&format!("任务 panic: {join_err:?}"));
                             }
                         }
                     }
@@ -312,7 +310,7 @@ impl InteractiveSession {
         // 我们给它一个合理的超时时间，以防它卡住。
         match tokio::time::timeout(Duration::from_secs(5), self.actor_handle).await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {:?}", e),
+            Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {e:?}"),
             Err(_) => warn!("等待 I/O Actor 退出超时！"),
         }
 

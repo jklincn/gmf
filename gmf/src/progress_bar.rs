@@ -81,7 +81,7 @@ impl AllProgressBar {
     /// 在进度条上方输出消息，不会干扰进度条显示
     fn println(&self, msg: &str) {
         self.mp.println(msg).unwrap_or_else(|_| {
-            println!("{}", msg);
+            println!("{msg}");
         });
     }
 
@@ -101,11 +101,10 @@ impl AllProgressBar {
                 let minutes = (timestamp / 60) % 60;
                 let seconds = timestamp % 60;
                 self.println(&format!(
-                    "[{:02}:{:02}:{:02}] {} {}",
-                    hours, minutes, seconds, level_str, msg
+                    "[{hours:02}:{minutes:02}:{seconds:02}] {level_str} {msg}"
                 ));
             } else {
-                self.println(&format!("[--:--:--] {} {}", level_str, msg));
+                self.println(&format!("[--:--:--] {level_str} {msg}"));
             }
         }
     }

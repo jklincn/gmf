@@ -150,22 +150,21 @@ impl Session {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let temp_file = format!("/tmp/upload_{}.tar.gz", timestamp);
+        let temp_file = format!("/tmp/upload_{timestamp}.tar.gz");
 
         // 2. 使用 SFTP 上传数据到临时文件
         self.upload_file(&temp_file, data).await?;
 
         // 3. 创建目标目录并解压，然后删除临时文件
         let extract_cmd = format!(
-            r#"mkdir -p "{}" && tar -xf "{}" -C "{}" && rm "{}""#,
-            remote_dest_dir, temp_file, remote_dest_dir, temp_file
+            r#"mkdir -p "{remote_dest_dir}" && tar -xf "{temp_file}" -C "{remote_dest_dir}" && rm "{temp_file}""#
         );
 
         match self.call(&extract_cmd, ExecutionMode::Once).await? {
             CallResult::Once((code, output)) => {
                 if code != 0 {
                     // 如果解压失败，尝试清理临时文件
-                    let cleanup_cmd = format!("rm -f '{}'", temp_file);
+                    let cleanup_cmd = format!("rm -f '{temp_file}'");
                     let _ = self.call(&cleanup_cmd, ExecutionMode::Once).await;
 
                     return Err(anyhow!("解压失败，退出码: {}, 输出: {}", code, output));

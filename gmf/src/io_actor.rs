@@ -76,7 +76,7 @@ impl IoActor {
     async fn handle_request(&mut self, request: ClientRequest) -> Result<()> {
         let message: Message = request.into();
         let json_string = message.to_json().context("序列化请求失败")?;
-        let data_to_send = format!("{}\n", json_string);
+        let data_to_send = format!("{json_string}\n");
         self.ssh_channel.data(data_to_send.as_bytes()).await?;
         Ok(())
     }
@@ -104,8 +104,8 @@ impl IoActor {
                                 return false;
                             }
                         }
-                        Ok(Message::DebugLog(logs)) => info!("收到调试日志: {:?}", logs),
-                        _ => error!("收到无效或非响应类型的消息: {}", line_str),
+                        Ok(Message::DebugLog(logs)) => info!("收到调试日志: {logs:?}"),
+                        _ => error!("收到无效或非响应类型的消息: {line_str}"),
                     }
                 }
             }

@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     let writer_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             if let Ok(json) = message.to_json() {
-                println!("{}", json);
+                println!("{json}");
             }
         }
     });
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         let error_response =
-                            ServerResponse::InvalidRequest(format!("无法解析的JSON: {}", e));
+                            ServerResponse::InvalidRequest(format!("无法解析的JSON: {e}"));
 
                         if tx.send(error_response.into()).await.is_err() {
                             break;
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 let fatal_error_response =
-                    ServerResponse::Error(format!("致命 I/O 错误，服务端将退出: {}", e));
+                    ServerResponse::Error(format!("致命 I/O 错误，服务端将退出: {e}"));
                 let _ = tx.send(fatal_error_response.into()).await;
                 break;
             }
