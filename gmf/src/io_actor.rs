@@ -41,12 +41,11 @@ impl IoActor {
                     match cmd_result {
                         Some(request) => {
                             if self.handle_request(request).await.is_err() {
-                                info!("发送命令失败, I/O Actor 退出。");
+                                error!("发送命令失败, I/O Actor 退出。");
                                 break;
                             }
                         }
                         None => {
-                            info!("命令通道已关闭, 准备向远程发送 EOF");
                             command_channel_closed = true;
                             if let Err(e) = self.ssh_channel.eof().await {
                                 error!("发送 EOF 失败: {e:?}");
@@ -65,7 +64,6 @@ impl IoActor {
                         }
                         None => {
                             // 通道被远端关闭
-                            info!("SSH 通道已关闭");
                             break;
                         }
                     }
@@ -112,7 +110,6 @@ impl IoActor {
                 }
             }
             ChannelMsg::ExitStatus { exit_status } => {
-                info!("远程程序已退出, 退出码: {}", exit_status);
                 return false; // 退出循环
             }
             _ => {} // 忽略其他消息

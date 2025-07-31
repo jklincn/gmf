@@ -1,7 +1,8 @@
 mod config;
 mod file;
 mod io_actor;
-mod remote_new;
+mod progress_bar;
+mod remote;
 mod ssh;
 
 use anyhow::Ok;
@@ -12,8 +13,8 @@ use config::Config;
 use env_logger::Builder;
 use env_logger::Env;
 use gmf_common::r2;
-use log::info;
-use log::{error, warn};
+use log::warn;
+use log::{error, info};
 use std::io::Write;
 use tokio::signal;
 
@@ -81,8 +82,8 @@ struct Args {
 
 fn set_log() {
     let default_log_level = match Args::parse().verbose {
-        0 => "info",
-        _ => "debug",
+        0 => "warn",
+        _ => "info",
     };
     let env = Env::default().default_filter_or(default_log_level);
     Builder::from_env(env)
@@ -90,7 +91,7 @@ fn set_log() {
         .init();
 }
 
-async fn set_s3(cfg: &Config) -> Result<()> {
+async fn set_r2(cfg: &Config) -> Result<()> {
     let s3_config = r2::S3Config {
         endpoint: cfg.endpoint.clone(),
         access_key_id: cfg.access_key_id.clone(),
@@ -101,57 +102,6 @@ async fn set_s3(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-// #[tokio::main]
-// async fn main() -> Result<()> {
-//     set_log();
-
-//     let args = Args::parse();
-
-//     let config = config::load_or_create_config()?;
-
-//     set_s3(&config).await?;
-
-//     ssh.close().await?;
-//     // let mut remote = remote::start_remote(&config).await?;
-
-//     // // 主逻辑
-//     // let logic_result: Result<()> = tokio::select! {
-//     //     // 分支 1: 正常执行业务逻辑
-//     //     res = async {
-//     //         remote
-//     //             .setup(&args.path, args.chunk_size, args.concurrency)
-//     //             .await?;
-//     //         remote.start().await?;
-//     //         Ok(())
-//     //     } => {
-//     //         res
-//     //     },
-
-//     //     // 分支 2: 监听 Ctrl+C 信号
-//     //     _ = signal::ctrl_c() => {
-//     //         warn!("\n接收到 Ctrl+C 信号，开始清理工作");
-//     //         Ok(())
-//     //     }
-//     // };
-
-//     // // 1. 如果主逻辑出错，先打印错误信息
-//     // if let Err(e) = &logic_result {
-//     //     error!("执行失败: {e:#}");
-//     // }
-
-//     // // 2. 无论主逻辑是否成功，都执行清理操作
-//     // if let Err(e) = remote.shutdown().await {
-//     //     error!("清理 gmf-remote 时发生错误: {e:#}");
-//     // }
-
-//     // // 清理 Bucket
-//     // if let Err(e) = r2::delete_bucket().await {
-//     //     error!("删除 Bucket 时发生错误: {e:#}");
-//     // }
-
-//     Ok(())
-// }
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -160,13 +110,48 @@ async fn main() -> Result<()> {
 
     let cfg = config::load_or_create_config()?;
 
-    let mut session = remote_new::InteractiveSession::start(&cfg).await?;
+    warn!("配置文件加载成功");
 
-    session
-        .setup(&args.path, args.chunk_size, args.concurrency)
-        .await?;
+    set_r2(&cfg).await?;
 
-    session.shutdown().await?;
+    warn!("R2 客户端初始化成功");
 
+    let mut session = remote::InteractiveSession::new(&cfg).await?;
+
+    let result: Result<()> = tokio::select! {
+        // 分支 1: 正常执行业务逻辑
+        res = async {
+            session
+                .setup(&args.path, args.chunk_size, args.concurrency)
+                .await?;
+            session.start().await?;
+            Ok(())
+        } => {
+            res
+        },
+
+        // 分支 2: 监听 Ctrl+C 信号
+        _ = signal::ctrl_c() => {
+            info!("收到 Ctrl+C 信号，正在清理...");
+            Ok(())
+        }
+    };
+
+    if let Err(e) = &result {
+        error!("发生错误: {e:#}");
+    } else {
+        // 给进度条一些时间显示完成状态
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    // 2. 无论主逻辑是否成功，都执行清理操作
+    if let Err(e) = session.shutdown().await {
+        error!("清理过程中发生错误: {e:#}");
+    }
+
+    // 清理 Bucket
+    if let Err(e) = r2::delete_bucket().await {
+        error!("清理 Bucket 时发生错误: {e:#}");
+    }
     Ok(())
 }

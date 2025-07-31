@@ -1,593 +1,324 @@
 use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
-use crate::{remote, ssh};
-use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
-use gmf_common::{SetupRequestPayload, SetupResponse, StartRequestPayload, TaskEvent, format_size};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use log::{debug, info};
-use reqwest::Client;
-use reqwest_eventsource::{Event, EventSource};
-use std::path::Path;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener;
-use tokio::process::Command;
-use tokio::time::sleep;
+use crate::io_actor::IoActor;
+use crate::progress_bar::{AllProgressBar, LogLevel};
+use crate::ssh::{self};
+use anyhow::{Context, Result, anyhow};
+use gmf_common::interface::*;
+use gmf_common::utils::format_size;
+use log::{error, info, warn};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
-const TIMEOUT: Duration = Duration::from_secs(20);
-const RETRY_INTERVAL: Duration = Duration::from_millis(500);
-const SSE_TIMEOUT: Duration = Duration::from_secs(20);
+pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
+    let mut ssh = ssh::Session::connect(cfg).await?;
+    warn!("远程服务器 {} 连接成功", cfg.host);
 
-pub struct TaskContext {
-    progress_bar: AllProgressBar,
-    session: GmfSession,
+    const REMOTE_BIN_DIR: &str = "$HOME/.local/bin";
+    const REMOTE_PATH: &str = "$HOME/.local/bin/gmf-remote";
+
+    // 检查远程程序 SHA256 的命令
+    let check_sha_cmd = format!(
+        r#"
+        if [ -f "{}" ]; then
+            sha256sum "{}" | cut -d' ' -f1
+        else
+            echo ""
+        fi
+    "#,
+        REMOTE_PATH, REMOTE_PATH
+    );
+
+    let needs_install = match ssh.call_once(&check_sha_cmd).await {
+        Ok((0, remote_sha)) => {
+            // 检查 SHA256 是否匹配
+            remote_sha.trim() != GMF_REMOTE_SHA256
+        }
+        _ => {
+            // 任何错误（如命令不存在）都视为需要安装
+            true
+        }
+    };
+
+    // 如果需要，则进行安装/更新
+    if needs_install {
+        info!("正在安装 gmf-remote 至远程目录: {}", REMOTE_BIN_DIR);
+
+        // 创建远程目录
+        ssh.call_once(&format!("mkdir -p {}", REMOTE_BIN_DIR))
+            .await?;
+
+        // 上传并解压
+        ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
+            .await?;
+
+        info!("gmf-remote 安装成功");
+    }
+
+    Ok((ssh, REMOTE_PATH.to_string()))
 }
 
-impl TaskContext {
-    pub fn new(info: &SetupResponse) -> Result<Self> {
-        let (gmf_file, completed_chunks) =
-            GMFFile::new(&info.filename, info.size, info.total_chunks)?;
-        let progress_bar = AllProgressBar::new(info.total_chunks, completed_chunks)?;
-        let session = GmfSession::new(gmf_file, completed_chunks);
+pub struct InteractiveSession {
+    // 用于向 IoActor 发送命令
+    command_tx: mpsc::Sender<ClientRequest>,
+    // 用于从 IoActor 接收响应
+    response_rx: mpsc::Receiver<ServerResponse>,
+    // IoActor 任务的句柄，用于在 shutdown 时等待它结束
+    actor_handle: JoinHandle<()>,
+    // 持有底层的 SSH 会话对象，以便能够关闭它
+    ssh_session: ssh::Session,
+    // 进度条
+    progress_bar: Option<Arc<AllProgressBar>>,
+    // GMF 文件管理
+    file: Option<Arc<GmfSession>>,
+}
 
-        Ok(TaskContext {
-            progress_bar,
-            session,
+impl InteractiveSession {
+    /// 启动远程程序并创建一个新的交互式会话。
+    pub async fn new(config: &Config) -> Result<Self> {
+        // 检查远程环境并获取 SSH 会话和远程程序路径
+        let (mut ssh_session, remote_path) = check_remote(config).await?;
+
+        info!("正在启动 gmf-remote...");
+        let command = format!(
+            "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' {}",
+            config.endpoint, config.access_key_id, config.secret_access_key, remote_path
+        );
+        // 以交互模式调用远程程序
+        let ssh_channel = match ssh_session
+            .call(&command, ssh::ExecutionMode::Interactive)
+            .await?
+        {
+            ssh::CallResult::Interactive(channel) => {
+                info!("gmf-remote 已成功启动");
+                channel
+            }
+            ssh::CallResult::Once((code, out)) => {
+                // 如果程序立即退出，说明启动失败，这是一个致命错误。
+                return Err(anyhow!(
+                    "尝试以交互模式启动 gmf-remote 失败，程序立即退出。退出码: {}, 输出: {}",
+                    code,
+                    out
+                ));
+            }
+        };
+
+        let (command_tx, command_rx) = mpsc::channel(100);
+        let (response_tx, response_rx) = mpsc::channel(100);
+
+        let actor = IoActor::new(ssh_channel, command_rx, response_tx);
+        let actor_handle = tokio::spawn(actor.run());
+
+        Ok(Self {
+            command_tx,
+            response_rx,
+            actor_handle,
+            ssh_session,
+            progress_bar: None,
+            file: None,
         })
     }
-}
 
-pub struct AllProgressBar {
-    upload: ProgressBar,
-    download: ProgressBar,
-    writer: ProgressBar,
-}
-
-impl AllProgressBar {
-    pub fn new(total_chunks: u64, completed_chunks: u64) -> Result<Self> {
-        let mp = MultiProgress::new();
-        let upload = mp.add(ProgressBar::new(total_chunks));
-        let download = mp.add(ProgressBar::new(total_chunks));
-        let writer = mp.add(ProgressBar::new(total_chunks));
-
-        upload.set_style(
-            ProgressStyle::default_bar()
-                .template("上传进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
-                .progress_chars("#>-"),
-        );
-
-        download.set_style(
-            ProgressStyle::default_bar()
-                .template("下载进度 [{bar:40.green/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
-                .progress_chars("#>-"),
-        );
-
-        writer.set_style(
-            ProgressStyle::default_bar()
-                .template("写入进度 [{bar:40.green/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
-                .progress_chars("#>-"),
-        );
-
-        upload.set_position(completed_chunks);
-        download.set_position(completed_chunks);
-        writer.set_position(completed_chunks);
-
-        Ok(AllProgressBar {
-            upload,
-            download,
-            writer,
-        })
-    }
-
-    pub fn update_upload(&self) {
-        self.upload.inc(1);
-    }
-    pub fn update_download(&self) {
-        self.download.inc(1);
-    }
-    pub fn update_writer(&self) {
-        self.writer.inc(1);
-    }
-}
-
-pub struct RemoteRunner {
-    url: String,
-    forward_child: tokio::process::Child,
-    session: Option<GmfSession>,
-    completed_chunks: u64,
-    multi_progress: MultiProgress,
-    upload_pb: ProgressBar,
-    chunk_size: Option<u64>,
-}
-
-impl RemoteRunner {
     pub async fn setup(
         &mut self,
         file_path: &str,
         chunk_size: u64,
         concurrency: u64,
     ) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build()?;
+        // 先接收一个 Ready 响应，表示远程程序已准备就绪
+        match self.next_response().await? {
+            Some(response) => {
+                if let ServerResponse::Ready = response {
+                    info!("远程程序已准备就绪");
+                }
+            }
+            _ => {
+                return Err(anyhow!("未收到 Setup 响应"));
+            }
+        }
 
-        let payload = SetupRequestPayload {
+        let client_request = ClientRequest::Setup(SetupRequestPayload {
             path: file_path.to_string(),
             chunk_size,
             concurrency,
-        };
-        let url = format!("{}/setup", self.url);
+        });
 
         info!("正在取得文件信息...");
-        let response = client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await?
-            .error_for_status()?;
-        let setup_info = response.json::<SetupResponse>().await?;
+        self.send_request(&client_request).await?;
 
-        info!(
-            "文件名: {}, 大小: {}",
-            setup_info.filename,
-            format_size(setup_info.size)
-        );
-
-        let (gmf_file, completed_chunks) = GMFFile::new(
-            &setup_info.filename,
-            setup_info.size,
-            setup_info.total_chunks,
-        )?;
-
-        // 存储已完成的分块数
-        self.completed_chunks = completed_chunks;
-        self.chunk_size = Some(chunk_size);
-
-        self.upload_pb = self
-            .multi_progress
-            .add(ProgressBar::new(setup_info.total_chunks as u64));
-        self.upload_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("上传进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
-                .progress_chars("#>-"),
-        );
-
-        self.upload_pb.set_position(completed_chunks);
-
-        let session = GmfSession::new(gmf_file, self.completed_chunks);
-        self.session = Some(session);
+        match self.next_response().await? {
+            Some(response) => {
+                if let ServerResponse::SetupSuccess(setup_response) = response {
+                    let (gmf_file, completed_chunks) = GMFFile::new(
+                        &setup_response.file_name,
+                        setup_response.file_size,
+                        setup_response.total_chunks,
+                    )?;
+                    warn!(
+                        "文件名称: {} (大小: {})",
+                        setup_response.file_name,
+                        format_size(setup_response.file_size)
+                    );
+                    let progress_bar = Arc::new(
+                        AllProgressBar::new(
+                            setup_response.total_chunks,
+                            completed_chunks,
+                            LogLevel::Info,
+                        )
+                        .unwrap(),
+                    );
+                    self.progress_bar = Some(progress_bar.clone());
+                    self.file = Some(Arc::new(GmfSession::new(
+                        gmf_file,
+                        completed_chunks,
+                        progress_bar.clone(),
+                    )));
+                } else {
+                    return Err(anyhow!("未收到 SetupSuccess 响应"));
+                }
+            }
+            _ => {
+                return Err(anyhow!("未收到 Setup 响应"));
+            }
+        }
 
         Ok(())
     }
 
-    // 开始处理
     pub async fn start(&mut self) -> Result<()> {
-        let session = self.session.take().unwrap();
+        let progress_bar = self
+            .progress_bar
+            .clone()
+            .ok_or_else(|| anyhow!("请先调用 setup() 方法以初始化进度条和文件信息"))?;
+        let completed_chunks = self.progress_bar.as_ref().unwrap().completed_chunks;
+        let client_request = ClientRequest::Start(StartRequestPayload {
+            resume_from_chunk_id: completed_chunks,
+        });
 
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .connect_timeout(Duration::from_secs(20))
-            .build()?;
-        let sse_url = format!("{}/start", self.url);
+        info!("正在发送上传请求");
+        self.send_request(&client_request).await?;
 
-        let start_payload = StartRequestPayload {
-            resume_from_chunk_id: self.completed_chunks,
-        };
+        match self.next_response().await? {
+            Some(response) => {
+                if let ServerResponse::StartSuccess = response {
+                    info!("开始上传");
+                    let session = self.file.take().expect("file 已初始化");
+                    let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            // —— 3.1 服务器有新消息 ——————————————————————————
+                            resp = self.next_response() => {
+                                match resp? {
+                                    Some(ServerResponse::ChunkReadyForDownload {chunk_id, passphrase_b64}) => {
+                                        // 更新 UI
+                                        progress_bar.update_upload();
 
-        let mut event_source = EventSource::new(
-            client
-                .post(&sse_url)
-                .header("Accept", "text/event-stream")
-                .json(&start_payload),
-        )?;
+                                        // 为每个分块启动一个异步任务
+                                        let session_clone = session.clone();
+                                        join_set.spawn(async move {
+                                            session_clone.handle_chunk(chunk_id, passphrase_b64).await
+                                        });
+                                    }
 
-        let mut worker_handles = FuturesUnordered::new();
-        let mut task_completed_signal = false; // 用于标记是否收到了服务端的完成信号
+                                    Some(ServerResponse::UploadCompleted) => {
+                                        progress_bar.log_debug("服务器端所有分块已推送完毕，等待剩余任务完成…");
+                                        break;
+                                    }
 
-        loop {
-            tokio::select! {
-            // 偏向于优先处理已完成的任务，避免积压
-                biased;
+                                    Some(ServerResponse::Error(msg)) => {
+                                        anyhow::bail!("服务端错误: {msg}");
+                                    }
 
-                // 分支1: 处理已完成的 worker 任务
-                // 当 worker_handles 不为空时，这个分支才会被轮询
-                Some(result) = worker_handles.next(), if !worker_handles.is_empty() => {
-                    // 明确告诉编译器 result 的类型
-                    let result: Result<ChunkResult, tokio::task::JoinError> = result;
-
-                    match result {
-                        Ok(ChunkResult::Success(_id)) => {
-                        }
-                        Ok(ChunkResult::Failure(id, e)) => {
-                        }
-                        Err(join_error) => {
-                            if join_error.is_panic() {
-                                let panic_payload = join_error.into_panic();
-                                if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
-                                    bail!("一个 Worker 任务发生 Panic: {s:?}");
-                                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                                    bail!("一个 Worker 任务发生 Panic: {s:?}");
-                                } else {
-                                    bail!("一个 Worker 任务发生未知类型的 Panic");
+                                    _ => {/* 忽略其他心跳 / 日志消息 */}
                                 }
-                            } else {
-                                return Err(anyhow!("Worker 任务被终止: {}", join_error));
+                            }
+
+                            // —— 3.2 有分块任务先结束 ——————————————————————
+                            Some(res) = join_set.join_next() => {
+                                match res {
+                                    Ok(ChunkResult::Success(id)) => {
+                                        progress_bar.log_debug(&format!("分块 {} 处理成功", id));
+                                    },
+                                    Ok(ChunkResult::Failure(id, err)) => {
+                                        progress_bar.log_debug(&format!("分块 {} 处理失败: {:?}", id, err));
+                                    },
+                                    Err(join_err) => {
+                                        progress_bar.log_debug(&format!("任务 panic: {:?}", join_err));
+                                    },
+                                }
                             }
                         }
                     }
-                }
-
-                // 分支2: 从服务端接收新任务
-                // 仅当服务端尚未发出完成信号时，才接收新事件
-                event = event_source.next(), if !task_completed_signal => {
-                    match event {
-                        Some(Ok(Event::Message(message))) => {
-                            let task_event: TaskEvent = serde_json::from_str(&message.data)
-                                .context("解析服务端事件失败")?;
-
-                            if let TaskEvent::ChunkReadyForDownload { chunk_id, passphrase_b64 } = task_event {
-                                if chunk_id < self.completed_chunks {
-                                    continue;
-                                }
-                                self.upload_pb.inc(1);
-                                let handle = session.handle_chunk(chunk_id, passphrase_b64);
-                                // 将新任务推入 FuturesUnordered
-                                worker_handles.push(handle);
-                            } else if let TaskEvent::TaskCompleted = task_event {
-                                self.upload_pb.finish();
-                                task_completed_signal = true; // 标记服务端任务已全部派发
-                                event_source.close();
-                            } else if let TaskEvent::Error { message } = task_event {
-                                bail!("服务端错误: {}", message);
+                    while let Some(res) = join_set.join_next().await {
+                        match res {
+                            Ok(ChunkResult::Success(id)) => {
+                                progress_bar.log_debug(&format!("分块 {} 处理成功", id));
+                            }
+                            Ok(ChunkResult::Failure(id, err)) => {
+                                progress_bar.log_debug(&format!("分块 {} 处理失败: {:?}", id, err));
+                            }
+                            Err(join_err) => {
+                                progress_bar.log_debug(&format!("任务 panic: {:?}", join_err));
                             }
                         }
-                        Some(Err(e)) => {
-                            self.upload_pb.abandon();
-                            return Err(anyhow!("SSE 流意外断开: {}", e));
-                        }
-                        None => {
-                            // SSE 流正常关闭
-                            task_completed_signal = true;
-                        }
-                        _ => {}
                     }
-                }
+                    let session = Arc::try_unwrap(session)
+                        .map_err(|_| anyhow!("还有其他 Arc 引用（逻辑错误）"))?;
+                    session.wait_for_completion().await?;
 
-                // 分支3: 超时检查
-                _ = sleep(SSE_TIMEOUT), if worker_handles.is_empty() && !task_completed_signal => {
-                        if self.completed_chunks == 0 {
-                        bail!("SSE 事件流超时：超过 {:?} 未收到任何事件", SSE_TIMEOUT);
-                        }
-                }
+                    // 完成进度条
+                    progress_bar.finish_all();
 
-                // 循环退出条件
-                else => {
-                    // 当其他分支都无法再取得进展时，进入此分支
-                    // 如果服务端已发完任务，并且所有 worker 都已处理完毕，则退出循环
-                    if task_completed_signal && worker_handles.is_empty() {
-                        break;
-                    }
+                    warn!("文件已下载到本地，正在执行清理");
+                } else {
+                    return Err(anyhow!("未收到 StartSuccess 响应"));
                 }
             }
+            _ => {
+                return Err(anyhow!("未收到 Start 响应"));
+            }
         }
-
-        debug!("所有 worker 已完成。现在等待文件写入器完成...");
-        session.wait_for_completion().await?;
-
         Ok(())
     }
 
-    // 关闭远程服务
-    pub async fn shutdown(&mut self) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build()?;
-
-        let url = format!("{}/shutdown", self.url);
-
-        client.post(&url).send().await?.error_for_status()?;
-
-        // 等待远端服务完全关闭
-        // BUG
-        const MAX_POLL_ATTEMPTS: u32 = 20;
-        const POLL_INTERVAL: Duration = Duration::from_millis(500);
-        let mut server_confirmed_down = false;
-
-        for _ in 0..MAX_POLL_ATTEMPTS {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            match client.get(&self.url).send().await {
-                Ok(_) => {}
-                Err(_) => {
-                    // BUG: 会出现 channel 2: open failed: connect failed: Connection refused
-                    server_confirmed_down = true;
-                    break;
-                }
-            }
-        }
-
-        if !server_confirmed_down {
-            return Err(anyhow!(
-                "等待远端服务关闭超时 ({} 秒后)",
-                (MAX_POLL_ATTEMPTS as u128 * POLL_INTERVAL.as_millis()) / 1000
-            ));
-        }
-
-        // 关闭 ssh 端口转发进程
-        self.forward_child
-            .kill()
+    /// 向远程程序发送一条指令，并自动添加换行符。
+    pub async fn send_request(&self, request: &ClientRequest) -> Result<()> {
+        self.command_tx
+            .send(request.clone())
             .await
-            .context("无法关闭 ssh 端口转发进程")?;
+            .context("向 I/O Actor 发送命令失败，通道可能已关闭")
+    }
+
+    pub async fn next_response(&mut self) -> Result<Option<ServerResponse>> {
+        match tokio::time::timeout(Duration::from_secs(5), self.response_rx.recv()).await {
+            Ok(Some(response)) => Ok(Some(response)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(anyhow::anyhow!("等待响应超时 (超过 5秒)",)),
+        }
+    }
+
+    /// 发送退出指令，并等待程序结束。
+    pub async fn shutdown(mut self) -> Result<()> {
+        // 步骤 1: 停止发送新命令
+        // 通过拿走 self 的所有权并 drop command_tx，来通知 IoActor 不会再有新任务。
+        // IoActor 的 command_rx.recv() 会返回 None，使其退出主循环。
+        drop(self.command_tx);
+
+        // 步骤 2: 等待后台 I/O Actor 任务处理完所有缓冲并正常退出
+        // 我们给它一个合理的超时时间，以防它卡住。
+        match tokio::time::timeout(Duration::from_secs(5), self.actor_handle).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {:?}", e),
+            Err(_) => warn!("等待 I/O Actor 退出超时！"),
+        }
+
+        // 步骤 3: 现在 Actor 已经停止，可以安全地、主动地关闭 SSH 连接
+        self.ssh_session.close().await?;
+
         Ok(())
     }
-}
-
-// 启动远端并返回 Runner
-pub async fn start_remote(cfg: &Config) -> Result<RemoteRunner> {
-    ensure_remote(cfg).await?;
-
-    debug!("正在启动 gmf-remote...");
-    // 启动 gmf‑remote
-    let mut ssh_child = {
-        let mut cmd = Command::new("ssh");
-        let remote_command = format!(
-            "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' ~/.local/bin/gmf-remote",
-            cfg.endpoint, cfg.access_key_id, cfg.secret_access_key,
-        );
-        add_ssh_args(&mut cmd, cfg)
-            .arg(&remote_command)
-            .kill_on_drop(true);
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
-        cmd.spawn().context("无法启动 gmf-remote")?
-    };
-
-    debug!("gmf-remote 启动成功");
-
-    // 获取输出
-    let stdout = ssh_child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("无法获得 ssh stdout"))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    // 读取端口
-    let port_line = reader
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow!("gmf-remote 未输出端口号"))?;
-    let remote_port: u16 = port_line.trim().parse().context("端口号解析失败")?;
-
-    // 建立本地端口转发：local_port -> 127.0.0.1:remote_port
-    let local_port = pick_free_port().await?;
-    let mut forward_child = {
-        let mut cmd = Command::new("ssh");
-        add_ssh_args(&mut cmd, cfg)
-            .args(["-N", "-o", "ExitOnForwardFailure=yes"])
-            .arg("-L")
-            .arg(format!("{local_port}:127.0.0.1:{remote_port}"));
-        cmd.spawn().context("无法启动 ssh 端口转发进程")?
-    };
-
-    // 轮询本地端口是否就绪
-    let url = format!("https://127.0.0.1:{local_port}");
-    let client = Client::builder()
-        .timeout(TIMEOUT)
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status() == 200 => break,
-            _ if Instant::now() > deadline => {
-                ssh_child.kill().await.ok();
-                forward_child.kill().await.ok();
-                return Err(anyhow!("等待端口 {local_port} 就绪超时 (> {TIMEOUT:?})"));
-            }
-            _ => sleep(RETRY_INTERVAL).await,
-        }
-    }
-
-    info!("gmf-remote 连接成功");
-    let mp = MultiProgress::new();
-    Ok(RemoteRunner {
-        url,
-        forward_child,
-        session: None,
-        completed_chunks: 0,
-        multi_progress: mp,
-        upload_pb: ProgressBar::new(0),
-        chunk_size: None,
-    })
-}
-
-pub async fn start_remote_new(cfg: &Config) -> Result<RemoteRunner> {
-    info!("正在尝试连接远程服务器 {}:{}", cfg.host, cfg.port);
-    let mut ssh = ssh::Session::connect(&cfg).await?;
-    info!("远程服务器连接成功");
-
-    let get_home_cmd = "sh -c 'echo $HOME'";
-    let (exit_code, home_dir_output) = ssh.call(get_home_cmd).await?;
-    if exit_code != 0 {
-        return Err(anyhow!(
-            "获取远程家目录失败, exit_code: {}, output: {}",
-            exit_code,
-            home_dir_output
-        ));
-    }
-    let home_dir = home_dir_output.trim();
-    let remote_path = format!("{home_dir}/.local/bin/gmf-remote");
-    let command = format!("sh -c '{remote_path} -V'");
-    let (exit_code, remote_version) = ssh.call(&command).await?;
-    if exit_code != 0 || !remote_version.contains(env!("CARGO_PKG_VERSION")) {
-        info!("正在安装（更新）gmf-remote 至远程服务器 ~/.local/bin 目录");
-        ssh.upload_file(remote_path.as_str(), GMF_REMOTE_TAR_GZ);
-        let command = format!(
-            r#"
-        # 任何命令失败则立即退出
-        set -e
-
-        # 定义常量和路径
-        BIN_DIR=~/.local/bin
-        REMOTE_FILE="$BIN_DIR/gmf-remote"
-        ARCHIVE=~/gmf-remote.tar.gz
-
-        # 核心操作
-        mkdir -p "$BIN_DIR"
-        tar -xzf "$ARCHIVE" -C "$BIN_DIR"
-        chmod +x "$REMOTE_FILE"
-        rm "$ARCHIVE"
-    "#
-        );
-        let (exit_code, output) = ssh.call(&command).await?;
-        if exit_code != 0 {
-            return Err(anyhow!(
-                "安装 gmf-remote 失败, exit_code: {}, output: {}",
-                exit_code,
-                output
-            ));
-        }
-        info!("gmf-remote 安装成功");
-    }
-
-    Ok(RemoteRunner {
-        url,
-        forward_child,
-        session: None,
-        completed_chunks: 0,
-        multi_progress: mp,
-        upload_pb: ProgressBar::new(0),
-        chunk_size: None,
-    })
-}
-
-async fn ensure_remote(cfg: &Config) -> Result<()> {
-    info!("正在尝试连接远程服务器 {}", cfg.host);
-    ssh_once(cfg, "ls").await.context("远程服务器连接失败")?;
-    info!("远程服务器 {} 连接成功", cfg.host);
-
-    let check_cmd = r#"
-        set -e
-        for cmd in sha256sum cut tar; do
-            command -v "$cmd" >/dev/null 2>&1
-        done
-        FILE_PATH=~/.local/bin/gmf-remote
-        if [ -f "$FILE_PATH" ]; then
-            sha256sum "$FILE_PATH" | cut -d' ' -f1
-        fi
-    "#;
-
-    let current_sha = ssh_once(cfg, check_cmd)
-        .await
-        .context("远程服务器初始检查失败 (可能缺少依赖命令如 sha256sum, cut, tar)")?;
-
-    // 在 Rust 端进行判断
-    if current_sha.trim() == GMF_REMOTE_SHA256 {
-        return Ok(());
-    }
-
-    // 上传 gzip
-    info!("正在安装 gmf-remote 至 ~/.local/bin 目录");
-    let tmp = std::env::temp_dir().join("gmf-remote.tar.gz");
-    tokio::fs::write(&tmp, GMF_REMOTE_TAR_GZ).await?;
-    scp_send(cfg, &tmp, "~/gmf-remote.tar.gz").await?;
-    tokio::fs::remove_file(&tmp).await.ok();
-
-    // 解压 + chmod
-    let install_and_verify_cmd = format!(
-        r#"
-        # 任何命令失败则立即退出
-        set -e
-
-        # 定义常量和路径
-        BIN_DIR=~/.local/bin
-        REMOTE_FILE="$BIN_DIR/gmf-remote"
-        ARCHIVE=~/gmf-remote.tar.gz
-        EXPECTED_SHA="{GMF_REMOTE_SHA256}"
-
-        # 核心操作
-        mkdir -p "$BIN_DIR"
-        tar -xzf "$ARCHIVE" -C "$BIN_DIR"
-        chmod +x "$REMOTE_FILE"
-        rm "$ARCHIVE"
-
-        # 最终校验
-        ACTUAL_SHA=$(sha256sum "$REMOTE_FILE" | cut -d' ' -f1)
-
-        # 如果校验失败，直接以非零状态码退出
-        [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]
-    "#
-    );
-
-    ssh_once(cfg, &install_and_verify_cmd)
-        .await
-        .context("在远程服务器上安装或校验 gmf-remote 时发生错误")?;
-
-    info!("gmf-remote 安装成功");
-    Ok(())
-}
-
-fn add_ssh_args<'a>(cmd: &'a mut Command, cfg: &Config) -> &'a mut Command {
-    cmd.arg("-p")
-        .arg(cfg.port.to_string())
-        .args(private_key_args(cfg))
-        .arg(format!("{}@{}", cfg.user, cfg.host))
-}
-
-fn private_key_args(cfg: &Config) -> Vec<String> {
-    if !cfg.private_key_path.is_empty() {
-        vec!["-i".to_string(), cfg.private_key_path.clone()]
-    } else {
-        Vec::new()
-    }
-}
-
-// TODO：使用 russh-sftp 重构
-async fn scp_send(cfg: &Config, local: &Path, remote: &str) -> Result<()> {
-    let status = {
-        let mut cmd = Command::new("scp");
-        cmd.arg("-q")
-            .arg("-P")
-            .arg(cfg.port.to_string())
-            .args(private_key_args(cfg))
-            .arg(local)
-            .arg(format!("{}@{}:{remote}", cfg.user, cfg.host));
-        cmd.status().await?
-    };
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| anyhow!("scp 上传失败"))
-}
-
-// TODO: 使用 russh 重构
-async fn ssh_once(cfg: &Config, remote_cmd: &str) -> Result<String> {
-    let output = {
-        let mut cmd = Command::new("ssh");
-        add_ssh_args(&mut cmd, cfg).arg(remote_cmd);
-        cmd.output().await?
-    };
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(anyhow!(
-            "ssh `{remote_cmd}` 失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
-// 获取一个可用的本地端口
-async fn pick_free_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
 }

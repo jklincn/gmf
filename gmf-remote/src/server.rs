@@ -180,7 +180,7 @@ pub async fn start(
         .for_each(|_| async { /* 忽略结果，任务会在内部处理 */ })
         .await;
 
-    let completed_response = ServerResponse::Completed;
+    let completed_response = ServerResponse::UploadCompleted;
     sender.send(completed_response.into()).await?;
 
     Ok(())

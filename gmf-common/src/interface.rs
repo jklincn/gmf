@@ -41,7 +41,7 @@ pub enum ServerResponse {
         chunk_id: u64,
         passphrase_b64: String,
     },
-    Completed,
+    UploadCompleted,
 
     // --- 【新增】错误响应 ---
     /// 通用错误，当错误不属于特定类别时使用。

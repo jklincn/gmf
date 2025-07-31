@@ -14,6 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::progress_bar::AllProgressBar;
+
 const MAGIC: &[u8; 13] = b"gmf temp file";
 const HEADER_SIZE: u64 = 32;
 
@@ -67,7 +69,6 @@ pub struct GMFFile {
     file: File,
     header: Header,
     pub filename: String,
-    pub size: u64,
     pub temp_path: PathBuf,
 }
 
@@ -82,7 +83,7 @@ impl GMFFile {
         let gmf_filename = PathBuf::from(format!(".{combined_hash_hex}.gmf"));
 
         if gmf_filename.exists() {
-            match Self::open_and_validate(&gmf_filename, chunk_count, filename, size) {
+            match Self::open_and_validate(&gmf_filename, chunk_count, filename) {
                 Ok(gmf_file) => {
                     let completed_chunks = gmf_file.header.written_count;
                     info!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
@@ -96,7 +97,7 @@ impl GMFFile {
         }
 
         // 如果文件不存在或验证失败，则创建新文件
-        let gmf_file = Self::create(&gmf_filename, chunk_count, filename, size)?;
+        let gmf_file = Self::create(&gmf_filename, chunk_count, filename)?;
         Ok((gmf_file, 0)) // 新文件，已完成 0 个
     }
 
@@ -105,7 +106,6 @@ impl GMFFile {
         path: P,
         expected_chunk_count: u64,
         filename: &str,
-        size: u64,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -146,17 +146,11 @@ impl GMFFile {
             file,
             header,
             filename: filename.to_string(),
-            size,
             temp_path: path.as_ref().to_path_buf(),
         })
     }
 
-    fn create<P: AsRef<Path>>(
-        path: P,
-        chunk_count: u64,
-        filename: &str,
-        size: u64,
-    ) -> Result<Self> {
+    fn create<P: AsRef<Path>>(path: P, chunk_count: u64, filename: &str) -> Result<Self> {
         let path_ref = path.as_ref();
         let header = Header {
             magic: *MAGIC,
@@ -172,7 +166,6 @@ impl GMFFile {
             file,
             header,
             filename: filename.to_string(),
-            size,
             temp_path: path.as_ref().to_path_buf(),
         })
     }
@@ -225,10 +218,15 @@ pub struct GmfSession {
     gmf_file: Arc<Mutex<GMFFile>>,
     decrypted_tx: mpsc::Sender<DecryptedChunk>,
     writer_handle: JoinHandle<Result<()>>,
+    progress_bar: Arc<AllProgressBar>,
 }
 
 impl GmfSession {
-    pub fn new(gmf_file: GMFFile, completed_chunks: u64) -> Self {
+    pub fn new(
+        gmf_file: GMFFile,
+        completed_chunks: u64,
+        progress_bar: Arc<AllProgressBar>,
+    ) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
@@ -236,67 +234,69 @@ impl GmfSession {
             gmf_file_arc.clone(),
             decrypted_rx,
             completed_chunks,
+            progress_bar.clone(),
         ));
 
         Self {
             gmf_file: gmf_file_arc,
             decrypted_tx,
             writer_handle,
+            progress_bar,
         }
     }
 
-    pub fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> JoinHandle<ChunkResult> {
+    pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
         let decrypted_tx = self.decrypted_tx.clone();
 
-        tokio::spawn(async move {
-            // 使用一个内部 async 块来执行所有操作，这样可以方便地使用 `?` 来传播错误。
-            let result: Result<()> = async {
-                // 1. 下载加密的分块数据
-                let content = r2::get_object(&chunk_id.to_string())
-                    .await
-                    .with_context(|| format!("从 r2 获取分块 {chunk_id} 数据失败"))?;
+        // 所有错误都统一折叠成 anyhow::Result，最后再转换为 ChunkResult
+        let result: anyhow::Result<()> = async {
+            // 下载分块
+            let content = r2::get_object(&chunk_id.to_string())
+                .await
+                .with_context(|| format!("从 r2 获取分块 {chunk_id} 数据失败"))?;
+            self.progress_bar.update_download();
 
-                // 2. 解密分块
-                let plain_data = tokio::task::spawn_blocking(move || {
-                    let key_bytes = general_purpose::STANDARD
-                        .decode(passphrase_b64)
-                        .context("Base64 解码密钥失败")?;
+            // 解密（阻塞运算放到 blocking 线程池）
+            let plain_data = tokio::task::spawn_blocking(move || {
+                let key_bytes = general_purpose::STANDARD
+                    .decode(passphrase_b64)
+                    .context("Base64 解码密钥失败")?;
 
-                    let (nonce_bytes, ciphertext) = content.split_at(NONCE_SIZE);
-                    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-                    let cipher = Aes256Gcm::new(key);
-                    let nonce = Nonce::from_slice(nonce_bytes);
+                let (nonce_bytes, ciphertext) = content.split_at(NONCE_SIZE);
+                let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+                let cipher = Aes256Gcm::new(key);
+                let nonce = Nonce::from_slice(nonce_bytes);
 
-                    cipher
-                        .decrypt(nonce, ciphertext)
-                        .map_err(|e| anyhow!("分块数据解密失败: {:?}", e))
+                cipher
+                    .decrypt(nonce, ciphertext)
+                    .map_err(|e| anyhow!("分块数据解密失败: {e:?}"))
+            })
+            .await
+            .context("解密任务本身发生错误（例如 panic）")??;
+
+            // 删除已下载对象
+            r2::delete_object(&chunk_id.to_string())
+                .await
+                .context("删除已下载的分块对象失败")?;
+
+            // 将明文发送给写入器
+            decrypted_tx
+                .send(DecryptedChunk {
+                    id: chunk_id,
+                    data: plain_data,
                 })
                 .await
-                .context("解密任务本身发生错误 (例如 panic)")??;
+                .map_err(|e| anyhow!("发送解密数据给写入器失败: {e}"))?;
 
-                r2::delete_object(&chunk_id.to_string())
-                    .await
-                    .context("删除已下载的分块对象失败")?;
+            Ok(())
+        }
+        .await;
 
-                // 3. 将解密后的数据发送给写入器任务
-                decrypted_tx
-                    .send(DecryptedChunk {
-                        id: chunk_id,
-                        data: plain_data,
-                    })
-                    .await
-                    .map_err(|e| anyhow!("发送解密数据给写入器失败: {}", e))?;
-
-                Ok(())
-            }
-            .await;
-
-            // 根据内部 async 块的结果，返回一个 ChunkResult
-            match result {
-                Ok(_) => ChunkResult::Success(chunk_id),
-                Err(e) => ChunkResult::Failure(chunk_id, e),
-            }
-        })
+        // 返回统一的 ChunkResult
+        match result {
+            Ok(_) => ChunkResult::Success(chunk_id),
+            Err(e) => ChunkResult::Failure(chunk_id, e),
+        }
     }
 
     /// 等待所有已派发的任务完成，并关闭写入器。
@@ -366,7 +366,6 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     fs::rename(temp_path, target_filename)
         .with_context(|| format!("重命名文件从 '{temp_path:?}' 到 '{target_filename}' 失败"))?;
 
-    info!("文件 '{target_filename}' 已成功下载并校验！");
     Ok(())
 }
 
@@ -375,6 +374,7 @@ async fn run_writer_task(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
     completed_chunks: u64,
+    progress_bar: Arc<AllProgressBar>,
 ) -> Result<()> {
     let mut buffer = BTreeMap::new();
     let mut next_chunk_to_write = completed_chunks;
@@ -382,7 +382,7 @@ async fn run_writer_task(
     while let Some(chunk) = decrypted_rx.recv().await {
         // 如果收到的块是已经写入过的，直接丢弃
         if chunk.id < next_chunk_to_write {
-            warn!("丢弃已处理过的分块 {}", chunk.id);
+            progress_bar.log_info(&format!("丢弃已处理过的分块 {}", chunk.id));
             continue;
         }
 
@@ -393,6 +393,8 @@ async fn run_writer_task(
             gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
             drop(gmf);
             next_chunk_to_write += 1;
+            progress_bar.update_writer();
+            progress_bar.log_debug(&format!("已成功写入分块 {}", next_chunk_to_write - 1));
         }
     }
 
@@ -403,6 +405,6 @@ async fn run_writer_task(
             missing_chunks.join(", ")
         );
     }
-    debug!("所有分块已成功写入");
+    progress_bar.log_debug("所有分块处理完毕");
     Ok(())
 }
