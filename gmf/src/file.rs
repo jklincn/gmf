@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use gmf_common::consts::NONCE_SIZE;
 use gmf_common::r2;
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

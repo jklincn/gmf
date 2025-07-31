@@ -12,7 +12,6 @@ use futures::stream::{self, StreamExt};
 use gmf_common::consts::NONCE_SIZE;
 use gmf_common::interface::*;
 use gmf_common::r2::{init_s3_client, put_object};
-use std::time::Instant;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, BufReader},
@@ -22,10 +21,7 @@ use tokio::{
 #[derive(Debug, Clone)]
 pub struct TaskMetadata {
     pub file_path: PathBuf,
-    pub file_name: String,
-    pub file_size: u64,
     pub chunk_size: u64,
-    pub total_chunks: u64,
     pub concurrency: u64,
 }
 
@@ -86,10 +82,7 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> Result<S
 
     let task_metadata = TaskMetadata {
         file_path,
-        file_name: file_name.clone(),
-        file_size,
         chunk_size: payload.chunk_size,
-        total_chunks,
         concurrency: payload.concurrency,
     };
 
@@ -152,7 +145,7 @@ pub async fn start(
                 match reader.read(&mut buf[filled..]).await {
                     Ok(0) => break,
                     Ok(n) => filled += n,
-                    Err(e) => {
+                    Err(_) => {
                         return None;
                     }
                 }
@@ -259,8 +252,6 @@ fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
 
 // TODO: 超时与错误重试（达到重试次数则退出）
 async fn upload_chunk(chunk_id: u64, data: Vec<u8>) -> Result<()> {
-    let start = Instant::now();
     put_object(&chunk_id.to_string(), data).await?;
-    let duration = start.elapsed();
     Ok(())
 }

@@ -109,7 +109,7 @@ impl IoActor {
                     }
                 }
             }
-            ChannelMsg::ExitStatus { exit_status } => {
+            ChannelMsg::ExitStatus { exit_status: _ } => {
                 return false; // 退出循环
             }
             _ => {} // 忽略其他消息
