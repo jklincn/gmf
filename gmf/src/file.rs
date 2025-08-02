@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::progress_bar::AllProgressBar;
+use crate::ui::AllProgressBar;
 
 const MAGIC: &[u8; 13] = b"gmf temp file";
 const HEADER_SIZE: u64 = 32;

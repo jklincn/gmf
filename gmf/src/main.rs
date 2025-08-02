@@ -1,7 +1,7 @@
 mod config;
 mod file;
 mod io_actor;
-mod progress_bar;
+mod ui;
 mod remote;
 mod ssh;
 
@@ -108,14 +108,14 @@ async fn main() -> Result<()> {
 
     set_log();
 
-    let cfg = progress_bar::run_with_spinner(
+    let cfg = ui::run_with_spinner(
         "正在加载配置文件...",
         "✅ 配置文件加载成功",
         config::load_or_create_config(),
     )
     .await?;
 
-    progress_bar::run_with_spinner(
+    ui::run_with_spinner(
         "正在初始化 R2 客户端...",
         "✅ R2 客户端初始化成功",
         set_r2(&cfg),

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::io_actor::IoActor;
-use crate::progress_bar::{AllProgressBar, LogLevel, run_with_spinner};
+use crate::ui::{AllProgressBar, LogLevel, run_with_spinner};
 use crate::ssh::{self};
 use anyhow::{Context, Result, anyhow};
 use gmf_common::interface::*;
@@ -151,7 +151,7 @@ impl InteractiveSession {
             concurrency,
         });
 
-        let spinner = crate::progress_bar::Spinner::new("正在取得文件信息...");
+        let spinner = crate::ui::Spinner::new("正在取得文件信息...");
 
         // 2. 执行异步任务，并用 match 处理所有可能的结果
         match async {
