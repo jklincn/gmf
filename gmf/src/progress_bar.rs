@@ -122,7 +122,7 @@ pub struct Spinner {
 impl Spinner {
     pub fn new(msg: &str) -> Self {
         let spinner_style = ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
+            .template("{spinner:.green}  {msg}")
             .expect("设置样式失败");
 
         let sp = ProgressBar::new_spinner();

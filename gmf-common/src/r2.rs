@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use aws_config::{self, BehaviorVersion, Region};
+use aws_config::{retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::config::Credentials;
 use bytes::Bytes;
 use log::warn;
 use std::env;
+use std::time::Duration;
 use tokio::sync::OnceCell;
 
 static S3_CLIENT: OnceCell<s3::Client> = OnceCell::const_new();
@@ -39,6 +41,12 @@ pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
         (endpoint, access_key_id, secret_access_key)
     };
 
+    let retry_config = RetryConfig::standard().with_max_attempts(3);
+    let timeout_config = TimeoutConfig::builder()
+        .operation_timeout(Duration::from_secs(60))
+        .operation_attempt_timeout(Duration::from_secs(15))
+        .build();
+
     // 构建配置
     let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
         .endpoint_url(endpoint)
@@ -50,6 +58,8 @@ pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
             None,
             "R2",
         ))
+        .retry_config(retry_config)
+        .timeout_config(timeout_config)
         .load()
         .await;
 

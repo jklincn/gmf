@@ -104,7 +104,6 @@ impl IoActor {
                                 return false;
                             }
                         }
-                        Ok(Message::DebugLog(logs)) => info!("收到调试日志: {logs:?}"),
                         _ => error!("收到无效或非响应类型的消息: {line_str}"),
                     }
                 }
