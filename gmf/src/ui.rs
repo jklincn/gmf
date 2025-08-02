@@ -47,6 +47,10 @@ impl AllProgressBar {
         self.download.finish();
     }
 
+    pub fn abandon_download(&self) {
+        self.download.abandon();
+    }
+
     pub fn start_tick(&self) {
         self.download.enable_steady_tick(Duration::from_secs(1));
     }

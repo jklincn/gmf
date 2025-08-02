@@ -188,9 +188,8 @@ impl InteractiveSession {
 
             // --- 发生了意外情况 ---
             Ok(Some(other_response)) => {
-                let error_msg = format!(
-                    "❌ 意外的响应: 收到了非预期的服务器响应 {other_response:?}"
-                );
+                let error_msg =
+                    format!("❌ 意外的响应: 收到了非预期的服务器响应 {other_response:?}");
                 spinner.finish(&error_msg);
                 return Err(anyhow!(error_msg));
             }
@@ -264,31 +263,27 @@ impl InteractiveSession {
         // 主事件循环
         let loop_result = event_loop(&mut self.response_rx, session.clone(), &progress_bar).await;
 
-        progress_bar.finish_download();
+        match loop_result {
+            Ok(_time) => {
+                progress_bar.finish_download();
+                info!("等待所有本地任务完成...");
 
-        info!("等待所有本地任务完成...");
+                let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
+                    anyhow!(
+                        "无法获得 GmfSession 的唯一所有权，还有 {} 个引用存在。这可能是个逻辑错误。",
+                        Arc::strong_count(&arc)
+                    )
+                })?;
 
-        let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
-            anyhow!(
-                "无法获得 GmfSession 的唯一所有权，还有 {} 个引用存在。这可能是个逻辑错误。",
-                Arc::strong_count(&arc)
-            )
-        })?;
-
-        session_to_finish.wait_for_completion().await?;
-
-        let _upload_time = match loop_result {
-            Ok(time) => time,
-            Err(e) => {
-                return Err(e);
+                session_to_finish.wait_for_completion().await?;
+                warn!("\n所有任务完成，文件已在本地准备就绪");
+                Ok(())
             }
-        };
-
-        warn!("\n所有任务完成，文件已在本地准备就绪");
-
-        // warn!("\n所有任务完成，文件已在本地准备就绪。平均上传速度：{} MB/s", upload_time.as_millis());
-
-        Ok(())
+            Err(e) => {
+                progress_bar.abandon_download();
+                Err(e)
+            }
+        }
     }
 
     /// 向远程程序发送一条指令，并自动添加换行符。
@@ -303,7 +298,7 @@ impl InteractiveSession {
         match tokio::time::timeout(Duration::from_secs(5), self.response_rx.recv()).await {
             Ok(Some(response)) => Ok(Some(response)),
             Ok(None) => Ok(None),
-            Err(_) => Err(anyhow::anyhow!("等待响应超时",)),
+            Err(_) => Err(anyhow!("等待响应超时",)),
         }
     }
 
@@ -345,12 +340,10 @@ async fn event_loop(
                     },
                     Ok(ChunkResult::Failure(id, err)) => {
                         let error_msg = format!("分块 #{id} 本地处理失败: {err:?}");
-                        progress_bar.log_error(&error_msg);
                         bail!(error_msg);
                     },
                     Err(join_err) => {
                         let error_msg = format!("任务执行出现严重错误 (panic): {join_err:?}");
-                        progress_bar.log_error(&error_msg);
                         bail!(error_msg);
                     },
                 }
@@ -372,7 +365,6 @@ async fn event_loop(
                             },
                             ServerResponse::Error(msg) => {
                                 let error_msg = format!("收到服务端错误: {msg}");
-                                progress_bar.log_error(&error_msg);
                                 bail!(error_msg);
                             },
                             other => {
