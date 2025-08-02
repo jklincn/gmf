@@ -268,6 +268,7 @@ async fn process_single_chunk(job: ChunkJob, sender: mpsc::Sender<Message>) -> R
     Ok(())
 }
 
+// TODO：由于加密导致的文件大小增加量不正常
 fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
@@ -290,9 +291,4 @@ fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     result.extend_from_slice(&ciphertext);
 
     Ok((result, general_purpose::STANDARD.encode(key)))
-}
-
-async fn upload_chunk(chunk_id: u64, data: Vec<u8>) -> Result<()> {
-    put_object(&chunk_id.to_string(), data).await?;
-    Ok(())
 }

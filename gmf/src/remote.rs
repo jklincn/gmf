@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::io_actor::IoActor;
-use crate::ui::{AllProgressBar, LogLevel, run_with_spinner};
 use crate::ssh::{self};
-use anyhow::{Context, Result, anyhow};
+use crate::ui::{AllProgressBar, LogLevel, run_with_spinner};
+use anyhow::{Context, Result, anyhow, bail};
+use futures::future::ok;
 use gmf_common::interface::*;
 use gmf_common::utils::format_size;
 use log::{error, info, warn};
@@ -135,13 +136,17 @@ impl InteractiveSession {
     ) -> Result<()> {
         // 先接收一个 Ready 响应，表示远程程序已准备就绪
         match self.next_response().await? {
-            Some(response) => {
-                if let ServerResponse::Ready = response {
-                    info!("远程程序已准备就绪");
-                }
+            Some(ServerResponse::Ready) => {
+                info!("远程程序已准备就绪");
             }
-            _ => {
-                return Err(anyhow!("未收到 Ready 响应"));
+            Some(other_response) => {
+                return Err(anyhow!(
+                    "协议错误：期望收到 Ready 响应，但收到了 {:?}",
+                    other_response
+                ));
+            }
+            None => {
+                return Err(anyhow!("连接已关闭，未收到任何响应"));
             }
         }
 
@@ -152,161 +157,144 @@ impl InteractiveSession {
         });
 
         let spinner = crate::ui::Spinner::new("正在取得文件信息...");
+        self.send_request(&client_request).await?;
 
-        // 2. 执行异步任务，并用 match 处理所有可能的结果
-        match async {
-            self.send_request(&client_request).await?;
-            self.next_response().await
-        }
-        .await
-        {
-            // --- 任务成功，且收到了期望的响应 ---
+        match self.next_response().await {
             Ok(Some(ServerResponse::SetupSuccess(setup_response))) => {
-                // 3. 在成功路径中，用动态数据构建最终消息
-                let final_msg = format!(
+                let success_msg = format!(
                     "✅ 文件名称: {} (大小: {})",
                     setup_response.file_name,
                     format_size(setup_response.file_size)
                 );
 
-                // 4. 用构建好的动态消息结束 Spinner
-                spinner.finish(&final_msg);
-
-                // --- 继续执行原来的设置逻辑 ---
-                let (gmf_file, completed_chunks) = GMFFile::new(
-                    &setup_response.file_name,
-                    setup_response.file_size,
-                    setup_response.total_chunks,
-                )?;
-
-                let progress_bar = Arc::new(AllProgressBar::new(
-                    setup_response.total_chunks,
-                    completed_chunks,
-                    LogLevel::Info,
-                )?);
-
-                self.progress_bar = Some(progress_bar.clone());
-                self.file = Some(Arc::new(GmfSession::new(
-                    gmf_file,
-                    completed_chunks,
-                    progress_bar,
-                )));
+                spinner.finish(&success_msg);
+                self.initialize_session(setup_response)?;
             }
 
-            // --- 任务本身出错了（例如网络错误） ---
-            Err(e) => {
-                // 5. 在失败路径中，用错误消息结束 Spinner
-                let error_msg = format!("❌ 获取文件信息失败: {}", e);
+            Ok(Some(ServerResponse::InvalidRequest(msg))) => {
+                let error_msg = format!("❌ 请求无效: {}", msg);
                 spinner.finish(&error_msg);
-                // 将错误继续向上传播
-                return Err(e.into());
+                return Err(anyhow!(error_msg));
+            }
+            Ok(Some(ServerResponse::NotFound(msg))) => {
+                let error_msg = format!("❌ 找不到文件: {}", msg);
+                spinner.finish(&error_msg);
+                return Err(anyhow!(error_msg));
+            }
+            Ok(Some(ServerResponse::Error(msg))) => {
+                let error_msg = format!("❌ 服务端错误: {}", msg);
+                spinner.finish(&error_msg);
+                return Err(anyhow!(error_msg));
             }
 
-            // --- 任务成功，但收到了非预期的响应 ---
-            _ => {
-                let error_msg = "❌ 获取文件信息失败: 收到了无效的服务器响应";
+            // --- 发生了意外情况 ---
+            Ok(Some(other_response)) => {
+                let error_msg = format!(
+                    "❌ 意外的响应: 收到了非预期的服务器响应 {:?}",
+                    other_response
+                );
+                spinner.finish(&error_msg);
+                return Err(anyhow!(error_msg));
+            }
+            Ok(None) => {
+                let error_msg = "❌ 连接中断: 在等待设置响应时连接已关闭";
                 spinner.finish(error_msg);
-                return Err(anyhow!(error_msg.to_string()));
+                return Err(anyhow!(error_msg));
+            }
+            Err(e) => {
+                // 这是 next_response() 本身发生的错误，如网络层或反序列化错误
+                let error_msg = format!("❌ 通信错误: {}", e);
+                spinner.finish(&error_msg);
+                return Err(e.context(error_msg));
             }
         }
 
         Ok(())
     }
 
+    fn initialize_session(&mut self, setup_response: SetupResponse) -> Result<()> {
+        let (gmf_file, completed_chunks) = GMFFile::new(
+            &setup_response.file_name,
+            setup_response.file_size,
+            setup_response.total_chunks,
+        )?;
+
+        let progress_bar = Arc::new(AllProgressBar::new(
+            setup_response.total_chunks,
+            completed_chunks,
+            LogLevel::Info,
+        )?);
+
+        self.progress_bar = Some(progress_bar.clone());
+        self.file = Some(Arc::new(GmfSession::new(
+            gmf_file,
+            completed_chunks,
+            progress_bar,
+        )));
+
+        Ok(())
+    }
+
     pub async fn start(&mut self) -> Result<()> {
+        // --- 1. 前置检查和状态准备 ---
         let progress_bar = self
             .progress_bar
             .clone()
-            .ok_or_else(|| anyhow!("请先调用 setup() 方法以初始化进度条和文件信息"))?;
-        let completed_chunks = self.progress_bar.as_ref().unwrap().completed_chunks;
+            .ok_or_else(|| anyhow!("请先调用 setup() 方法以初始化客户端状态"))?;
+        let session = self
+            .file
+            .take()
+            .ok_or_else(|| anyhow!("内部状态错误: file 未初始化"))?;
+
+        let resume_from_chunk_id = progress_bar.completed_chunks;
         let client_request = ClientRequest::Start(StartRequestPayload {
-            resume_from_chunk_id: completed_chunks,
+            resume_from_chunk_id,
         });
 
-        info!("正在发送上传请求");
+        // --- 2. 发送 Start 请求并等待确认 ---
+        info!("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
-
         match self.next_response().await? {
-            Some(response) => {
-                if let ServerResponse::StartSuccess = response {
-                    info!("开始上传");
-                    let session = self.file.take().expect("file 已初始化");
-                    let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
-                    loop {
-                        tokio::select! {
-                            // —— 3.1 服务器有新消息 ——————————————————————————
-                            resp = self.next_response() => {
-                                match resp? {
-                                    Some(ServerResponse::ChunkReadyForDownload {chunk_id, passphrase_b64}) => {
-                                        // 更新 UI
-                                        progress_bar.update_upload();
-
-                                        // 为每个分块启动一个异步任务
-                                        let session_clone = session.clone();
-                                        join_set.spawn(async move {
-                                            session_clone.handle_chunk(chunk_id, passphrase_b64).await
-                                        });
-                                    }
-
-                                    Some(ServerResponse::UploadCompleted) => {
-                                        progress_bar.log_debug("服务器端所有分块已推送完毕，等待剩余任务完成…");
-                                        progress_bar.finish_upload();
-                                        break;
-                                    }
-
-                                    Some(ServerResponse::Error(msg)) => {
-                                        anyhow::bail!("服务端错误: {msg}");
-                                    }
-
-                                    _ => {/* 忽略其他心跳 / 日志消息 */}
-                                }
-                            }
-
-                            // —— 3.2 有分块任务先结束 ——————————————————————
-                            Some(res) = join_set.join_next() => {
-                                match res {
-                                    Ok(ChunkResult::Success(id)) => {
-                                        progress_bar.log_debug(&format!("分块 {id} 处理成功"));
-                                    },
-                                    Ok(ChunkResult::Failure(id, err)) => {
-                                        progress_bar.log_debug(&format!("分块 {id} 处理失败: {err:?}"));
-                                    },
-                                    Err(join_err) => {
-                                        progress_bar.log_debug(&format!("任务 panic: {join_err:?}"));
-                                    },
-                                }
-                            }
-                        }
-                    }
-                    while let Some(res) = join_set.join_next().await {
-                        match res {
-                            Ok(ChunkResult::Success(id)) => {
-                                progress_bar.log_debug(&format!("分块 {id} 处理成功"));
-                            }
-                            Ok(ChunkResult::Failure(id, err)) => {
-                                progress_bar.log_debug(&format!("分块 {id} 处理失败: {err:?}"));
-                            }
-                            Err(join_err) => {
-                                progress_bar.log_debug(&format!("任务 panic: {join_err:?}"));
-                            }
-                        }
-                    }
-                    let session = Arc::try_unwrap(session)
-                        .map_err(|_| anyhow!("还有其他 Arc 引用（逻辑错误）"))?;
-                    session.wait_for_completion().await?;
-
-                    // 完成进度条
-                    progress_bar.finish_download();
-
-                    warn!("\n文件已下载到本地，正在执行清理");
-                } else {
-                    return Err(anyhow!("未收到 StartSuccess 响应"));
-                }
+            Some(ServerResponse::StartSuccess) => {
+                info!("服务端确认，开始接收分块信息...");
             }
-            _ => {
-                return Err(anyhow!("未收到 Start 响应"));
-            }
+            Some(other_response) => bail!(
+                "协议错误: 期望收到 StartSuccess，但收到 {:?}",
+                other_response
+            ),
+            None => bail!("连接中断: 在等待 StartSuccess 响应时连接已关闭"),
         }
+
+        // 主事件循环
+        let loop_result = event_loop(&mut self.response_rx, session.clone(), &progress_bar).await;
+
+        // --- 4. 任务清理与收尾 ---
+        // 无论循环是正常结束还是因错误退出，都尝试等待剩余任务完成
+        info!("等待所有本地任务完成...");
+        // 注意：这里需要从 self 中拿走 session，因为它在循环中被克隆了
+        // 更好的做法是，在调用 event_loop 之前就拿走
+        let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
+            // 如果这里失败，说明有严重的逻辑错误，比如 event_loop 提前退出了，
+            // 但 join_set 中还有任务在运行。
+            anyhow!(
+                "无法获得 GmfSession 的唯一所有权，还有 {} 个引用存在。这可能是个逻辑错误。",
+                Arc::strong_count(&arc)
+            )
+        })?;
+
+        session_to_finish.wait_for_completion().await?;
+
+        progress_bar.finish_download();
+
+        let upload_time = match loop_result {
+            Ok(time) => time,
+            Err(e) => {
+                error!("上传任务执行失败: {e:#}");
+                return Err(e);
+            }
+        };
+        warn!("\n所有任务完成，文件已在本地准备就绪。上传速度达到 {} MB/s", upload_time.as_millis());
+
         Ok(())
     }
 
@@ -346,4 +334,81 @@ impl InteractiveSession {
 
         Ok(())
     }
+}
+
+async fn event_loop(
+    response_rx: &mut mpsc::Receiver<ServerResponse>,
+    session: Arc<GmfSession>,
+    progress_bar: &Arc<AllProgressBar>,
+) -> Result<Duration> {
+    let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
+    let mut upload_completed = false;
+    let mut upload_time = Duration::ZERO;
+    let start_time = std::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            Some(res) = join_set.join_next() => {
+                match res {
+                    Ok(ChunkResult::Success(id)) => {
+                        progress_bar.log_debug(&format!("分块 {id} 处理成功"));
+                    },
+                    Ok(ChunkResult::Failure(id, err)) => {
+                        let error_msg = format!("分块 #{id} 本地处理失败: {err:?}");
+                        progress_bar.log_error(&error_msg);
+                        bail!(error_msg);
+                    },
+                    Err(join_err) => {
+                        let error_msg = format!("任务执行出现严重错误 (panic): {join_err:?}");
+                        progress_bar.log_error(&error_msg);
+                        bail!(error_msg);
+                    },
+                }
+            },
+
+            resp = tokio::time::timeout(Duration::from_secs(5), response_rx.recv()), if !upload_completed => {
+                match resp {
+                    Ok(Some(response)) => {
+                        match response {
+                            ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
+                                progress_bar.update_upload();
+                                let session_clone = session.clone();
+                                join_set.spawn(async move {
+                                    session_clone.handle_chunk(chunk_id, passphrase_b64).await
+                                });
+                            },
+                            ServerResponse::UploadCompleted => {
+                                upload_time = start_time.elapsed();
+                                progress_bar.finish_upload();
+                                upload_completed = true;
+                            },
+                            ServerResponse::Error(msg) => {
+                                let error_msg = format!("收到服务端错误: {msg}");
+                                progress_bar.log_error(&error_msg);
+                                bail!(error_msg);
+                            },
+                            // FIX 2: 去掉 Some()，直接用变量捕获
+                            other => {
+                                progress_bar.log_debug(&format!("收到非关键消息: {:?}", other));
+                            }
+                        }
+                    },
+                    Ok(None) => { // recv() 返回 None (通道关闭) 或 Err
+                        bail!("连接中断: 服务端在任务完成前关闭了连接");
+                    }
+                    Err(_) => { // `timeout` 触发
+                        bail!("等待响应超时 (超过 5秒)");
+                    }
+                }
+            },
+        }
+
+        if upload_completed && join_set.is_empty() {
+            break;
+        }
+    }
+
+    Ok(upload_time)
 }

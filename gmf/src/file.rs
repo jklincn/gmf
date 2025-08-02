@@ -108,6 +108,7 @@ impl GMFFile {
         self.header.chunk_count
     }
 
+    #[allow(unused)]
     pub fn written_count(&self) -> u64 {
         self.header.written_count
     }
@@ -228,8 +229,6 @@ pub struct GmfSession {
     gmf_file: Arc<Mutex<GMFFile>>,
     decrypted_tx: mpsc::Sender<DecryptedChunk>,
     writer_handle: JoinHandle<Result<()>>,
-    progress_bar: Arc<AllProgressBar>,
-    completed_chunks: u64,
 }
 
 impl GmfSession {
@@ -256,16 +255,10 @@ impl GmfSession {
             gmf_file: gmf_file_arc,
             decrypted_tx,
             writer_handle,
-            progress_bar,
-            completed_chunks,
         }
     }
 
-    pub async fn chunk_count(&self) -> u64 {
-        let gmf_file = self.gmf_file.lock().await;
-        gmf_file.chunk_count()
-    }
-
+    /// 负责下载分块与解密，写入交由写入器操作
     pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
         let decrypted_tx = self.decrypted_tx.clone();
 

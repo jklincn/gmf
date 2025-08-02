@@ -1,9 +1,9 @@
 mod config;
 mod file;
 mod io_actor;
-mod ui;
 mod remote;
 mod ssh;
+mod ui;
 
 use anyhow::Ok;
 use anyhow::Result;
@@ -13,7 +13,6 @@ use config::Config;
 use env_logger::Builder;
 use env_logger::Env;
 use gmf_common::r2;
-use log::warn;
 use log::{error, info};
 use std::io::Write;
 use tokio::signal;
