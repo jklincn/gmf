@@ -60,18 +60,13 @@ struct Args {
         long,
         short = 'c',
         value_name = "SIZE",
-        default_value_t = 10 * 1024 * 1024, // 默认值: 10 MiB
+        default_value_t = 10 * 1024 * 1024,
         value_parser = parse_chunk_size
     )]
     chunk_size: u64,
 
-    /// 并发上传的任务数量
-    #[arg(
-        long,
-        short = 'n',
-        value_name = "NUMBER",
-        default_value_t = 4 // 默认值: 4
-    )]
+    /// 并发上传数
+    #[arg(long, short = 'n', value_name = "NUMBER", default_value_t = 1)]
     concurrency: u64,
 
     /// 打印详细输出
@@ -82,9 +77,9 @@ struct Args {
 fn set_log() {
     let args = Args::parse();
     let log_level = if args.verbose {
-        "info" // 如果提供了 -v 或 --verbose
+        "info"
     } else {
-        "warn" // 如果没有提供
+        "warn"
     };
     let env = Env::default().default_filter_or(log_level);
     Builder::from_env(env)

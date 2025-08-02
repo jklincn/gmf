@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use gmf_common::interface::{ClientRequest, Message, ServerResponse};
-use log::{error, info};
+use log::error;
 use russh::client::Msg as ClientMsg;
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc;
