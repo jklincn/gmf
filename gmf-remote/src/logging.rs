@@ -12,7 +12,7 @@ pub fn init_logging() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
 
     // 构建 subscriber
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .with_writer(non_blocking_writer)
         .with_ansi(false)
         .finish();

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::io_actor::IoActor;
-use crate::progress_bar::{AllProgressBar, LogLevel};
+use crate::progress_bar::{AllProgressBar, LogLevel, run_with_spinner};
 use crate::ssh::{self};
 use anyhow::{Context, Result, anyhow};
 use gmf_common::interface::*;
@@ -15,8 +15,12 @@ use tokio::task::{JoinHandle, JoinSet};
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
 pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
-    let mut ssh = ssh::Session::connect(cfg).await?;
-    warn!("远程服务器 {} 连接成功", cfg.host);
+    let mut ssh = run_with_spinner(
+        "正在连接远程服务器...",
+        "✅ 远程服务器连接成功",
+        ssh::Session::connect(cfg),
+    )
+    .await?;
 
     const REMOTE_BIN_DIR: &str = "$HOME/.local/bin";
     const REMOTE_PATH: &str = "$HOME/.local/bin/gmf-remote";
@@ -45,16 +49,18 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
 
     // 如果需要，则进行安装/更新
     if needs_install {
-        info!("正在安装 gmf-remote 至远程目录: {REMOTE_BIN_DIR}");
+        let msg = format!("正在安装服务端至远程目录: {REMOTE_BIN_DIR}...");
+        run_with_spinner::<_, (), anyhow::Error>(&msg, "✅ 远程服务端安装成功", async {
+            // 第一步：创建目录
+            ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
 
-        // 创建远程目录
-        ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
+            // 第二步：上传并解压
+            ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
+                .await?;
 
-        // 上传并解压
-        ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
-            .await?;
-
-        info!("gmf-remote 安装成功");
+            Ok(())
+        })
+        .await?;
     }
 
     Ok((ssh, REMOTE_PATH.to_string()))
@@ -135,7 +141,7 @@ impl InteractiveSession {
                 }
             }
             _ => {
-                return Err(anyhow!("未收到 Setup 响应"));
+                return Err(anyhow!("未收到 Ready 响应"));
             }
         }
 
@@ -145,42 +151,62 @@ impl InteractiveSession {
             concurrency,
         });
 
-        info!("正在取得文件信息...");
-        self.send_request(&client_request).await?;
+        let spinner = crate::progress_bar::Spinner::new("正在取得文件信息...");
 
-        match self.next_response().await? {
-            Some(response) => {
-                if let ServerResponse::SetupSuccess(setup_response) = response {
-                    let (gmf_file, completed_chunks) = GMFFile::new(
-                        &setup_response.file_name,
-                        setup_response.file_size,
-                        setup_response.total_chunks,
-                    )?;
-                    warn!(
-                        "文件名称: {} (大小: {})",
-                        setup_response.file_name,
-                        format_size(setup_response.file_size)
-                    );
-                    let progress_bar = Arc::new(
-                        AllProgressBar::new(
-                            setup_response.total_chunks,
-                            completed_chunks,
-                            LogLevel::Info,
-                        )
-                        .unwrap(),
-                    );
-                    self.progress_bar = Some(progress_bar.clone());
-                    self.file = Some(Arc::new(GmfSession::new(
-                        gmf_file,
-                        completed_chunks,
-                        progress_bar.clone(),
-                    )));
-                } else {
-                    return Err(anyhow!("未收到 SetupSuccess 响应"));
-                }
+        // 2. 执行异步任务，并用 match 处理所有可能的结果
+        match async {
+            self.send_request(&client_request).await?;
+            self.next_response().await
+        }
+        .await
+        {
+            // --- 任务成功，且收到了期望的响应 ---
+            Ok(Some(ServerResponse::SetupSuccess(setup_response))) => {
+                // 3. 在成功路径中，用动态数据构建最终消息
+                let final_msg = format!(
+                    "✅ 文件名称: {} (大小: {})",
+                    setup_response.file_name,
+                    format_size(setup_response.file_size)
+                );
+
+                // 4. 用构建好的动态消息结束 Spinner
+                spinner.finish(&final_msg);
+
+                // --- 继续执行原来的设置逻辑 ---
+                let (gmf_file, completed_chunks) = GMFFile::new(
+                    &setup_response.file_name,
+                    setup_response.file_size,
+                    setup_response.total_chunks,
+                )?;
+
+                let progress_bar = Arc::new(AllProgressBar::new(
+                    setup_response.total_chunks,
+                    completed_chunks,
+                    LogLevel::Info,
+                )?);
+
+                self.progress_bar = Some(progress_bar.clone());
+                self.file = Some(Arc::new(GmfSession::new(
+                    gmf_file,
+                    completed_chunks,
+                    progress_bar,
+                )));
             }
+
+            // --- 任务本身出错了（例如网络错误） ---
+            Err(e) => {
+                // 5. 在失败路径中，用错误消息结束 Spinner
+                let error_msg = format!("❌ 获取文件信息失败: {}", e);
+                spinner.finish(&error_msg);
+                // 将错误继续向上传播
+                return Err(e.into());
+            }
+
+            // --- 任务成功，但收到了非预期的响应 ---
             _ => {
-                return Err(anyhow!("未收到 Setup 响应"));
+                let error_msg = "❌ 获取文件信息失败: 收到了无效的服务器响应";
+                spinner.finish(error_msg);
+                return Err(anyhow!(error_msg.to_string()));
             }
         }
 
@@ -224,6 +250,7 @@ impl InteractiveSession {
 
                                     Some(ServerResponse::UploadCompleted) => {
                                         progress_bar.log_debug("服务器端所有分块已推送完毕，等待剩余任务完成…");
+                                        progress_bar.finish_upload();
                                         break;
                                     }
 
@@ -269,9 +296,9 @@ impl InteractiveSession {
                     session.wait_for_completion().await?;
 
                     // 完成进度条
-                    progress_bar.finish_all();
+                    progress_bar.finish_download();
 
-                    warn!("文件已下载到本地，正在执行清理");
+                    warn!("\n文件已下载到本地，正在执行清理");
                 } else {
                     return Err(anyhow!("未收到 StartSuccess 响应"));
                 }

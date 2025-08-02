@@ -18,7 +18,7 @@ pub struct Config {
 }
 
 /// 加载或创建配置文件
-pub fn load_or_create_config() -> Result<Config> {
+pub async fn load_or_create_config() -> Result<Config> {
     let path = Path::new(CONFIG_FILE_NAME);
     if path.exists() {
         let content = fs::read_to_string(path).context("读取配置文件失败")?;

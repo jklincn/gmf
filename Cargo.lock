@@ -1641,6 +1641,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "hex",
+ "log",
  "serde",
  "serde_json",
  "tokio",

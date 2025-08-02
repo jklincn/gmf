@@ -108,13 +108,19 @@ async fn main() -> Result<()> {
 
     set_log();
 
-    let cfg = config::load_or_create_config()?;
+    let cfg = progress_bar::run_with_spinner(
+        "正在加载配置文件...",
+        "✅ 配置文件加载成功",
+        config::load_or_create_config(),
+    )
+    .await?;
 
-    warn!("配置文件加载成功");
-
-    set_r2(&cfg).await?;
-
-    warn!("R2 客户端初始化成功");
+    progress_bar::run_with_spinner(
+        "正在初始化 R2 客户端...",
+        "✅ R2 客户端初始化成功",
+        set_r2(&cfg),
+    )
+    .await?;
 
     let mut session = remote::InteractiveSession::new(&cfg).await?;
 

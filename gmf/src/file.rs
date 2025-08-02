@@ -80,6 +80,9 @@ impl GMFFile {
         let combined_hash_hex = format!("{combined_hash:x}");
 
         // 使用这个组合哈希来命名临时文件
+        // 这里一个优秀做法是服务端对文件进行哈希，然后传递给客户端，可以用这个值做临时文件名
+        // 但是服务端哈希时间较长，并且如果哈希值不匹配，也没有错误处理了（且分块解密包含了完整性验证）
+        // 因此这里的临时文件名使用这种“草率”的做法
         let gmf_filename = PathBuf::from(format!(".{combined_hash_hex}.gmf"));
 
         if gmf_filename.exists() {
@@ -101,7 +104,14 @@ impl GMFFile {
         Ok((gmf_file, 0)) // 新文件，已完成 0 个
     }
 
-    // `open_and_validate` 函数的签名和实现保持不变，因为它已经接收了所有需要的参数。
+    pub fn chunk_count(&self) -> u64 {
+        self.header.chunk_count
+    }
+
+    pub fn written_count(&self) -> u64 {
+        self.header.written_count
+    }
+
     fn open_and_validate<P: AsRef<Path>>(
         path: P,
         expected_chunk_count: u64,
@@ -219,6 +229,7 @@ pub struct GmfSession {
     decrypted_tx: mpsc::Sender<DecryptedChunk>,
     writer_handle: JoinHandle<Result<()>>,
     progress_bar: Arc<AllProgressBar>,
+    completed_chunks: u64,
 }
 
 impl GmfSession {
@@ -228,12 +239,16 @@ impl GmfSession {
         progress_bar: Arc<AllProgressBar>,
     ) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
+
+        let chunk_count = gmf_file.chunk_count();
+
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
         let writer_handle = tokio::spawn(run_writer_task(
             gmf_file_arc.clone(),
             decrypted_rx,
             completed_chunks,
+            chunk_count,
             progress_bar.clone(),
         ));
 
@@ -242,7 +257,13 @@ impl GmfSession {
             decrypted_tx,
             writer_handle,
             progress_bar,
+            completed_chunks,
         }
+    }
+
+    pub async fn chunk_count(&self) -> u64 {
+        let gmf_file = self.gmf_file.lock().await;
+        gmf_file.chunk_count()
     }
 
     pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
@@ -254,7 +275,6 @@ impl GmfSession {
             let content = r2::get_object(&chunk_id.to_string())
                 .await
                 .with_context(|| format!("从 r2 获取分块 {chunk_id} 数据失败"))?;
-            self.progress_bar.update_download();
 
             // 解密（阻塞运算放到 blocking 线程池）
             let plain_data = tokio::task::spawn_blocking(move || {
@@ -374,10 +394,12 @@ async fn run_writer_task(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
     completed_chunks: u64,
+    chunk_count: u64,
     progress_bar: Arc<AllProgressBar>,
 ) -> Result<()> {
     let mut buffer = BTreeMap::new();
     let mut next_chunk_to_write = completed_chunks;
+    let mut remaining_chunks = chunk_count - completed_chunks;
 
     while let Some(chunk) = decrypted_rx.recv().await {
         // 如果收到的块是已经写入过的，直接丢弃
@@ -389,11 +411,16 @@ async fn run_writer_task(
         buffer.insert(chunk.id, chunk.data);
 
         while let Some(data_to_write) = buffer.remove(&next_chunk_to_write) {
-            let mut gmf = gmf_file_arc.lock().await;
-            gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
-            drop(gmf);
+            {
+                let mut gmf = gmf_file_arc.lock().await;
+                gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
+            }
+            progress_bar.update_download();
             next_chunk_to_write += 1;
-            progress_bar.update_writer();
+            remaining_chunks -= 1;
+            if remaining_chunks == 0 {
+                progress_bar.finish_download();
+            }
             progress_bar.log_debug(&format!("已成功写入分块 {}", next_chunk_to_write - 1));
         }
     }

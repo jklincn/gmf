@@ -3,6 +3,7 @@ use aws_config::{self, BehaviorVersion, Region};
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::config::Credentials;
 use bytes::Bytes;
+use log::warn;
 use std::env;
 use tokio::sync::OnceCell;
 
@@ -141,6 +142,7 @@ pub async fn delete_bucket() -> Result<()> {
 
     let objects = list_objects().await?;
     if !objects.is_empty() {
+        warn!("Bucket '{BUCKET_NAME}' 非空，正在删除其中的对象...",);
         delete_objects(objects).await?;
     }
 
