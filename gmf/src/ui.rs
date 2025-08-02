@@ -121,7 +121,7 @@ impl Spinner {
     pub fn finish(self, msg: &str) {
         let finish_template = ProgressStyle::with_template("{msg}").expect("创建完成样式失败");
         self.sp.set_style(finish_template);
-        self.sp.finish_with_message(format!("{msg}"));
+        self.sp.finish_with_message(msg.to_string());
     }
 }
 
@@ -139,12 +139,12 @@ where
     match task.await {
         Ok(value) => {
             // 成功
-            spinner.finish(&format!("{}", success_msg));
+            spinner.finish(&success_msg);
             Ok(value)
         }
         Err(error) => {
             // 失败
-            let error_message = format!("❌ 运行失败: {}", error);
+            let error_message = format!("❌ 运行失败: {error}");
             spinner.finish(&error_message);
             Err(error)
         }

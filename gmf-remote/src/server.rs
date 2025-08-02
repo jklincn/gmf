@@ -1,24 +1,25 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose;
+use base64::{Engine, engine::general_purpose};
 use futures::{StreamExt, TryStreamExt, stream};
-use gmf_common::consts::NONCE_SIZE;
-use gmf_common::interface::*;
-use gmf_common::r2::{init_s3_client, put_object};
-use tokio::task::JoinHandle;
+use gmf_common::{
+    consts::NONCE_SIZE,
+    interface::*,
+    r2::{init_s3_client, put_object},
+};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, BufReader},
     sync::{Mutex, mpsc},
+    task::JoinHandle,
 };
 use tracing::{error, info};
+
 #[derive(Debug, Clone)]
 pub struct TaskMetadata {
     pub file_path: PathBuf,
@@ -85,7 +86,7 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
     }
 
     if let Err(e) = init_s3_client(None).await {
-        return ServerResponse::Error(format!("S3 客户端初始化失败: {}", e));
+        return ServerResponse::Error(format!("S3 客户端初始化失败: {e}"));
     }
 
     let file_path_str = shellexpand::tilde(&payload.path).to_string();
@@ -171,7 +172,7 @@ pub async fn start(
             let offset = payload.resume_from_chunk_id * chunk_size;
             file.seek(tokio::io::SeekFrom::Start(offset))
                 .await
-                .with_context(|| format!("无法跳转到文件偏移量 {}", offset))?;
+                .with_context(|| format!("无法跳转到文件偏移量 {offset}"))?;
         }
 
         let reader = BufReader::new(file);
@@ -234,7 +235,7 @@ pub async fn start(
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join("\n  caused by: ");
-        let error_message = format!("上传任务执行失败:\n{}", error_chain);
+        let error_message = format!("上传任务执行失败:\n{error_chain}");
         let error_response = ServerResponse::Error(error_message);
         if sender.send(error_response.into()).await.is_err() {
             error!(

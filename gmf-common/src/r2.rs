@@ -1,15 +1,10 @@
 use anyhow::{Context, Result};
-use aws_config::{self, BehaviorVersion, Region};
-use aws_config::{retry::RetryConfig, timeout::TimeoutConfig};
-use aws_sdk_s3 as s3;
-use aws_sdk_s3::config::Credentials;
-use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_config::{self, BehaviorVersion, Region, retry::RetryConfig, timeout::TimeoutConfig};
+use aws_sdk_s3::{self as s3, config::Credentials, error::ProvideErrorMetadata};
 use bytes::Bytes;
 use log::error;
-use std::env;
-use std::time::Duration;
-use tokio::sync::OnceCell;
-use tokio::time::sleep;
+use std::{env, time::Duration};
+use tokio::{sync::OnceCell, time::sleep};
 
 static S3_CLIENT: OnceCell<s3::Client> = OnceCell::const_new();
 

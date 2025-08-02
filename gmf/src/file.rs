@@ -1,20 +1,24 @@
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use crate::ui::AllProgressBar;
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
-use gmf_common::consts::NONCE_SIZE;
-use gmf_common::r2;
+use gmf_common::{consts::NONCE_SIZE, r2};
 use log::{info, warn};
-use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 use xxhash_rust::xxh3::xxh3_64;
-
-use crate::ui::AllProgressBar;
 
 const MAGIC: &[u8; 16] = b"gmf temp file\0\0\0";
 // 16 (magic) + 8 (file_size) + 8 (total_chunks) + 8 (completed_chunks) = 40
@@ -107,6 +111,7 @@ impl GMFFile {
         self.header.total_chunks
     }
 
+    #[allow(unused)]
     pub fn file_size(&self) -> u64 {
         self.header.file_size
     }

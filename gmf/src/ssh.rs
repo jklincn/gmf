@@ -1,10 +1,8 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::config::Config;
 use anyhow::{Context, Result, anyhow};
-use russh::keys::*;
-use russh::*;
+use russh::{keys::*, *};
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::io::AsyncWriteExt;
 
@@ -40,8 +38,6 @@ pub struct Session {
 
 impl Session {
     pub async fn connect(cfg: &Config) -> Result<Self> {
-        let key_pair = load_secret_key(&cfg.private_key_path, None)?;
-
         let config = client::Config {
             inactivity_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
@@ -53,18 +49,28 @@ impl Session {
         let addr = (cfg.host.as_str(), cfg.port);
         let mut session = client::connect(config, addr, sh).await?;
 
-        let auth_res = session
-            .authenticate_publickey(
-                cfg.user.as_str(),
-                PrivateKeyWithHashAlg::new(
-                    Arc::new(key_pair),
-                    session.best_supported_rsa_hash().await?.flatten(),
-                ),
-            )
-            .await?;
+        // 根据配置选择认证方式：有密码时使用密码，否则使用密钥
+        let auth_res = if let Some(password) = &cfg.password {
+            session
+                .authenticate_password(cfg.user.as_str(), password)
+                .await?
+        } else if let Some(private_key_path) = &cfg.private_key_path {
+            let key_pair = load_secret_key(private_key_path, None)?;
+            session
+                .authenticate_publickey(
+                    cfg.user.as_str(),
+                    PrivateKeyWithHashAlg::new(
+                        Arc::new(key_pair),
+                        session.best_supported_rsa_hash().await?.flatten(),
+                    ),
+                )
+                .await?
+        } else {
+            anyhow::bail!("未配置认证方式：需要密码或私钥路径");
+        };
 
         if !auth_res.success() {
-            anyhow::bail!("公钥认证失败");
+            anyhow::bail!("SSH认证失败");
         }
 
         Ok(Self { session })

@@ -5,13 +5,10 @@ mod remote;
 mod ssh;
 mod ui;
 
-use anyhow::Ok;
-use anyhow::Result;
-use anyhow::anyhow;
+use anyhow::{Result, anyhow};
 use clap::Parser;
-use config::Config;
-use env_logger::Builder;
-use env_logger::Env;
+use config::{Config, ConfigError};
+use env_logger::{Builder, Env};
 use gmf_common::r2;
 use log::{error, warn};
 use std::io::Write;
@@ -76,11 +73,7 @@ struct Args {
 
 fn set_log() {
     let args = Args::parse();
-    let log_level = if args.verbose {
-        "info"
-    } else {
-        "warn"
-    };
+    let log_level = if args.verbose { "info" } else { "warn" };
     let env = Env::default().default_filter_or(log_level);
     Builder::from_env(env)
         .format(|buf, record| writeln!(buf, "{}", record.args()))
@@ -104,12 +97,23 @@ async fn main() -> Result<()> {
 
     set_log();
 
-    let cfg = ui::run_with_spinner(
+    let cfg_result = ui::run_with_spinner(
         "正在加载配置文件...",
         "✅ 配置文件加载成功",
         config::load_or_create_config(),
     )
-    .await?;
+    .await;
+
+    let cfg = match cfg_result {
+        Ok(config) => config,
+        Err(e) => {
+            if e.downcast_ref::<ConfigError>().is_some() {
+                std::process::exit(0);
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     ui::run_with_spinner(
         "正在初始化 R2 客户端...",

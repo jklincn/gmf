@@ -2,7 +2,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 pub fn init_logging() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     // 定义日志文件的路径
-    let log_file = "gmf-remote.log";
+    let log_file = ".gmf-remote.log";
 
     // 使用 File::create 会在每次运行时创建新文件或覆盖旧文件
     let file = std::fs::File::create(log_file)?;

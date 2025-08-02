@@ -4,13 +4,13 @@ use crate::io_actor::IoActor;
 use crate::ssh::{self};
 use crate::ui::{AllProgressBar, LogLevel, run_with_spinner};
 use anyhow::{Context, Result, anyhow, bail};
-use gmf_common::interface::*;
-use gmf_common::utils::format_size;
+use gmf_common::{interface::*, utils::format_size};
 use log::{error, info, warn};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, JoinSet};
+use std::{sync::Arc, time::Duration};
+use tokio::{
+    sync::mpsc,
+    task::{JoinHandle, JoinSet},
+};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
@@ -49,7 +49,7 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
 
     // 如果需要，则进行安装/更新
     if needs_install {
-        let msg = format!("正在安装服务端至远程目录 (~/.local/bin)...");
+        let msg = "正在安装服务端至远程目录 (~/.local/bin)...".to_string();
         run_with_spinner::<_, (), anyhow::Error>(&msg, "✅ 远程服务端安装成功", async {
             // 第一步：创建目录
             ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
@@ -171,17 +171,17 @@ impl InteractiveSession {
             }
 
             Ok(Some(ServerResponse::InvalidRequest(msg))) => {
-                let error_msg = format!("❌ 请求无效: {}", msg);
+                let error_msg = format!("❌ 请求无效: {msg}");
                 spinner.finish(&error_msg);
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(ServerResponse::NotFound(msg))) => {
-                let error_msg = format!("❌ 找不到文件: {}", msg);
+                let error_msg = format!("❌ 找不到文件: {msg}");
                 spinner.finish(&error_msg);
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(ServerResponse::Error(msg))) => {
-                let error_msg = format!("❌ 服务端错误: {}", msg);
+                let error_msg = format!("❌ 服务端错误: {msg}");
                 spinner.finish(&error_msg);
                 return Err(anyhow!(error_msg));
             }
@@ -189,8 +189,7 @@ impl InteractiveSession {
             // --- 发生了意外情况 ---
             Ok(Some(other_response)) => {
                 let error_msg = format!(
-                    "❌ 意外的响应: 收到了非预期的服务器响应 {:?}",
-                    other_response
+                    "❌ 意外的响应: 收到了非预期的服务器响应 {other_response:?}"
                 );
                 spinner.finish(&error_msg);
                 return Err(anyhow!(error_msg));
@@ -202,7 +201,7 @@ impl InteractiveSession {
             }
             Err(e) => {
                 // 这是 next_response() 本身发生的错误，如网络层或反序列化错误
-                let error_msg = format!("❌ 通信错误: {}", e);
+                let error_msg = format!("❌ 通信错误: {e}");
                 spinner.finish(&error_msg);
                 return Err(e.context(error_msg));
             }
@@ -266,7 +265,7 @@ impl InteractiveSession {
         let loop_result = event_loop(&mut self.response_rx, session.clone(), &progress_bar).await;
 
         progress_bar.finish_download();
-        
+
         info!("等待所有本地任务完成...");
 
         let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
@@ -277,8 +276,6 @@ impl InteractiveSession {
         })?;
 
         session_to_finish.wait_for_completion().await?;
-
-        
 
         let _upload_time = match loop_result {
             Ok(time) => time,
@@ -379,7 +376,7 @@ async fn event_loop(
                                 bail!(error_msg);
                             },
                             other => {
-                                progress_bar.log_debug(&format!("收到非关键消息: {:?}", other));
+                                progress_bar.log_debug(&format!("收到非关键消息: {other:?}"));
                             }
                         }
                     },

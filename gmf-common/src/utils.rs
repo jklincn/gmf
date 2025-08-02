@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use std::hash::Hasher;
-use std::io;
-use std::{fs::File, path::Path};
+use std::{fs::File, hash::Hasher, io, path::Path};
 use xxhash_rust::xxh3::Xxh3;
 
 /// 格式化字节大小为易读的字符串

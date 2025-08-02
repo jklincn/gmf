@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use gmf_common::interface::{ClientRequest, Message, ServerResponse};
 use log::error;
-use russh::client::Msg as ClientMsg;
-use russh::{Channel, ChannelMsg};
+use russh::{Channel, ChannelMsg, client::Msg as ClientMsg};
 use tokio::sync::mpsc;
 
 /// IoActor 负责所有底层的 SSH I/O 操作。
