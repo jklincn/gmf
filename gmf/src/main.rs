@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
     }
 
     // 清理 Bucket
-    if let Err(e) = r2::delete_bucket().await {
+    if let Err(e) = r2::delete_bucket_with_retry().await {
         error!("清理 Bucket 时发生错误: {e:#}");
     }
     Ok(())

@@ -292,7 +292,7 @@ impl InteractiveSession {
                 return Err(e);
             }
         };
-        
+
         warn!("\n所有任务完成，文件已在本地准备就绪");
 
         // warn!("\n所有任务完成，文件已在本地准备就绪。上传速度达到 {} MB/s", upload_time.as_millis());
@@ -375,7 +375,6 @@ async fn event_loop(
                     Ok(Some(response)) => {
                         match response {
                             ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
-                                progress_bar.update_upload();
                                 let session_clone = session.clone();
                                 join_set.spawn(async move {
                                     session_clone.handle_chunk(chunk_id, passphrase_b64).await
@@ -383,7 +382,6 @@ async fn event_loop(
                             },
                             ServerResponse::UploadCompleted => {
                                 upload_time = start_time.elapsed();
-                                progress_bar.finish_upload();
                                 upload_completed = true;
                             },
                             ServerResponse::Error(msg) => {

@@ -16,7 +16,6 @@ pub struct AllProgressBar {
     log_level: LogLevel, // 新增：存储当前日志等级
 
     mp: MultiProgress,
-    upload: ProgressBar,
     download: ProgressBar,
 }
 
@@ -24,43 +23,28 @@ impl AllProgressBar {
     /// 创建一个新的 AllProgressBar 实例
     pub fn new(total_chunks: u64, completed_chunks: u64, log_level: LogLevel) -> Result<Self> {
         let mp: MultiProgress = MultiProgress::new();
-        let upload = mp.add(ProgressBar::new(total_chunks));
         let download = mp.add(ProgressBar::new(total_chunks));
-
-        upload.set_style(
-            ProgressStyle::default_bar()
-                .template("远程上传进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
-                .progress_chars("#>-"),
-        );
 
         download.set_style(
             ProgressStyle::default_bar()
-                .template("本地下载进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .template("下载进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
 
-        upload.set_position(completed_chunks);
         download.set_position(completed_chunks);
 
         Ok(AllProgressBar {
             completed_chunks,
             log_level, // 初始化日志等级
             mp,
-            upload,
             download,
         })
     }
 
-    pub fn update_upload(&self) {
-        self.upload.inc(1);
-    }
     pub fn update_download(&self) {
         self.download.inc(1);
     }
 
-    pub fn finish_upload(&self) {
-        self.upload.finish();
-    }
     pub fn finish_download(&self) {
         self.download.finish();
     }

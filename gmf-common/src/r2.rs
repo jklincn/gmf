@@ -3,11 +3,13 @@ use aws_config::{self, BehaviorVersion, Region};
 use aws_config::{retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_s3 as s3;
 use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
-use log::warn;
+use log::{error, warn};
 use std::env;
 use std::time::Duration;
 use tokio::sync::OnceCell;
+use tokio::time::sleep;
 
 static S3_CLIENT: OnceCell<s3::Client> = OnceCell::const_new();
 
@@ -147,16 +149,49 @@ pub async fn delete_objects(objects_to_delete: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn delete_bucket() -> Result<()> {
+pub async fn delete_bucket_with_retry() -> Result<()> {
     let client = get_s3_client()?;
 
-    let objects = list_objects().await?;
-    if !objects.is_empty() {
-        warn!("Bucket '{BUCKET_NAME}' 非空，正在删除其中的对象...",);
-        delete_objects(objects).await?;
+    loop {
+        // 尝试删除存储桶
+        match client.delete_bucket().bucket(BUCKET_NAME).send().await {
+            // 如果成功
+            Ok(_) => {
+                break; // 成功，跳出循环
+            }
+            // 如果失败
+            Err(sdk_error) => {
+                if let Some(service_error) = sdk_error.as_service_error() {
+                    // 检查错误码是否为 "BucketNotEmpty"
+                    if service_error.code() == Some("BucketNotEmpty") {
+                        warn!(
+                            "存储桶 '{BUCKET_NAME}' 非空，将自动清空并重试... 错误: {:?}",
+                            service_error.message()
+                        );
+
+                        let objects = list_objects().await?;
+                        if !objects.is_empty() {
+                            warn!("发现 {} 个对象，正在删除...", objects.len());
+                            delete_objects(objects).await?;
+                            warn!("对象已删除。");
+                        } else {
+                            warn!("未发现需要删除的对象，可能是最终一致性问题。");
+                        }
+
+                        // 等待1秒后重试
+                        sleep(Duration::from_secs(1)).await;
+                        continue; // 继续下一次循环
+                    }
+                }
+
+                // 如果错误不是 BucketNotEmpty，或者无法解析为服务错误，
+                // 则认为是一个无法处理的致命错误，打印并返回。
+                error!("删除存储桶时发生无法处理的错误: {:?}", sdk_error);
+                return Err(sdk_error.into());
+            }
+        }
     }
 
-    client.delete_bucket().bucket(BUCKET_NAME).send().await?;
     Ok(())
 }
 
