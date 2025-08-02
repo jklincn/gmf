@@ -16,107 +16,111 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::ui::AllProgressBar;
 
-const MAGIC: &[u8; 13] = b"gmf temp file";
-const HEADER_SIZE: u64 = 32;
+const MAGIC: &[u8; 16] = b"gmf temp file\0\0\0";
+// 16 (magic) + 8 (file_size) + 8 (total_chunks) + 8 (completed_chunks) = 40
+const HEADER_SIZE: u64 = 40;
 
+/// 文件数据结构
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Header {
-    pub magic: [u8; 13],
-    _padding: [u8; 3],
-    pub chunk_count: u64,
-    pub written_count: u64,
+    pub magic: [u8; 16],
+    pub file_size: u64,
+    pub total_chunks: u64,
+    pub completed_chunks: u64,
 }
 
 impl Header {
+    pub fn new(file_size: u64, total_chunks: u64) -> Self {
+        Self {
+            magic: *MAGIC,
+            file_size,
+            total_chunks,
+            completed_chunks: 0,
+        }
+    }
+
     /// 将 Header 序列化为字节数组
-    fn to_bytes(self) -> [u8; HEADER_SIZE as usize] {
+    pub fn to_bytes(self) -> [u8; HEADER_SIZE as usize] {
         let mut buf = [0u8; HEADER_SIZE as usize];
-
-        // magic: 0..13
-        buf[0..13].copy_from_slice(&self.magic);
-
-        // padding: 13..16
-
-        buf[16..24].copy_from_slice(&self.chunk_count.to_le_bytes());
-
-        buf[24..32].copy_from_slice(&self.written_count.to_le_bytes());
-
+        buf[0..16].copy_from_slice(&self.magic);
+        buf[16..24].copy_from_slice(&self.file_size.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.total_chunks.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.completed_chunks.to_le_bytes());
         buf
     }
 
     /// 从字节数组创建 Header
-    fn from_bytes(bytes: [u8; HEADER_SIZE as usize]) -> Self {
-        let mut magic = [0u8; 13];
-        magic.copy_from_slice(&bytes[0..13]);
-
-        let chunk_count_bytes: [u8; 8] = bytes[16..24].try_into().unwrap();
-        let chunk_count = u64::from_le_bytes(chunk_count_bytes);
-
-        let written_count_bytes: [u8; 8] = bytes[24..32].try_into().unwrap();
-        let written_count = u64::from_le_bytes(written_count_bytes);
-
+    pub fn from_bytes(bytes: [u8; HEADER_SIZE as usize]) -> Self {
+        let mut magic = [0u8; 16];
+        magic.copy_from_slice(&bytes[0..16]);
+        let file_size = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let total_chunks = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        let completed_chunks = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
         Self {
             magic,
-            _padding: [0; 3],
-            chunk_count,
-            written_count,
+            file_size,
+            total_chunks,
+            completed_chunks,
         }
     }
 }
 
+// 文件上下文
 pub struct GMFFile {
     file: File,
     header: Header,
-    pub filename: String,
+    pub file_name: String,
     pub temp_path: PathBuf,
 }
 
 impl GMFFile {
-    pub fn new(filename: &str, size: u64, chunk_count: u64) -> Result<(Self, u64)> {
-        let combined_string = format!("{filename}:{size}");
-
+    pub fn new_or_resume(
+        file_name: &str,
+        file_size: u64,
+        total_chunks: u64,
+    ) -> Result<(Self, u64)> {
+        let combined_string = format!("{file_name}:{file_size}");
         let combined_hash = xxh3_64(combined_string.as_bytes());
-        let combined_hash_hex = format!("{combined_hash:x}");
+        let temp_filename = PathBuf::from(format!(".{combined_hash:x}.gmf"));
 
-        // 使用这个组合哈希来命名临时文件
-        // 这里一个优秀做法是服务端对文件进行哈希，然后传递给客户端，可以用这个值做临时文件名
-        // 但是服务端哈希时间较长，并且如果哈希值不匹配，也没有错误处理了（且分块解密包含了完整性验证）
-        // 因此这里的临时文件名使用这种“草率”的做法
-        let gmf_filename = PathBuf::from(format!(".{combined_hash_hex}.gmf"));
-
-        if gmf_filename.exists() {
-            match Self::open_and_validate(&gmf_filename, chunk_count, filename) {
+        if temp_filename.exists() {
+            match Self::open(&temp_filename, file_size, total_chunks, file_name) {
                 Ok(gmf_file) => {
-                    let completed_chunks = gmf_file.header.written_count;
+                    let completed_chunks = gmf_file.header.completed_chunks;
                     info!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
                     return Ok((gmf_file, completed_chunks));
                 }
                 Err(e) => {
                     warn!("发现旧的临时文件，但验证失败：{e}。将重新创建。");
-                    fs::remove_file(&gmf_filename).context("删除无效的临时文件失败")?;
+                    fs::remove_file(&temp_filename).context("删除无效的临时文件失败")?;
                 }
             }
         }
 
-        // 如果文件不存在或验证失败，则创建新文件
-        let gmf_file = Self::create(&gmf_filename, chunk_count, filename)?;
-        Ok((gmf_file, 0)) // 新文件，已完成 0 个
+        info!("创建新的临时文件: {}", temp_filename.display());
+        let gmf_file = Self::create(&temp_filename, file_size, total_chunks, file_name)?;
+        Ok((gmf_file, 0))
     }
 
-    pub fn chunk_count(&self) -> u64 {
-        self.header.chunk_count
+    pub fn total_chunks(&self) -> u64 {
+        self.header.total_chunks
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.header.file_size
     }
 
     #[allow(unused)]
-    pub fn written_count(&self) -> u64 {
-        self.header.written_count
+    pub fn completed_chunks(&self) -> u64 {
+        self.header.completed_chunks
     }
 
-    fn open_and_validate<P: AsRef<Path>>(
+    fn open<P: AsRef<Path>>(
         path: P,
-        expected_chunk_count: u64,
-        filename: &str,
+        expected_file_size: u64,
+        expected_total_chunks: u64,
+        file_name: &str,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -130,85 +134,93 @@ impl GMFFile {
 
         let header = Header::from_bytes(header_bytes);
 
-        // 验证1: Magic Number
         if &header.magic != MAGIC {
             bail!("文件格式不正确 (magic number 错误)");
         }
-
-        // 验证2: 分块总数
-        if header.chunk_count != expected_chunk_count {
+        if header.file_size != expected_file_size {
             bail!(
-                "分块总数不匹配 (文件记录: {}, 当前任务: {})",
-                header.chunk_count,
-                expected_chunk_count
+                "文件总大小不匹配 (文件记录: {}, 当前任务: {})",
+                header.file_size,
+                expected_file_size
             );
         }
-
-        // 验证3: 已写入分块数是否合理
-        if header.written_count > header.chunk_count {
+        if header.total_chunks != expected_total_chunks {
+            bail!(
+                "分块总数不匹配 (文件记录: {}, 当前任务: {})",
+                header.total_chunks,
+                expected_total_chunks
+            );
+        }
+        if header.completed_chunks > header.total_chunks {
             bail!(
                 "文件头数据损坏 (已写入数 {} > 总数 {})",
-                header.written_count,
-                header.chunk_count
+                header.completed_chunks,
+                header.total_chunks
             );
         }
 
         Ok(Self {
             file,
             header,
-            filename: filename.to_string(),
+            file_name: file_name.to_string(),
             temp_path: path.as_ref().to_path_buf(),
         })
     }
 
-    fn create<P: AsRef<Path>>(path: P, chunk_count: u64, filename: &str) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let header = Header {
-            magic: *MAGIC,
-            _padding: [0; 3],
-            chunk_count,
-            written_count: 0,
-        };
-        let mut file = File::create(path_ref).context("创建 GMF 临时文件失败")?;
+    fn create<P: AsRef<Path>>(
+        path: P,
+        file_size: u64,
+        total_chunks: u64,
+        file_name: &str,
+    ) -> Result<Self> {
+        let header = Header::new(file_size, total_chunks);
+
+        let mut file = File::create(path.as_ref()).context("创建 GMF 临时文件失败")?;
         file.write_all(&header.to_bytes())
             .context("写入 GMF 文件头失败")?;
 
         Ok(Self {
             file,
             header,
-            filename: filename.to_string(),
+            file_name: file_name.to_string(),
             temp_path: path.as_ref().to_path_buf(),
         })
     }
 
     pub fn write_chunk(&mut self, idx: u64, data: &[u8]) -> Result<()> {
-        if idx != self.header.written_count {
+        if idx != self.header.completed_chunks {
             bail!(
                 "写入顺序错误：期望写入块 {}, 但收到了块 {}",
-                self.header.written_count,
+                self.header.completed_chunks,
                 idx
             );
         }
-        if idx >= self.header.chunk_count {
+        if idx >= self.header.total_chunks {
             bail!(
                 "块索引 {} 超出范围 (总数: {})",
                 idx,
-                self.header.chunk_count
+                self.header.total_chunks
             );
         }
 
+        // 定位到文件末尾，追加新数据
         self.file
             .seek(SeekFrom::End(0))
             .context("移动文件指针到末尾失败")?;
         self.file.write_all(data).context("写入分块数据失败")?;
 
-        self.header.written_count += 1;
+        // 更新内存中的 header
+        self.header.completed_chunks += 1;
+
+        // 定位回文件开头，覆盖写入更新后的整个 header
         self.file
-            .seek(SeekFrom::Start(24))
+            .seek(SeekFrom::Start(0))
             .context("移动文件指针到头部失败")?;
         self.file
-            .write_all(&self.header.written_count.to_le_bytes())
-            .context("更新已写入分块计数失败")?;
+            .write_all(&self.header.to_bytes())
+            .context("更新文件头失败")?;
+
+        // 确保写入磁盘
         self.file.flush().context("刷新文件缓冲区失败")?;
         Ok(())
     }
@@ -239,11 +251,11 @@ impl GmfSession {
     ) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
 
-        let chunk_count = gmf_file.chunk_count();
+        let chunk_count = gmf_file.total_chunks();
 
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
-        let writer_handle = tokio::spawn(run_writer_task(
+        let writer_handle = tokio::spawn(writer(
             gmf_file_arc.clone(),
             decrypted_rx,
             completed_chunks,
@@ -341,7 +353,7 @@ impl GmfSession {
 
 fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
     let temp_path = &gmf_file.temp_path;
-    let target_filename = &gmf_file.filename;
+    let target_filename = &gmf_file.file_name;
 
     // 显式 drop 文件句柄，以便后续可以安全地进行截断和重命名
     drop(gmf_file.file);
@@ -383,7 +395,7 @@ fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
 }
 
 // 后台“写入器”任务
-async fn run_writer_task(
+async fn writer(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
     completed_chunks: u64,

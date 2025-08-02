@@ -4,7 +4,6 @@ use crate::io_actor::IoActor;
 use crate::ssh::{self};
 use crate::ui::{AllProgressBar, LogLevel, run_with_spinner};
 use anyhow::{Context, Result, anyhow, bail};
-use futures::future::ok;
 use gmf_common::interface::*;
 use gmf_common::utils::format_size;
 use log::{error, info, warn};
@@ -213,7 +212,7 @@ impl InteractiveSession {
     }
 
     fn initialize_session(&mut self, setup_response: SetupResponse) -> Result<()> {
-        let (gmf_file, completed_chunks) = GMFFile::new(
+        let (gmf_file, completed_chunks) = GMFFile::new_or_resume(
             &setup_response.file_name,
             setup_response.file_size,
             setup_response.total_chunks,
@@ -286,14 +285,17 @@ impl InteractiveSession {
 
         progress_bar.finish_download();
 
-        let upload_time = match loop_result {
+        let _upload_time = match loop_result {
             Ok(time) => time,
             Err(e) => {
                 error!("上传任务执行失败: {e:#}");
                 return Err(e);
             }
         };
-        warn!("\n所有任务完成，文件已在本地准备就绪。上传速度达到 {} MB/s", upload_time.as_millis());
+        
+        warn!("\n所有任务完成，文件已在本地准备就绪");
+
+        // warn!("\n所有任务完成，文件已在本地准备就绪。上传速度达到 {} MB/s", upload_time.as_millis());
 
         Ok(())
     }
@@ -310,7 +312,7 @@ impl InteractiveSession {
         match tokio::time::timeout(Duration::from_secs(5), self.response_rx.recv()).await {
             Ok(Some(response)) => Ok(Some(response)),
             Ok(None) => Ok(None),
-            Err(_) => Err(anyhow::anyhow!("等待响应超时 (超过 5秒)",)),
+            Err(_) => Err(anyhow::anyhow!("等待响应超时",)),
         }
     }
 
@@ -399,7 +401,7 @@ async fn event_loop(
                         bail!("连接中断: 服务端在任务完成前关闭了连接");
                     }
                     Err(_) => { // `timeout` 触发
-                        bail!("等待响应超时 (超过 5秒)");
+                        bail!("等待响应超时");
                     }
                 }
             },
