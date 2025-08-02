@@ -272,6 +272,7 @@ impl GmfSession {
 
     /// 负责下载分块与解密，写入交由写入器操作
     pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
+        info!("开始处理分块 {chunk_id}");
         let decrypted_tx = self.decrypted_tx.clone();
 
         // 所有错误都统一折叠成 anyhow::Result，最后再转换为 ChunkResult

@@ -5,7 +5,7 @@ use aws_sdk_s3 as s3;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use bytes::Bytes;
-use log::{error, warn};
+use log::error;
 use std::env;
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -164,18 +164,9 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
                 if let Some(service_error) = sdk_error.as_service_error() {
                     // 检查错误码是否为 "BucketNotEmpty"
                     if service_error.code() == Some("BucketNotEmpty") {
-                        warn!(
-                            "存储桶 '{BUCKET_NAME}' 非空，将自动清空并重试... 错误: {:?}",
-                            service_error.message()
-                        );
-
                         let objects = list_objects().await?;
                         if !objects.is_empty() {
-                            warn!("发现 {} 个对象，正在删除...", objects.len());
                             delete_objects(objects).await?;
-                            warn!("对象已删除。");
-                        } else {
-                            warn!("未发现需要删除的对象，可能是最终一致性问题。");
                         }
 
                         // 等待1秒后重试

@@ -12,6 +12,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use gmf_common::consts::NONCE_SIZE;
 use gmf_common::interface::*;
 use gmf_common::r2::{init_s3_client, put_object};
+use tokio::task::JoinHandle;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, BufReader},
@@ -41,7 +42,7 @@ pub async fn handle_message(
     message: Message,
     state: SharedState,
     sender: mpsc::Sender<Message>,
-) -> Result<()> {
+) -> Result<Option<JoinHandle<()>>> {
     let request = match message {
         Message::Request(req) => req,
         _ => {
@@ -51,7 +52,7 @@ pub async fn handle_message(
             if sender.send(error_response.into()).await.is_err() {
                 error!("Channel closed. Could not send InvalidRequest error.");
             }
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -61,17 +62,18 @@ pub async fn handle_message(
             if sender.send(response.into()).await.is_err() {
                 error!("Channel closed. Could not send setup response.");
             }
+            Ok(None)
         }
         ClientRequest::Start(payload) => {
             let ack = ServerResponse::StartSuccess;
             if sender.send(ack.into()).await.is_err() {
                 error!("Channel closed. Could not send StartSuccess ack.");
-                return Ok(());
+                return Ok(None);
             }
-            tokio::spawn(start(payload, state, sender.clone()));
+            let handle = tokio::spawn(start(payload, state, sender.clone()));
+            Ok(Some(handle))
         }
     }
-    Ok(())
 }
 
 pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerResponse {
@@ -244,6 +246,7 @@ pub async fn start(
 }
 
 async fn process_single_chunk(job: ChunkJob, sender: mpsc::Sender<Message>) -> Result<()> {
+    let start_time = std::time::Instant::now();
     let chunk_id = job.id;
     info!("开始处理分块 #{chunk_id}...");
 
@@ -264,7 +267,10 @@ async fn process_single_chunk(job: ChunkJob, sender: mpsc::Sender<Message>) -> R
         .await
         .map_err(|e| anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: {}", e))?;
 
-    info!("分块 #{chunk_id} 处理成功。");
+    info!(
+        "分块 #{chunk_id} 处理成功, 耗时: {} s",
+        start_time.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 

@@ -8,7 +8,9 @@ use gmf_common::interface::{Message, ServerResponse};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 use tracing::info;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging().expect("无法初始化文件日志系统");
@@ -16,6 +18,8 @@ async fn main() -> Result<()> {
     let state: SharedState = Arc::new(Mutex::new(AppState::default()));
 
     let (tx, mut rx) = mpsc::channel::<Message>(100);
+
+    let mut upload_task_handle: Option<JoinHandle<()>> = None;
 
     let writer_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
@@ -44,7 +48,8 @@ async fn main() -> Result<()> {
                 }
                 match Message::from_json(line) {
                     Ok(message) => {
-                        let _ = server::handle_message(message, state.clone(), tx.clone()).await;
+                        upload_task_handle =
+                            server::handle_message(message, state.clone(), tx.clone()).await?
                     }
                     Err(e) => {
                         let error_response =
@@ -63,6 +68,11 @@ async fn main() -> Result<()> {
                 break;
             }
         }
+    }
+
+    if let Some(handle) = upload_task_handle {
+        info!("收到 EOF，正在中止文件上传任务...");
+        handle.abort();
     }
 
     drop(tx);

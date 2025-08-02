@@ -3,7 +3,6 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-/// 日志输出等级
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum LogLevel {
     Error = 0,
@@ -13,21 +12,20 @@ pub enum LogLevel {
 
 pub struct AllProgressBar {
     pub completed_chunks: u64,
-    log_level: LogLevel, // 新增：存储当前日志等级
+    log_level: LogLevel,
 
     mp: MultiProgress,
     download: ProgressBar,
 }
 
 impl AllProgressBar {
-    /// 创建一个新的 AllProgressBar 实例
     pub fn new(total_chunks: u64, completed_chunks: u64, log_level: LogLevel) -> Result<Self> {
         let mp: MultiProgress = MultiProgress::new();
         let download = mp.add(ProgressBar::new(total_chunks));
 
         download.set_style(
             ProgressStyle::default_bar()
-                .template("下载进度 [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
 
@@ -49,6 +47,10 @@ impl AllProgressBar {
         self.download.finish();
     }
 
+    pub fn start_tick(&self) {
+        self.download.enable_steady_tick(Duration::from_secs(1));
+    }
+
     /// 在进度条上方输出消息，不会干扰进度条显示
     fn println(&self, msg: &str) {
         self.mp.println(msg).unwrap_or_else(|_| {
@@ -66,7 +68,6 @@ impl AllProgressBar {
             };
 
             if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-                // 东八区时间
                 let timestamp = duration.as_secs() + 8 * 3600;
                 let hours = (timestamp / 3600) % 24;
                 let minutes = (timestamp / 60) % 60;
@@ -130,8 +131,8 @@ pub async fn run_with_spinner<F, T, E>(
     task: F,
 ) -> Result<T, E>
 where
-    F: Future<Output = Result<T, E>>, // 任务必须是一个返回 Result 的 Future
-    E: std::fmt::Display,             // 错误类型必须可以被显示
+    F: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
 {
     let spinner = Spinner::new(loading_msg);
 
@@ -145,7 +146,7 @@ where
             // 失败
             let error_message = format!("❌ 运行失败: {}", error);
             spinner.finish(&error_message);
-            Err(error) // 将原始错误继续向上传播
+            Err(error)
         }
     }
 }

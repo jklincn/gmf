@@ -49,7 +49,7 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
 
     // 如果需要，则进行安装/更新
     if needs_install {
-        let msg = format!("正在安装服务端至远程目录: {REMOTE_BIN_DIR}...");
+        let msg = format!("正在安装服务端至远程目录 (~/.local/bin)...");
         run_with_spinner::<_, (), anyhow::Error>(&msg, "✅ 远程服务端安装成功", async {
             // 第一步：创建目录
             ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
@@ -235,7 +235,6 @@ impl InteractiveSession {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        // --- 1. 前置检查和状态准备 ---
         let progress_bar = self
             .progress_bar
             .clone()
@@ -250,7 +249,6 @@ impl InteractiveSession {
             resume_from_chunk_id,
         });
 
-        // --- 2. 发送 Start 请求并等待确认 ---
         info!("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
         match self.next_response().await? {
@@ -267,14 +265,11 @@ impl InteractiveSession {
         // 主事件循环
         let loop_result = event_loop(&mut self.response_rx, session.clone(), &progress_bar).await;
 
-        // --- 4. 任务清理与收尾 ---
-        // 无论循环是正常结束还是因错误退出，都尝试等待剩余任务完成
+        progress_bar.finish_download();
+        
         info!("等待所有本地任务完成...");
-        // 注意：这里需要从 self 中拿走 session，因为它在循环中被克隆了
-        // 更好的做法是，在调用 event_loop 之前就拿走
+
         let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
-            // 如果这里失败，说明有严重的逻辑错误，比如 event_loop 提前退出了，
-            // 但 join_set 中还有任务在运行。
             anyhow!(
                 "无法获得 GmfSession 的唯一所有权，还有 {} 个引用存在。这可能是个逻辑错误。",
                 Arc::strong_count(&arc)
@@ -283,19 +278,18 @@ impl InteractiveSession {
 
         session_to_finish.wait_for_completion().await?;
 
-        progress_bar.finish_download();
+        
 
         let _upload_time = match loop_result {
             Ok(time) => time,
             Err(e) => {
-                error!("上传任务执行失败: {e:#}");
                 return Err(e);
             }
         };
 
         warn!("\n所有任务完成，文件已在本地准备就绪");
 
-        // warn!("\n所有任务完成，文件已在本地准备就绪。上传速度达到 {} MB/s", upload_time.as_millis());
+        // warn!("\n所有任务完成，文件已在本地准备就绪。平均上传速度：{} MB/s", upload_time.as_millis());
 
         Ok(())
     }
@@ -318,20 +312,14 @@ impl InteractiveSession {
 
     /// 发送退出指令，并等待程序结束。
     pub async fn shutdown(mut self) -> Result<()> {
-        // 步骤 1: 停止发送新命令
-        // 通过拿走 self 的所有权并 drop command_tx，来通知 IoActor 不会再有新任务。
-        // IoActor 的 command_rx.recv() 会返回 None，使其退出主循环。
         drop(self.command_tx);
 
-        // 步骤 2: 等待后台 I/O Actor 任务处理完所有缓冲并正常退出
-        // 我们给它一个合理的超时时间，以防它卡住。
         match tokio::time::timeout(Duration::from_secs(5), self.actor_handle).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {e:?}"),
             Err(_) => warn!("等待 I/O Actor 退出超时！"),
         }
 
-        // 步骤 3: 现在 Actor 已经停止，可以安全地、主动地关闭 SSH 连接
         self.ssh_session.close().await?;
 
         Ok(())
@@ -347,6 +335,7 @@ async fn event_loop(
     let mut upload_completed = false;
     let mut upload_time = Duration::ZERO;
     let start_time = std::time::Instant::now();
+    progress_bar.start_tick();
 
     loop {
         tokio::select! {
@@ -370,7 +359,7 @@ async fn event_loop(
                 }
             },
 
-            resp = tokio::time::timeout(Duration::from_secs(5), response_rx.recv()), if !upload_completed => {
+            resp = tokio::time::timeout(Duration::from_secs(15), response_rx.recv()), if !upload_completed => {
                 match resp {
                     Ok(Some(response)) => {
                         match response {
@@ -389,7 +378,6 @@ async fn event_loop(
                                 progress_bar.log_error(&error_msg);
                                 bail!(error_msg);
                             },
-                            // FIX 2: 去掉 Some()，直接用变量捕获
                             other => {
                                 progress_bar.log_debug(&format!("收到非关键消息: {:?}", other));
                             }

@@ -13,7 +13,7 @@ use config::Config;
 use env_logger::Builder;
 use env_logger::Env;
 use gmf_common::r2;
-use log::{error, info};
+use log::{error, warn};
 use std::io::Write;
 use tokio::signal;
 
@@ -52,11 +52,10 @@ fn parse_chunk_size(s: &str) -> Result<u64> {
     long_about = None
 )]
 struct Args {
-    /// 要上传的文件路径
+    /// 要下载的远程文件路径
     path: String,
 
-    /// 设置分块大小。支持单位 (KB, MB, GB) 或纯数字 (字节)。
-    /// 示例: 10MB, 256KB, 1gb, 10485760
+    /// 分块大小
     #[arg(
         long,
         short = 'c',
@@ -66,7 +65,7 @@ struct Args {
     )]
     chunk_size: u64,
 
-    /// 设置并发上传的任务数量
+    /// 并发上传的任务数量
     #[arg(
         long,
         short = 'n',
@@ -75,16 +74,19 @@ struct Args {
     )]
     concurrency: u64,
 
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    verbose: u8,
+    /// 打印详细输出
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 fn set_log() {
-    let default_log_level = match Args::parse().verbose {
-        0 => "warn",
-        _ => "info",
+    let args = Args::parse();
+    let log_level = if args.verbose {
+        "info" // 如果提供了 -v 或 --verbose
+    } else {
+        "warn" // 如果没有提供
     };
-    let env = Env::default().default_filter_or(default_log_level);
+    let env = Env::default().default_filter_or(log_level);
     Builder::from_env(env)
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
@@ -137,19 +139,16 @@ async fn main() -> Result<()> {
 
         // 分支 2: 监听 Ctrl+C 信号
         _ = signal::ctrl_c() => {
-            info!("收到 Ctrl+C 信号，正在清理...");
+            warn!("收到 Ctrl+C 信号，正在清理...");
             Ok(())
         }
     };
 
     if let Err(e) = &result {
         error!("发生错误: {e:#}");
-    } else {
-        // 给进度条一些时间显示完成状态
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
-    // 2. 无论主逻辑是否成功，都执行清理操作
+    // 无论主逻辑是否成功，都执行清理操作
     if let Err(e) = session.shutdown().await {
         error!("清理过程中发生错误: {e:#}");
     }
