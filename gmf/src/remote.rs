@@ -127,11 +127,7 @@ impl InteractiveSession {
         })
     }
 
-    pub async fn setup(
-        &mut self,
-        file_path: &str,
-        chunk_size: u64,
-    ) -> Result<()> {
+    pub async fn setup(&mut self, file_path: &str, chunk_size: u64) -> Result<()> {
         // 先接收一个 Ready 响应，表示远程程序已准备就绪
         match self.next_response().await? {
             Some(ServerResponse::Ready) => {
@@ -247,22 +243,27 @@ impl InteractiveSession {
 
         info!("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
-        match self.next_response().await? {
-            Some(ServerResponse::StartSuccess) => {
-                info!("服务端确认，开始接收分块信息...");
+
+        let remaining_size = match self.next_response().await? {
+            Some(ServerResponse::StartSuccess(response)) => {
+                info!(
+                    "服务端确认，需要传输的大小为 {} 字节，开始接收分块信息...",
+                    response.remaining_size
+                );
+                response.remaining_size
             }
             Some(other_response) => bail!(
                 "协议错误: 期望收到 StartSuccess，但收到 {:?}",
                 other_response
             ),
             None => bail!("连接中断: 在等待 StartSuccess 响应时连接已关闭"),
-        }
+        };
 
         // 主事件循环
         let loop_result = event_loop(&mut self.response_rx, session.clone(), &progress_bar).await;
 
         match loop_result {
-            Ok(_time) => {
+            Ok(time) => {
                 progress_bar.finish_download();
                 info!("等待所有本地任务完成...");
 
@@ -274,7 +275,11 @@ impl InteractiveSession {
                 })?;
 
                 session_to_finish.wait_for_completion().await?;
-                warn!("\n所有任务完成，文件已在本地准备就绪");
+                let speed = (remaining_size as f64 / 1024.0 / 1024.0) / time.as_secs_f64();
+                let speed_str = format!("{:.2} MB/s", speed);
+
+                warn!("\n✅ 所有任务完成，文件已在本地准备就绪");
+                warn!("⚡ 远程服务端平均上传速度: {}", speed_str);
                 Ok(())
             }
             Err(e) => {
@@ -293,7 +298,7 @@ impl InteractiveSession {
     }
 
     pub async fn next_response(&mut self) -> Result<Option<ServerResponse>> {
-        match tokio::time::timeout(Duration::from_secs(5), self.response_rx.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(10), self.response_rx.recv()).await {
             Ok(Some(response)) => Ok(Some(response)),
             Ok(None) => Ok(None),
             Err(_) => Err(anyhow!("等待响应超时",)),
@@ -304,7 +309,7 @@ impl InteractiveSession {
     pub async fn shutdown(mut self) -> Result<()> {
         drop(self.command_tx);
 
-        match tokio::time::timeout(Duration::from_secs(5), self.actor_handle).await {
+        match tokio::time::timeout(Duration::from_secs(10), self.actor_handle).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {e:?}"),
             Err(_) => warn!("等待 I/O Actor 退出超时！"),
@@ -347,7 +352,7 @@ async fn event_loop(
                 }
             },
 
-            resp = tokio::time::timeout(Duration::from_secs(15), response_rx.recv()), if !upload_completed => {
+            resp = tokio::time::timeout(Duration::from_secs(20), response_rx.recv()), if !upload_completed => {
                 match resp {
                     Ok(Some(response)) => {
                         match response {

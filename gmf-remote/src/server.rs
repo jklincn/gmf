@@ -1,10 +1,10 @@
 use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    Aes256Gcm, Key, Nonce,
 };
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine, engine::general_purpose};
-use futures::{TryStreamExt, stream};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine};
+use futures::{stream, TryStreamExt};
 use gmf_common::{
     consts::NONCE_SIZE,
     interface::*,
@@ -14,15 +14,18 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, BufReader},
-    sync::{Mutex, mpsc},
+    sync::{mpsc, watch, Mutex},
     task::JoinHandle,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct TaskMetadata {
     pub file_path: PathBuf,
+    pub file_size: u64,
     pub chunk_size: u64,
+    #[allow(unused)]
+    pub total_chunks: u64,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +45,7 @@ pub async fn handle_message(
     message: Message,
     state: SharedState,
     sender: mpsc::Sender<Message>,
+    shutdown_rx: watch::Receiver<()>, // 接收关闭信号
 ) -> Result<Option<JoinHandle<()>>> {
     let request = match message {
         Message::Request(req) => req,
@@ -65,12 +69,22 @@ pub async fn handle_message(
             Ok(None)
         }
         ClientRequest::Start(payload) => {
-            let ack = ServerResponse::StartSuccess;
+            let (file_size, chunk_size) = {
+                let app_state = state.lock().await;
+                let metadata = app_state
+                    .metadata
+                    .as_ref()
+                    .context("任务未初始化。请在 'start' 之前先调用 'setup'")?;
+                (metadata.file_size, metadata.chunk_size)
+            };
+            let ack = ServerResponse::StartSuccess(StartResponse {
+                remaining_size: file_size - (payload.resume_from_chunk_id * chunk_size),
+            });
             if sender.send(ack.into()).await.is_err() {
                 error!("Channel closed. Could not send StartSuccess ack.");
                 return Ok(None);
             }
-            let handle = tokio::spawn(start(payload, state, sender.clone()));
+            let handle = tokio::spawn(start(payload, state, sender.clone(), shutdown_rx));
             Ok(Some(handle))
         }
     }
@@ -79,9 +93,6 @@ pub async fn handle_message(
 pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerResponse {
     if payload.chunk_size == 0 {
         return ServerResponse::InvalidRequest("chunk_size 不能为 0".to_string());
-    }
-    if payload.concurrency == 0 {
-        return ServerResponse::InvalidRequest("concurrency 不能为 0".to_string());
     }
 
     if let Err(e) = init_s3_client(None).await {
@@ -129,6 +140,8 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
     let task_metadata = TaskMetadata {
         file_path,
         chunk_size: payload.chunk_size,
+        file_size,
+        total_chunks,
     };
 
     {
@@ -147,6 +160,7 @@ pub async fn start(
     payload: StartRequestPayload,
     state: SharedState,
     sender: mpsc::Sender<Message>,
+    mut shutdown_rx: watch::Receiver<()>, // 接收关闭信号
 ) {
     let result: Result<()> = async {
         let (file_path, chunk_size) = {
@@ -161,38 +175,39 @@ pub async fn start(
         let (upload_tx, mut upload_rx) = mpsc::channel::<EncryptedChunk>(4);
 
         // 3. 启动上传任务 (消费者)
-        // 这个任务会独立运行，从队列中接收加密好的分块并上传
         let sender_clone = sender.clone();
+        let mut upload_shutdown_rx = shutdown_rx.clone();
         let upload_handle = tokio::spawn(async move {
-            while let Some(encrypted_chunk) = upload_rx.recv().await {
-                let chunk_id = encrypted_chunk.id;
-                let passphrase_b64 = encrypted_chunk.passphrase_b64;
-
-                let upload_start_time = std::time::Instant::now();
-                info!("开始上传分块 #{chunk_id}...");
-
-                // 执行上传
-                if let Err(e) = put_object(&chunk_id.to_string(), encrypted_chunk.data).await {
-                    // 如果上传失败，返回错误，整个任务会因此中止
-                    return Err(e.context(format!("分块 #{chunk_id} 上传失败 (已自动重试)")));
-                }
-
-                info!(
-                    "分块 #{chunk_id} 上传成功, 耗时: {} s",
-                    upload_start_time.elapsed().as_secs_f32()
-                );
-
-                // 上传成功后，发送消息通知客户端
-                let success_response = ServerResponse::ChunkReadyForDownload {
-                    chunk_id,
-                    passphrase_b64,
-                };
-
-                if sender_clone.send(success_response.into()).await.is_err() {
-                    error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
-                    return Err(anyhow!(
-                        "无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"
-                    ));
+            loop {
+                tokio::select! {
+                    _ = upload_shutdown_rx.changed() => {
+                        info!("上传任务收到关闭信号，正在退出...");
+                        break;
+                    }
+                    item = upload_rx.recv() => {
+                        match item {
+                            Some(encrypted_chunk) => {
+                                let chunk_id = encrypted_chunk.id;
+                                let passphrase_b64 = encrypted_chunk.passphrase_b64;
+                                let upload_start_time = std::time::Instant::now();
+                                info!("开始上传分块 #{chunk_id}...");
+                                if let Err(e) = put_object(&chunk_id.to_string(), encrypted_chunk.data).await {
+                                    return Err(e.context(format!("分块 #{chunk_id} 上传失败 (已自动重试)")));
+                                }
+                                info!("分块 #{chunk_id} 上传成功, 耗时: {} s", upload_start_time.elapsed().as_secs_f32());
+                                let success_response = ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64 };
+                                if sender_clone.send(success_response.into()).await.is_err() {
+                                    error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
+                                    return Err(anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"));
+                                }
+                            }
+                            None => {
+                                // 队列关闭，正常退出
+                                info!("上传队列已关闭，上传任务正在退出");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -213,110 +228,118 @@ pub async fn start(
 
             let reader = BufReader::new(file);
 
-            // 创建文件分块流，直接产生 (chunk_id, data) 元组
-            let file_reader_stream = stream::try_unfold(
+            let mut file_reader_stream = Box::pin(stream::try_unfold(
                 (reader, payload.resume_from_chunk_id),
                 move |(mut reader, chunk_id)| async move {
                     let mut buf = vec![0u8; chunk_size as usize];
                     let mut filled = 0;
                     loop {
-                        if filled == chunk_size as usize {
-                            break;
-                        }
+                        if filled == chunk_size as usize { break; }
                         match reader.read(&mut buf[filled..]).await {
                             Ok(0) => break,
                             Ok(n) => filled += n,
                             Err(e) => return Err(e),
                         }
                     }
-                    if filled == 0 {
-                        Ok(None)
-                    } else {
+                    if filled == 0 { Ok(None) } else {
                         buf.truncate(filled);
-                        // 直接返回元组，不再需要 ChunkJob
                         Ok(Some(((chunk_id, buf), (reader, chunk_id + 1))))
                     }
                 },
-            );
+            ).map_err(anyhow::Error::from));
 
-            // 串行处理流：读取 -> 加密 -> 发送到队列
-            file_reader_stream
-                .map_err(anyhow::Error::from)
-                // 直接在闭包参数中解构元组，这样更清晰
-                .try_for_each(|(chunk_id, data)| {
-                    let upload_tx = upload_tx.clone();
-                    async move {
-                        let encrypt_start_time = std::time::Instant::now();
-                        info!("开始加密分块 #{chunk_id}...");
-
-                        let (encrypted_data, passphrase_b64) = encrypt_chunk(&data)
-                            .with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
-
-                        info!(
-                            "分块 #{chunk_id} 加密成功，耗时: {} s，已发送到上传队列。",
-                            encrypt_start_time.elapsed().as_secs_f32()
-                        );
-
-                        let chunk_to_upload = EncryptedChunk {
-                            id: chunk_id,
-                            data: encrypted_data,
-                            passphrase_b64,
-                        };
-
-                        if upload_tx.send(chunk_to_upload).await.is_err() {
-                            return Err(anyhow!("无法发送加密分块到上传队列：上传任务已终止"));
-                        }
-
-                        Ok(())
+            // 使用循环和 select! 来处理流，以便可以中断
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        warn!("加密任务收到关闭信号，正在中断文件处理...");
+                        return Err(anyhow!("任务被用户中断"));
                     }
-                })
-                .await
-                .context("文件流处理过程中发生错误")?;
-
+                    item = file_reader_stream.try_next() => {
+                        match item {
+                            Ok(Some((chunk_id, data))) => {
+                                let encrypt_start_time = std::time::Instant::now();
+                                info!("开始加密分块 #{chunk_id}...");
+                                let (encrypted_data, passphrase_b64) = encrypt_chunk(&data)
+                                    .with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
+                                info!("分块 #{chunk_id} 加密成功，耗时: {} s，已发送到上传队列。", encrypt_start_time.elapsed().as_secs_f32());
+                                let chunk_to_upload = EncryptedChunk { id: chunk_id, data: encrypted_data, passphrase_b64 };
+                                if upload_tx.send(chunk_to_upload).await.is_err() {
+                                    return Err(anyhow!("无法发送加密分块到上传队列：上传任务已终止"));
+                                }
+                            }
+                            Ok(None) => {
+                                // 文件读取完毕，正常退出循环
+                                info!("文件处理完成，所有分块已发送到上传队列");
+                                break;
+                            }
+                            Err(e) => {
+                                // 文件流发生错误
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
             Ok(())
-        }
-        .await;
+        }.await;
 
         // 5. 等待所有任务完成并处理结果
-        // 当加密循环结束后，`upload_tx` 会被 `drop`，
-        // 这会关闭队列，上传任务在处理完所有剩余项目后会自动结束。
-
-        // 首先检查加密过程是否出错
-        encryption_result?;
-
-        // 显式 drop `upload_tx`，确保上传任务的 `recv` 循环会结束
+        let was_interrupted = if let Err(e) = &encryption_result {
+            e.to_string() == "任务被用户中断"
+        } else {
+            false
+        };
+        
+        let encryption_successful = encryption_result.is_ok();
+        
+        // 如果是非中断错误，则传播错误
+        if let Err(e) = encryption_result {
+            if e.to_string() != "任务被用户中断" {
+                return Err(e);
+            }
+        }
+        
         drop(upload_tx);
 
-        // 等待上传任务完成，并检查其是否返回了错误
-        // 第一个 `?` 处理 `JoinError` (如果任务 panic)
-        // 第二个 `?` 处理我们任务内部返回的 `Result`
+        // 等待上传任务完成（处理完队列中剩余的所有项目）
+        info!("等待上传任务处理完队列中剩余的分块...");
         upload_handle.await??;
 
-        // 所有分块都已成功上传
-        let completed_response = ServerResponse::UploadCompleted;
-        sender
-            .send(completed_response.into())
-            .await
-            .context("无法发送 UploadCompleted 消息")?;
+        // 根据任务完成情况发送不同的响应
+        if was_interrupted {
+            warn!("任务因用户中断而停止");
+        } else if encryption_successful {
+            info!("任务成功完成");
+            let completed_response = ServerResponse::UploadCompleted;
+            sender
+                .send(completed_response.into())
+                .await
+                .context("无法发送 UploadCompleted 消息")?;
+        }
 
         Ok(())
-    }
-    .await;
+    }.await;
 
-    // 如果上述任何步骤失败，发送一个 Error 消息
+    // 如果上述任何步骤失败，发送一个 Error 消息（除非是用户中断）
     if let Err(e) = result {
-        let error_chain = e
-            .chain()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join("\n  caused by: ");
-        let error_message = format!("上传任务执行失败:\n{error_chain}");
-        let error_response = ServerResponse::Error(error_message);
-        if sender.send(error_response.into()).await.is_err() {
-            error!(
-                "Channel closed. Could not send Error for start task. Final error was: {:?}",
-                e
-            );
+        // 如果是用户中断，只记录日志，不向客户端发送消息
+        if e.to_string() == "任务被用户中断" {
+            warn!("任务被用户中断，不发送错误消息给客户端");
+        } else {
+            let error_chain = e
+                .chain()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  caused by: ");
+            let error_message = format!("上传任务执行失败:\n{error_chain}");
+            let error_response = ServerResponse::Error(error_message);
+            if sender.send(error_response.into()).await.is_err() {
+                error!(
+                    "Channel closed. Could not send Error for start task. Final error was: {:?}",
+                    e
+                );
+            }
         }
     }
 }
@@ -325,7 +348,6 @@ fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
 
-    // 生成随机 nonce（每个文件都唯一）
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
 
@@ -337,7 +359,6 @@ fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
         .encrypt(nonce, input_data)
         .map_err(|e| anyhow::anyhow!("加密失败: {:?}", e))?;
 
-    // 输出格式：nonce || ciphertext
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     result.extend_from_slice(&nonce_bytes[..]);
     result.extend_from_slice(&ciphertext);

@@ -25,7 +25,7 @@ pub enum ClientRequest {
 pub enum ServerResponse {
     Ready,
     SetupSuccess(SetupResponse),
-    StartSuccess,
+    StartSuccess(StartResponse),
     ChunkReadyForDownload {
         chunk_id: u64,
         passphrase_b64: String,
@@ -51,6 +51,11 @@ pub struct SetupResponse {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StartRequestPayload {
     pub resume_from_chunk_id: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StartResponse {
+    pub remaining_size: u64,
 }
 
 impl From<ServerResponse> for Message {

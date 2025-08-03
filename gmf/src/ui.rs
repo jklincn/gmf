@@ -52,7 +52,7 @@ impl AllProgressBar {
     }
 
     pub fn start_tick(&self) {
-        self.download.enable_steady_tick(Duration::from_secs(1));
+        self.download.enable_steady_tick(Duration::from_millis(500));
     }
 
     /// 在进度条上方输出消息，不会干扰进度条显示

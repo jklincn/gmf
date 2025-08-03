@@ -92,7 +92,7 @@ impl GMFFile {
             match Self::open(&temp_filename, file_size, total_chunks, file_name) {
                 Ok(gmf_file) => {
                     let completed_chunks = gmf_file.header.completed_chunks;
-                    info!("检测到未完成的下载任务，从分块 {completed_chunks} 继续。");
+                    warn!("➡️ 继续未完成的下载任务");
                     return Ok((gmf_file, completed_chunks));
                 }
                 Err(e) => {
