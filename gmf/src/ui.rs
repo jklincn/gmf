@@ -127,6 +127,10 @@ impl Spinner {
         self.sp.set_style(finish_template);
         self.sp.finish_with_message(msg.to_string());
     }
+
+    pub fn abandon(self) {
+        self.sp.abandon();
+    }
 }
 
 pub async fn run_with_spinner<F, T, E>(

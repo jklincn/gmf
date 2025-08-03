@@ -1,17 +1,16 @@
-use std::{path::PathBuf, sync::Arc};
-
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{TryStreamExt, stream};
 use gmf_common::{
     consts::NONCE_SIZE,
     interface::*,
     r2::{init_s3_client, put_object},
 };
+use std::{path::PathBuf, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, BufReader},
@@ -24,7 +23,6 @@ use tracing::{error, info};
 pub struct TaskMetadata {
     pub file_path: PathBuf,
     pub chunk_size: u64,
-    pub concurrency: u64,
 }
 
 #[derive(Debug, Default)]
@@ -34,9 +32,10 @@ pub struct AppState {
 
 pub type SharedState = Arc<Mutex<AppState>>;
 
-pub struct ChunkJob {
-    pub id: u64,
-    pub data: Vec<u8>,
+struct EncryptedChunk {
+    id: u64,
+    data: Vec<u8>,
+    passphrase_b64: String,
 }
 
 pub async fn handle_message(
@@ -130,7 +129,6 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
     let task_metadata = TaskMetadata {
         file_path,
         chunk_size: payload.chunk_size,
-        concurrency: payload.concurrency,
     };
 
     {
@@ -151,73 +149,150 @@ pub async fn start(
     sender: mpsc::Sender<Message>,
 ) {
     let result: Result<()> = async {
-        let (file_path, chunk_size, concurrency) = {
+        let (file_path, chunk_size) = {
             let app_state = state.lock().await;
             let metadata = app_state
                 .metadata
                 .as_ref()
                 .context("任务未初始化。请在 'start' 之前先调用 'setup'")?;
-            (
-                metadata.file_path.clone(),
-                metadata.chunk_size,
-                metadata.concurrency,
-            )
+            (metadata.file_path.clone(), metadata.chunk_size)
         };
 
-        let mut file = File::open(&file_path)
-            .await
-            .with_context(|| format!("无法打开文件: {}", file_path.display()))?;
+        let (upload_tx, mut upload_rx) = mpsc::channel::<EncryptedChunk>(4);
 
-        if payload.resume_from_chunk_id > 0 {
-            let offset = payload.resume_from_chunk_id * chunk_size;
-            file.seek(tokio::io::SeekFrom::Start(offset))
+        // 3. 启动上传任务 (消费者)
+        // 这个任务会独立运行，从队列中接收加密好的分块并上传
+        let sender_clone = sender.clone();
+        let upload_handle = tokio::spawn(async move {
+            while let Some(encrypted_chunk) = upload_rx.recv().await {
+                let chunk_id = encrypted_chunk.id;
+                let passphrase_b64 = encrypted_chunk.passphrase_b64;
+
+                let upload_start_time = std::time::Instant::now();
+                info!("开始上传分块 #{chunk_id}...");
+
+                // 执行上传
+                if let Err(e) = put_object(&chunk_id.to_string(), encrypted_chunk.data).await {
+                    // 如果上传失败，返回错误，整个任务会因此中止
+                    return Err(e.context(format!("分块 #{chunk_id} 上传失败 (已自动重试)")));
+                }
+
+                info!(
+                    "分块 #{chunk_id} 上传成功, 耗时: {} s",
+                    upload_start_time.elapsed().as_secs_f32()
+                );
+
+                // 上传成功后，发送消息通知客户端
+                let success_response = ServerResponse::ChunkReadyForDownload {
+                    chunk_id,
+                    passphrase_b64,
+                };
+
+                if sender_clone.send(success_response.into()).await.is_err() {
+                    error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
+                    return Err(anyhow!(
+                        "无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"
+                    ));
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // 4. 主任务负责文件读取和加密 (生产者)
+        let encryption_result: Result<()> = async {
+            let mut file = File::open(&file_path)
                 .await
-                .with_context(|| format!("无法跳转到文件偏移量 {offset}"))?;
-        }
+                .with_context(|| format!("无法打开文件: {}", file_path.display()))?;
 
-        let reader = BufReader::new(file);
+            if payload.resume_from_chunk_id > 0 {
+                let offset = payload.resume_from_chunk_id * chunk_size;
+                file.seek(tokio::io::SeekFrom::Start(offset))
+                    .await
+                    .with_context(|| format!("无法跳转到文件偏移量 {offset}"))?;
+            }
 
-        let file_reader_stream = stream::try_unfold(
-            (reader, payload.resume_from_chunk_id),
-            move |(mut reader, chunk_id)| async move {
-                let mut buf = vec![0u8; chunk_size as usize];
-                let mut filled = 0;
-                loop {
-                    if filled == chunk_size as usize {
-                        break;
+            let reader = BufReader::new(file);
+
+            // 创建文件分块流，直接产生 (chunk_id, data) 元组
+            let file_reader_stream = stream::try_unfold(
+                (reader, payload.resume_from_chunk_id),
+                move |(mut reader, chunk_id)| async move {
+                    let mut buf = vec![0u8; chunk_size as usize];
+                    let mut filled = 0;
+                    loop {
+                        if filled == chunk_size as usize {
+                            break;
+                        }
+                        match reader.read(&mut buf[filled..]).await {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(e) => return Err(e),
+                        }
                     }
-                    match reader.read(&mut buf[filled..]).await {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) => return Err(e),
+                    if filled == 0 {
+                        Ok(None)
+                    } else {
+                        buf.truncate(filled);
+                        // 直接返回元组，不再需要 ChunkJob
+                        Ok(Some(((chunk_id, buf), (reader, chunk_id + 1))))
                     }
-                }
-                if filled == 0 {
-                    Ok(None)
-                } else {
-                    buf.truncate(filled);
-                    Ok(Some((
-                        ChunkJob {
+                },
+            );
+
+            // 串行处理流：读取 -> 加密 -> 发送到队列
+            file_reader_stream
+                .map_err(anyhow::Error::from)
+                // 直接在闭包参数中解构元组，这样更清晰
+                .try_for_each(|(chunk_id, data)| {
+                    let upload_tx = upload_tx.clone();
+                    async move {
+                        let encrypt_start_time = std::time::Instant::now();
+                        info!("开始加密分块 #{chunk_id}...");
+
+                        let (encrypted_data, passphrase_b64) = encrypt_chunk(&data)
+                            .with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
+
+                        info!(
+                            "分块 #{chunk_id} 加密成功，耗时: {} s，已发送到上传队列。",
+                            encrypt_start_time.elapsed().as_secs_f32()
+                        );
+
+                        let chunk_to_upload = EncryptedChunk {
                             id: chunk_id,
-                            data: buf,
-                        },
-                        (reader, chunk_id + 1),
-                    )))
-                }
-            },
-        );
+                            data: encrypted_data,
+                            passphrase_b64,
+                        };
 
-        file_reader_stream
-            .map_err(anyhow::Error::from)
-            .map(|job_result| async {
-                let job = job_result?;
-                process_single_chunk(job, sender.clone()).await
-            })
-            .buffered(concurrency as usize)
-            .try_for_each(|_| async { Ok(()) })
-            .await
-            .context("文件流处理过程中发生错误")?;
+                        if upload_tx.send(chunk_to_upload).await.is_err() {
+                            return Err(anyhow!("无法发送加密分块到上传队列：上传任务已终止"));
+                        }
 
+                        Ok(())
+                    }
+                })
+                .await
+                .context("文件流处理过程中发生错误")?;
+
+            Ok(())
+        }
+        .await;
+
+        // 5. 等待所有任务完成并处理结果
+        // 当加密循环结束后，`upload_tx` 会被 `drop`，
+        // 这会关闭队列，上传任务在处理完所有剩余项目后会自动结束。
+
+        // 首先检查加密过程是否出错
+        encryption_result?;
+
+        // 显式 drop `upload_tx`，确保上传任务的 `recv` 循环会结束
+        drop(upload_tx);
+
+        // 等待上传任务完成，并检查其是否返回了错误
+        // 第一个 `?` 处理 `JoinError` (如果任务 panic)
+        // 第二个 `?` 处理我们任务内部返回的 `Result`
+        upload_handle.await??;
+
+        // 所有分块都已成功上传
         let completed_response = ServerResponse::UploadCompleted;
         sender
             .send(completed_response.into())
@@ -246,36 +321,6 @@ pub async fn start(
     }
 }
 
-async fn process_single_chunk(job: ChunkJob, sender: mpsc::Sender<Message>) -> Result<()> {
-    let start_time = std::time::Instant::now();
-    let chunk_id = job.id;
-    info!("开始处理分块 #{chunk_id}...");
-
-    let (encrypted_data, passphrase_b64) =
-        encrypt_chunk(&job.data).with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
-
-    put_object(&chunk_id.to_string(), encrypted_data)
-        .await
-        .with_context(|| format!("分块 #{chunk_id} 上传失败 (已自动重试)"))?;
-
-    let success_response = ServerResponse::ChunkReadyForDownload {
-        chunk_id,
-        passphrase_b64,
-    };
-
-    sender
-        .send(success_response.into())
-        .await
-        .map_err(|e| anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: {}", e))?;
-
-    info!(
-        "分块 #{chunk_id} 处理成功, 耗时: {} s",
-        start_time.elapsed().as_secs_f32()
-    );
-    Ok(())
-}
-
-// TODO：由于加密导致的文件大小增加量不正常
 fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);

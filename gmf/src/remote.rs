@@ -131,7 +131,6 @@ impl InteractiveSession {
         &mut self,
         file_path: &str,
         chunk_size: u64,
-        concurrency: u64,
     ) -> Result<()> {
         // 先接收一个 Ready 响应，表示远程程序已准备就绪
         match self.next_response().await? {
@@ -152,7 +151,6 @@ impl InteractiveSession {
         let client_request = ClientRequest::Setup(SetupRequestPayload {
             path: file_path.to_string(),
             chunk_size,
-            concurrency,
         });
 
         let spinner = crate::ui::Spinner::new("正在取得文件信息...");
@@ -172,17 +170,17 @@ impl InteractiveSession {
 
             Ok(Some(ServerResponse::InvalidRequest(msg))) => {
                 let error_msg = format!("❌ 请求无效: {msg}");
-                spinner.finish(&error_msg);
+                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(ServerResponse::NotFound(msg))) => {
                 let error_msg = format!("❌ 找不到文件: {msg}");
-                spinner.finish(&error_msg);
+                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(ServerResponse::Error(msg))) => {
                 let error_msg = format!("❌ 服务端错误: {msg}");
-                spinner.finish(&error_msg);
+                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
 
@@ -190,18 +188,18 @@ impl InteractiveSession {
             Ok(Some(other_response)) => {
                 let error_msg =
                     format!("❌ 意外的响应: 收到了非预期的服务器响应 {other_response:?}");
-                spinner.finish(&error_msg);
+                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(None) => {
                 let error_msg = "❌ 连接中断: 在等待设置响应时连接已关闭";
-                spinner.finish(error_msg);
+                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Err(e) => {
                 // 这是 next_response() 本身发生的错误，如网络层或反序列化错误
                 let error_msg = format!("❌ 通信错误: {e}");
-                spinner.finish(&error_msg);
+                spinner.abandon();
                 return Err(e.context(error_msg));
             }
         }

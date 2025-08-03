@@ -41,7 +41,6 @@ pub enum ServerResponse {
 pub struct SetupRequestPayload {
     pub path: String,
     pub chunk_size: u64,
-    pub concurrency: u64,
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SetupResponse {

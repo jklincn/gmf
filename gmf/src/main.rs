@@ -62,10 +62,6 @@ struct Args {
     )]
     chunk_size: u64,
 
-    /// 并发上传数
-    #[arg(long, short = 'n', value_name = "NUMBER", default_value_t = 1)]
-    concurrency: u64,
-
     /// 打印详细输出
     #[arg(short, long)]
     verbose: bool,
@@ -128,7 +124,7 @@ async fn main() -> Result<()> {
         // 分支 1: 正常执行业务逻辑
         res = async {
             session
-                .setup(&args.path, args.chunk_size, args.concurrency)
+                .setup(&args.path, args.chunk_size)
                 .await?;
             session.start().await?;
             Ok(())
@@ -138,7 +134,7 @@ async fn main() -> Result<()> {
 
         // 分支 2: 监听 Ctrl+C 信号
         _ = signal::ctrl_c() => {
-            warn!("收到 Ctrl+C 信号，正在清理...");
+            warn!("⛔ 收到 Ctrl+C 信号，正在清理...");
             Ok(())
         }
     };
