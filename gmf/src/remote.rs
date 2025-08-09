@@ -127,7 +127,7 @@ impl InteractiveSession {
         })
     }
 
-    pub async fn setup(&mut self, file_path: &str, chunk_size: u64) -> Result<()> {
+    pub async fn setup(&mut self, file_path: &str, chunk_size: u64, verbose: bool) -> Result<()> {
         // 先接收一个 Ready 响应，表示远程程序已准备就绪
         match self.next_response().await? {
             Some(ServerResponse::Ready) => {
@@ -161,7 +161,7 @@ impl InteractiveSession {
                 );
 
                 spinner.finish(&success_msg);
-                self.initialize_session(setup_response)?;
+                self.initialize_session(setup_response, verbose)?;
             }
 
             Ok(Some(ServerResponse::InvalidRequest(msg))) => {
@@ -203,7 +203,7 @@ impl InteractiveSession {
         Ok(())
     }
 
-    fn initialize_session(&mut self, setup_response: SetupResponse) -> Result<()> {
+    fn initialize_session(&mut self, setup_response: SetupResponse, verbose: bool) -> Result<()> {
         let (gmf_file, completed_chunks) = GMFFile::new_or_resume(
             &setup_response.file_name,
             setup_response.file_size,
@@ -213,7 +213,11 @@ impl InteractiveSession {
         let progress_bar = Arc::new(AllProgressBar::new(
             setup_response.total_chunks,
             completed_chunks,
-            LogLevel::Info,
+            if verbose {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
         )?);
 
         self.progress_bar = Some(progress_bar.clone());
@@ -278,8 +282,7 @@ impl InteractiveSession {
                 let speed = (remaining_size as f64 / 1024.0 / 1024.0) / time.as_secs_f64();
                 let speed_str = format!("{:.2} MB/s", speed);
 
-                warn!("\n✅ 所有任务完成，文件已在本地准备就绪");
-                warn!("⚡ 远程服务端平均上传速度: {}", speed_str);
+                warn!("\n⚡ 下载完成，平均传输速度: {}", speed_str);
                 Ok(())
             }
             Err(e) => {
@@ -339,7 +342,7 @@ async fn event_loop(
             Some(res) = join_set.join_next() => {
                 match res {
                     Ok(ChunkResult::Success(id)) => {
-                        progress_bar.log_debug(&format!("分块 {id} 处理成功"));
+                        progress_bar.log_info(&format!("分块 #{id} 处理成功"));
                     },
                     Ok(ChunkResult::Failure(id, err)) => {
                         let error_msg = format!("分块 #{id} 本地处理失败: {err:?}");
@@ -352,7 +355,7 @@ async fn event_loop(
                 }
             },
 
-            resp = tokio::time::timeout(Duration::from_secs(20), response_rx.recv()), if !upload_completed => {
+            resp = tokio::time::timeout(Duration::from_secs(30), response_rx.recv()), if !upload_completed => {
                 match resp {
                     Ok(Some(response)) => {
                         match response {
@@ -371,7 +374,7 @@ async fn event_loop(
                                 bail!(error_msg);
                             },
                             other => {
-                                progress_bar.log_debug(&format!("收到非关键消息: {other:?}"));
+                                progress_bar.log_info(&format!("收到非关键消息: {other:?}"));
                             }
                         }
                     },
@@ -379,7 +382,7 @@ async fn event_loop(
                         bail!("连接中断: 服务端在任务完成前关闭了连接");
                     }
                     Err(_) => { // `timeout` 触发
-                        bail!("等待响应超时");
+                        bail!("等待远程服务端响应超时，绝大概率为首次上传超时，请重试");
                     }
                 }
             },

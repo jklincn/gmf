@@ -6,8 +6,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum LogLevel {
     Error = 0,
-    Info = 1,
-    Debug = 2,
+    Warn = 1,
+    Info = 2,
 }
 
 pub struct AllProgressBar {
@@ -67,8 +67,8 @@ impl AllProgressBar {
         if level <= self.log_level {
             let level_str = match level {
                 LogLevel::Error => "[ERROR]",
+                LogLevel::Warn => "[WARN]",
                 LogLevel::Info => "[INFO]",
-                LogLevel::Debug => "[DEBUG]",
             };
 
             if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
@@ -93,14 +93,14 @@ impl AllProgressBar {
 
     /// 记录一条 INFO 等级的日志
     #[allow(unused)]
-    pub fn log_info(&self, msg: &str) {
-        self.log(LogLevel::Info, msg);
+    pub fn log_warn(&self, msg: &str) {
+        self.log(LogLevel::Warn, msg);
     }
 
     /// 记录一条 DEBUG 等级的日志
     #[allow(unused)]
-    pub fn log_debug(&self, msg: &str) {
-        self.log(LogLevel::Debug, msg);
+    pub fn log_info(&self, msg: &str) {
+        self.log(LogLevel::Info, msg);
     }
 }
 

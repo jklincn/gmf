@@ -96,7 +96,7 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
     }
 
     if let Err(e) = init_s3_client(None).await {
-        return ServerResponse::Error(format!("S3 客户端初始化失败: {e}"));
+        return ServerResponse::Error(format!("远程 S3 客户端初始化失败: {e}"));
     }
 
     let file_path_str = shellexpand::tilde(&payload.path).to_string();

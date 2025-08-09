@@ -2,9 +2,12 @@ use anyhow::{Context, Result};
 use aws_config::{self, BehaviorVersion, Region, retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_s3::{self as s3, config::Credentials, error::ProvideErrorMetadata};
 use bytes::Bytes;
-use log::error;
+use log::{error, info, warn};
 use std::{env, time::Duration};
-use tokio::{sync::OnceCell, time::sleep};
+use tokio::{
+    sync::OnceCell,
+    time::{error::Elapsed, sleep, timeout},
+};
 
 static S3_CLIENT: OnceCell<s3::Client> = OnceCell::const_new();
 
@@ -22,27 +25,50 @@ pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
         return Err(anyhow::anyhow!("S3 客户端已经被初始化"));
     }
 
-    let (endpoint, access_key_id, secret_access_key) = if let Some(config) = config_override {
-        // 传参初始化
-        (
-            config.endpoint,
-            config.access_key_id,
-            config.secret_access_key,
-        )
-    } else {
-        // 环境变量初始化
-        let endpoint = env::var("ENDPOINT").context("环境变量 'ENDPOINT' 未设置")?;
-        let access_key_id = env::var("ACCESS_KEY_ID").context("环境变量 'ACCESS_KEY_ID' 未设置")?;
-        let secret_access_key =
-            env::var("SECRET_ACCESS_KEY").context("环境变量 'SECRET_ACCESS_KEY' 未设置")?;
-        (endpoint, access_key_id, secret_access_key)
-    };
-
-    let retry_config = RetryConfig::standard().with_max_attempts(3);
-    let timeout_config = TimeoutConfig::builder()
-        .operation_timeout(Duration::from_secs(60))
-        .operation_attempt_timeout(Duration::from_secs(15))
-        .build();
+    let (endpoint, access_key_id, secret_access_key, retry_config, timeout_config) =
+        if let Some(config) = config_override.clone() {
+            // 客户端配置
+            // 超时和重试手动处理
+            let retry_config = RetryConfig::standard()
+                .with_max_attempts(5)
+                .with_initial_backoff(Duration::from_millis(500))
+                .with_max_backoff(Duration::from_millis(500));
+            let timeout_config = TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .operation_attempt_timeout(Duration::from_secs(10))
+                .operation_timeout(Duration::from_secs(60))
+                .build();
+            (
+                config.endpoint,
+                config.access_key_id,
+                config.secret_access_key,
+                retry_config,
+                timeout_config,
+            )
+        } else {
+            // 服务端配置
+            let endpoint = env::var("ENDPOINT").context("环境变量 'ENDPOINT' 未设置")?;
+            let access_key_id =
+                env::var("ACCESS_KEY_ID").context("环境变量 'ACCESS_KEY_ID' 未设置")?;
+            let secret_access_key =
+                env::var("SECRET_ACCESS_KEY").context("环境变量 'SECRET_ACCESS_KEY' 未设置")?;
+            let retry_config = RetryConfig::standard()
+                .with_max_attempts(3)
+                .with_initial_backoff(Duration::from_millis(500))
+                .with_max_backoff(Duration::from_millis(500));
+            let timeout_config = TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .operation_timeout(Duration::from_secs(60))
+                .operation_attempt_timeout(Duration::from_secs(20))
+                .build();
+            (
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                retry_config,
+                timeout_config,
+            )
+        };
 
     // 构建配置
     let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
@@ -64,14 +90,31 @@ pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
 
     S3_CLIENT
         .set(client)
-        .map_err(|_| anyhow::anyhow!("设置 S3 客户端失败，可能已被其他线程初始化"))?;
+        .map_err(|_| anyhow::anyhow!("内部错误: 设置 S3 客户端失败，可能已被其他线程初始化"))?;
+
+    // 服务端预热
+    if config_override.is_none() {
+        let client_to_warm_up = S3_CLIENT.get().unwrap();
+        let _ = client_to_warm_up
+            .put_object()
+            .bucket(BUCKET_NAME)
+            .key("0")
+            .body(s3::primitives::ByteStream::from(Vec::new()))
+            .send()
+            .await;
+        let _ = client_to_warm_up
+            .delete_object()
+            .bucket(BUCKET_NAME)
+            .key("0")
+            .send()
+            .await;
+    }
+
     Ok(())
 }
 
 fn get_s3_client() -> Result<&'static s3::Client> {
-    S3_CLIENT
-        .get()
-        .context("S3 客户端尚未初始化。请在程序启动时调用 init_s3_client。")
+    S3_CLIENT.get().context("内部错误: S3 客户端尚未初始化")
 }
 
 pub async fn list_buckets() -> Result<Vec<String>> {
@@ -172,7 +215,7 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
 
                 // 如果错误不是 BucketNotEmpty，或者无法解析为服务错误，
                 // 则认为是一个无法处理的致命错误，打印并返回。
-                error!("删除存储桶时发生无法处理的错误: {:?}", sdk_error);
+                error!("内部错误: 删除存储桶时发生无法处理的错误: {:?}", sdk_error);
                 return Err(sdk_error.into());
             }
         }
@@ -181,15 +224,74 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
     Ok(())
 }
 
+// TODO：上传与下载的完整性验证
+const MAX_RETRIES: u32 = 6;
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+
 pub async fn get_object(key: &str) -> Result<Bytes> {
     let client = get_s3_client()?;
-    let resp = client
-        .get_object()
-        .bucket(BUCKET_NAME)
-        .key(key)
-        .send()
-        .await?;
-    Ok(resp.body.collect().await?.into_bytes())
+    let get_object_override_config = aws_sdk_s3::config::Builder::default()
+        .retry_config(RetryConfig::disabled())
+        .timeout_config(TimeoutConfig::disabled());
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..MAX_RETRIES {
+        let result: Result<Result<Bytes, anyhow::Error>, Elapsed> =
+            timeout(ATTEMPT_TIMEOUT, async {
+                let resp = client
+                    .get_object()
+                    .bucket(BUCKET_NAME)
+                    .key(key)
+                    .customize()
+                    .config_override(get_object_override_config.clone())
+                    .send()
+                    .await
+                    .context("S3 get_object API call failed")?;
+                let body = resp
+                    .body
+                    .collect()
+                    .await
+                    .context("Failed to collect S3 object body during download")?;
+
+                Ok(body.into_bytes())
+            })
+            .await;
+
+        match result {
+            Ok(Ok(bytes)) => {
+                if attempt > 0 {
+                    warn!("分块 #{} 第 {} 次重试成功", key, attempt);
+                }
+                return Ok(bytes);
+            }
+            Ok(Err(e)) => {
+                last_error = Some(e.context("S3 operation failed internally"));
+            }
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Operation timed out after {:?}",
+                    ATTEMPT_TIMEOUT
+                ));
+            }
+        }
+
+        // 如果不是最后一次尝试，就打印日志并等待
+        if attempt < MAX_RETRIES - 1 {
+            warn!(
+                "分块 #{} 下载超时，开始第 {}/{} 次重试...",
+                key,
+                attempt + 1, // 刚刚失败的是哪一次尝试
+                MAX_RETRIES - 1,
+            );
+            sleep(RETRY_DELAY).await;
+        }
+    }
+    Err(last_error.unwrap().context(format!(
+        "Failed to get object '{}' after {} attempts",
+        key,
+        MAX_RETRIES - 1
+    )))
 }
 
 pub async fn put_object(key: &str, data: Vec<u8>) -> Result<()> {

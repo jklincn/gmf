@@ -11,7 +11,7 @@ use config::{Config, ConfigError};
 use env_logger::{Builder, Env};
 use gmf_common::r2;
 use log::{error, warn};
-use std::io::Write;
+use std::{io::Write, time::SystemTime};
 use tokio::signal;
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
@@ -72,7 +72,20 @@ fn set_log() {
     let log_level = if args.verbose { "info" } else { "warn" };
     let env = Env::default().default_filter_or(log_level);
     Builder::from_env(env)
-        .format(|buf, record| writeln!(buf, "{}", record.args()))
+        .format(|buf, record| {
+            let time_str =
+                if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                    let timestamp = duration.as_secs() + 8 * 3600;
+                    let hours = (timestamp / 3600) % 24;
+                    let minutes = (timestamp / 60) % 60;
+                    let seconds = timestamp % 60;
+                    format!("{hours:02}:{minutes:02}:{seconds:02}")
+                } else {
+                    "--:--:--".to_string()
+                };
+
+            writeln!(buf, "[{}] [{}] {}", time_str, record.level(), record.args())
+        })
         .init();
 }
 
@@ -124,7 +137,7 @@ async fn main() -> Result<()> {
         // 分支 1: 正常执行业务逻辑
         res = async {
             session
-                .setup(&args.path, args.chunk_size)
+                .setup(&args.path, args.chunk_size,args.verbose)
                 .await?;
             session.start().await?;
             Ok(())
@@ -134,7 +147,7 @@ async fn main() -> Result<()> {
 
         // 分支 2: 监听 Ctrl+C 信号
         _ = signal::ctrl_c() => {
-            warn!("⛔ 收到 Ctrl+C 信号，正在清理...");
+            warn!("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
             Ok(())
         }
     };

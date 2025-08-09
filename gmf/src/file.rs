@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
 };
 use xxhash_rust::xxh3::xxh3_64;
@@ -234,6 +234,7 @@ impl GMFFile {
 struct DecryptedChunk {
     id: u64,
     data: Vec<u8>,
+    permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug)]
@@ -246,6 +247,7 @@ pub struct GmfSession {
     gmf_file: Arc<Mutex<GMFFile>>,
     decrypted_tx: mpsc::Sender<DecryptedChunk>,
     writer_handle: JoinHandle<Result<()>>,
+    buffer_semaphore: Arc<Semaphore>,
 }
 
 impl GmfSession {
@@ -255,9 +257,9 @@ impl GmfSession {
         progress_bar: Arc<AllProgressBar>,
     ) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
+        let buffer_semaphore = Arc::new(Semaphore::new(10));
 
         let chunk_count = gmf_file.total_chunks();
-
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
         let writer_handle = tokio::spawn(writer(
@@ -272,21 +274,37 @@ impl GmfSession {
             gmf_file: gmf_file_arc,
             decrypted_tx,
             writer_handle,
+            buffer_semaphore,
         }
     }
 
     /// 负责下载分块与解密，写入交由写入器操作
     pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
-        info!("开始处理分块 {chunk_id}");
+        let permit = match self.buffer_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                // 如果信号量被关闭，则无法获取许可，说明程序正在退出。
+                return ChunkResult::Failure(
+                    chunk_id,
+                    anyhow!("内部错误: 无法获取信号量许可，会话已关闭"),
+                );
+            }
+        };
+
+        info!("开始处理分块 #{chunk_id}");
         let decrypted_tx = self.decrypted_tx.clone();
 
         // 所有错误都统一折叠成 anyhow::Result，最后再转换为 ChunkResult
         let result: anyhow::Result<()> = async {
             // 下载分块
+            let start_time = std::time::Instant::now();
             let content = r2::get_object(&chunk_id.to_string())
                 .await
-                .with_context(|| format!("从 r2 获取分块 {chunk_id} 数据失败"))?;
-
+                .with_context(|| format!("从 r2 下载分块 #{chunk_id} 失败"))?;
+            info!(
+                "分块 #{chunk_id} 下载完成，耗时: {:.2?}",
+                start_time.elapsed()
+            );
             // 解密（阻塞运算放到 blocking 线程池）
             let plain_data = tokio::task::spawn_blocking(move || {
                 let key_bytes = general_purpose::STANDARD
@@ -310,14 +328,14 @@ impl GmfSession {
                 .await
                 .context("删除已下载的分块对象失败")?;
 
-            // 将明文发送给写入器
             decrypted_tx
                 .send(DecryptedChunk {
                     id: chunk_id,
                     data: plain_data,
+                    permit,
                 })
                 .await
-                .map_err(|e| anyhow!("发送解密数据给写入器失败: {e}"))?;
+                .map_err(|e| anyhow!("内部错误: 发送解密数据给写入器失败: {e}"))?;
 
             Ok(())
         }
@@ -332,83 +350,85 @@ impl GmfSession {
 
     /// 等待所有已派发的任务完成，并关闭写入器。
     pub async fn wait_for_completion(self) -> Result<()> {
-        // 1. 通知写入器不会再有新数据了
+        // 1) 关闭发送端，让 writer 知道不会再有新的 chunk 传来。
         drop(self.decrypted_tx);
 
-        // 2. 等待写入器任务完成，确保所有分块都已写入磁盘
+        // 2) 关闭信号量，这样任何还在等待 acquire 的任务都会立即出错并退出。
+        self.buffer_semaphore.close();
+
+        // 3) 等待 writer 任务处理完所有已在通道中的数据并退出。
         match self.writer_handle.await {
-            Ok(Ok(_)) => { /* 写入器成功退出 */ }
-            Ok(Err(e)) => return Err(e), // 写入器任务内部返回错误
-            Err(e) => return Err(anyhow!("写入器任务 panic: {}", e)), // 写入器任务本身 panic
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow!("内部错误: 写入器任务 panic: {}", e)),
         }
 
-        // 3. 获取 GMFFile 的所有权，准备进行最终处理
-        // Arc::try_unwrap 确保我们是 Arc 的唯一所有者，如果不是则表示有逻辑错误
+        // 4) 取回 GMFFile 的所有权
         let gmf_mutex = Arc::try_unwrap(self.gmf_file)
-            .map_err(|_| anyhow!("无法获取 GMFFile 的唯一所有权，可能存在悬空引用"))?;
+            .map_err(|_| anyhow!("内部错误:无法获取 GMFFile 的唯一所有权，可能存在悬空引用"))?;
         let gmf_file = gmf_mutex.into_inner();
 
-        // 4. 在一个阻塞任务中执行所有同步的文件 I/O 操作
-        tokio::task::spawn_blocking(move || finalize_and_verify_file(gmf_file))
-            .await
-            .context("文件最终化任务 panic")??; // 第一个?处理JoinError, 第二个?处理内部Result
+        // 5) 在阻塞线程池里处理最终文件
+        tokio::task::spawn_blocking(move || {
+            let temp_path = &gmf_file.temp_path;
+            let target_filename = &gmf_file.file_name;
+
+            // 显式 drop，确保后续可以截断/重命名
+            drop(gmf_file.file);
+
+            {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(temp_path)
+                    .with_context(|| format!("无法重新打开临时文件 '{temp_path:?}' 进行最终化"))?;
+
+                let total_size = file.metadata()?.len();
+                if total_size < HEADER_SIZE {
+                    bail!("临时文件大小异常，小于文件头大小");
+                }
+                let content_size = total_size - HEADER_SIZE;
+
+                let mut buffer = vec![0; 8192];
+                let mut read_pos = HEADER_SIZE;
+                let mut write_pos = 0;
+                while read_pos < total_size {
+                    let bytes_to_read =
+                        std::cmp::min(buffer.len() as u64, total_size - read_pos) as usize;
+                    file.seek(SeekFrom::Start(read_pos))?;
+                    file.read_exact(&mut buffer[..bytes_to_read])?;
+                    file.seek(SeekFrom::Start(write_pos))?;
+                    file.write_all(&buffer[..bytes_to_read])?;
+                    read_pos += bytes_to_read as u64;
+                    write_pos += bytes_to_read as u64;
+                }
+
+                file.set_len(content_size).context("截断临时文件失败")?;
+            }
+
+            fs::rename(temp_path, target_filename).with_context(|| {
+                format!("重命名文件从 '{temp_path:?}' 到 '{target_filename}' 失败")
+            })?;
+
+            Ok(())
+        })
+        .await
+        .context("内部错误: 文件最终处理失败")??;
 
         Ok(())
     }
 }
 
-fn finalize_and_verify_file(gmf_file: GMFFile) -> Result<()> {
-    let temp_path = &gmf_file.temp_path;
-    let target_filename = &gmf_file.file_name;
-
-    // 显式 drop 文件句柄，以便后续可以安全地进行截断和重命名
-    drop(gmf_file.file);
-
-    {
-        // 使用新的作用域来管理文件句柄
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(temp_path)
-            .with_context(|| format!("无法重新打开临时文件 '{temp_path:?}' 进行最终化"))?;
-
-        let total_size = file.metadata()?.len();
-        if total_size < HEADER_SIZE {
-            bail!("临时文件大小异常，小于文件头大小");
-        }
-        let content_size = total_size - HEADER_SIZE;
-
-        let mut buffer = vec![0; 8192];
-        let mut read_pos = HEADER_SIZE;
-        let mut write_pos = 0;
-        while read_pos < total_size {
-            let bytes_to_read = std::cmp::min(buffer.len() as u64, total_size - read_pos) as usize;
-            file.seek(SeekFrom::Start(read_pos))?;
-            file.read_exact(&mut buffer[..bytes_to_read])?;
-            file.seek(SeekFrom::Start(write_pos))?;
-            file.write_all(&buffer[..bytes_to_read])?;
-            read_pos += bytes_to_read as u64;
-            write_pos += bytes_to_read as u64;
-        }
-
-        file.set_len(content_size).context("截断临时文件失败")?;
-    }
-
-    fs::rename(temp_path, target_filename)
-        .with_context(|| format!("重命名文件从 '{temp_path:?}' 到 '{target_filename}' 失败"))?;
-
-    Ok(())
-}
-
 // 后台“写入器”任务
 async fn writer(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
+    // 修改：接收新的 DecryptedChunk 结构体
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
     completed_chunks: u64,
     chunk_count: u64,
     progress_bar: Arc<AllProgressBar>,
 ) -> Result<()> {
-    let mut buffer = BTreeMap::new();
+    let mut buffer: BTreeMap<u64, (Vec<u8>, OwnedSemaphorePermit)> = BTreeMap::new();
     let mut next_chunk_to_write = completed_chunks;
     let mut remaining_chunks = chunk_count - completed_chunks;
 
@@ -419,9 +439,12 @@ async fn writer(
             continue;
         }
 
-        buffer.insert(chunk.id, chunk.data);
+        // 将数据和许可一起存入缓冲区
+        buffer.insert(chunk.id, (chunk.data, chunk.permit));
 
-        while let Some(data_to_write) = buffer.remove(&next_chunk_to_write) {
+        // 尝试按顺序写入所有已缓冲的块
+        while let Some(data_to_write_tuple) = buffer.remove(&next_chunk_to_write) {
+            let (data_to_write, permit_to_release) = data_to_write_tuple;
             {
                 let mut gmf = gmf_file_arc.lock().await;
                 gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
@@ -432,7 +455,8 @@ async fn writer(
             if remaining_chunks == 0 {
                 progress_bar.finish_download();
             }
-            progress_bar.log_debug(&format!("已成功写入分块 {}", next_chunk_to_write - 1));
+            progress_bar.log_info(&format!("已成功写入分块 #{}", next_chunk_to_write - 1));
+            drop(permit_to_release);
         }
     }
 
@@ -443,6 +467,5 @@ async fn writer(
             missing_chunks.join(", ")
         );
     }
-    progress_bar.log_debug("所有分块处理完毕");
     Ok(())
 }
