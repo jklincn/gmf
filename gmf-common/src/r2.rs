@@ -225,73 +225,44 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
 }
 
 // TODO：上传与下载的完整性验证
-const MAX_RETRIES: u32 = 6;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
-const RETRY_DELAY: Duration = Duration::from_millis(500);
-
 pub async fn get_object(key: &str) -> Result<Bytes> {
     let client = get_s3_client()?;
     let get_object_override_config = aws_sdk_s3::config::Builder::default()
         .retry_config(RetryConfig::disabled())
         .timeout_config(TimeoutConfig::disabled());
 
-    let mut last_error: Option<anyhow::Error> = None;
-    for attempt in 0..MAX_RETRIES {
-        let result: Result<Result<Bytes, anyhow::Error>, Elapsed> =
-            timeout(ATTEMPT_TIMEOUT, async {
-                let resp = client
-                    .get_object()
-                    .bucket(BUCKET_NAME)
-                    .key(key)
-                    .customize()
-                    .config_override(get_object_override_config.clone())
-                    .send()
-                    .await
-                    .context("S3 get_object API call failed")?;
-                let body = resp
-                    .body
-                    .collect()
-                    .await
-                    .context("Failed to collect S3 object body during download")?;
+    // 手动控制下载 20 秒超时
+    match timeout(ATTEMPT_TIMEOUT, async {
+        let resp = client
+            .get_object()
+            .bucket(BUCKET_NAME)
+            .key(key)
+            .customize()
+            .config_override(get_object_override_config.clone())
+            .send()
+            .await?;
 
-                Ok(body.into_bytes())
-            })
-            .await;
+        let body = resp
+            .body
+            .collect()
+            .await
+            .context("Failed to collect S3 object body during download")?;
 
-        match result {
-            Ok(Ok(bytes)) => {
-                if attempt > 0 {
-                    warn!("分块 #{} 第 {} 次重试成功", key, attempt);
-                }
-                return Ok(bytes);
-            }
-            Ok(Err(e)) => {
-                last_error = Some(e.context("S3 operation failed internally"));
-            }
-            Err(_) => {
-                last_error = Some(anyhow::anyhow!(
-                    "Operation timed out after {:?}",
-                    ATTEMPT_TIMEOUT
-                ));
-            }
-        }
-
-        // 如果不是最后一次尝试，就打印日志并等待
-        if attempt < MAX_RETRIES - 1 {
-            warn!(
-                "分块 #{} 下载超时，开始第 {}/{} 次重试...",
-                key,
-                attempt + 1, // 刚刚失败的是哪一次尝试
-                MAX_RETRIES - 1,
-            );
-            sleep(RETRY_DELAY).await;
-        }
+        Ok(body.into_bytes())
+    })
+    .await
+    {
+        // 超时
+        Err(_) => Err(anyhow::anyhow!(
+            "Operation timed out after {:?}",
+            ATTEMPT_TIMEOUT
+        )),
+        // 未超时，但内部有错误
+        Ok(Err(e)) => Err(e),
+        // 成功
+        Ok(Ok(bytes)) => Ok(bytes),
     }
-    Err(last_error.unwrap().context(format!(
-        "Failed to get object '{}' after {} attempts",
-        key,
-        MAX_RETRIES - 1
-    )))
 }
 
 pub async fn put_object(key: &str, data: Vec<u8>) -> Result<()> {

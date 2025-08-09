@@ -13,6 +13,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
@@ -283,7 +284,6 @@ impl GmfSession {
         let permit = match self.buffer_semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
-                // 如果信号量被关闭，则无法获取许可，说明程序正在退出。
                 return ChunkResult::Failure(
                     chunk_id,
                     anyhow!("内部错误: 无法获取信号量许可，会话已关闭"),
@@ -294,18 +294,59 @@ impl GmfSession {
         info!("开始处理分块 #{chunk_id}");
         let decrypted_tx = self.decrypted_tx.clone();
 
-        // 所有错误都统一折叠成 anyhow::Result，最后再转换为 ChunkResult
         let result: anyhow::Result<()> = async {
-            // 下载分块
             let start_time = std::time::Instant::now();
-            let content = r2::get_object(&chunk_id.to_string())
-                .await
-                .with_context(|| format!("从 r2 下载分块 #{chunk_id} 失败"))?;
+
+            // 下载分块
+            // TODO：二次重试队列
+            let content = {
+                const MAX_ATTEMPTS: u32 = 4; // 总共尝试4次，重试3次
+                const RETRY_DELAY: Duration = Duration::from_millis(500); // 每次重试间隔500毫秒
+                let mut last_error: Option<anyhow::Error> = None;
+                let mut attempt = 0;
+                loop {
+                    if attempt >= MAX_ATTEMPTS {
+                        break Err(last_error.unwrap().context(format!(
+                            "Failed to get object '{}' after {} attempts",
+                            chunk_id,
+                            MAX_ATTEMPTS - 1
+                        )));
+                    }
+                    match r2::get_object(&chunk_id.to_string()).await {
+                        Ok(bytes) => {
+                            if attempt > 0 {
+                                warn!(
+                                    "分块 #{} 在第 {}/{} 次尝试中成功",
+                                    chunk_id,
+                                    attempt + 1,
+                                    MAX_ATTEMPTS
+                                );
+                            }
+                            break Ok(bytes);
+                        }
+                        Err(e) => {
+                            last_error = Some(e);
+                            if attempt < MAX_ATTEMPTS - 1 {
+                                warn!(
+                                    "分块 #{} 第 {}/{} 次尝试失败，准备重试...",
+                                    chunk_id,
+                                    attempt + 1,
+                                    MAX_ATTEMPTS - 1
+                                );
+                                tokio::time::sleep(RETRY_DELAY).await;
+                            }
+                        }
+                    }
+                    attempt += 1;
+                }
+            }?;
+
             info!(
                 "分块 #{chunk_id} 下载完成，耗时: {:.2?}",
                 start_time.elapsed()
             );
-            // 解密（阻塞运算放到 blocking 线程池）
+
+            // 解密分块
             let plain_data = tokio::task::spawn_blocking(move || {
                 let key_bytes = general_purpose::STANDARD
                     .decode(passphrase_b64)
@@ -323,11 +364,12 @@ impl GmfSession {
             .await
             .context("解密任务本身发生错误（例如 panic）")??;
 
-            // 删除已下载对象
+            // 删除 R2 中已下载的分块
             r2::delete_object(&chunk_id.to_string())
                 .await
                 .context("删除已下载的分块对象失败")?;
 
+            // 将解密后分块发送到写入器
             decrypted_tx
                 .send(DecryptedChunk {
                     id: chunk_id,
@@ -341,7 +383,6 @@ impl GmfSession {
         }
         .await;
 
-        // 返回统一的 ChunkResult
         match result {
             Ok(_) => ChunkResult::Success(chunk_id),
             Err(e) => ChunkResult::Failure(chunk_id, e),
