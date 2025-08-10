@@ -8,10 +8,7 @@ mod ui;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use config::{Config, ConfigError};
-use env_logger::{Builder, Env};
 use gmf_common::r2;
-use log::error;
-use std::io::Write;
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
 fn parse_chunk_size(s: &str) -> Result<u64> {
@@ -66,20 +63,6 @@ struct Args {
     verbose: bool,
 }
 
-// TODO：把 warn 换成 info，info 换成 debug（主要是屏蔽其他模块的debug）
-fn set_log() {
-    let args = Args::parse();
-    let log_level = if args.verbose { "info" } else { "warn" };
-    let env = Env::default().default_filter_or(log_level);
-
-    Builder::from_env(env)
-        .format(|buf, record| {
-            let time_str = chrono::Local::now().format("%H:%M:%S");
-            writeln!(buf, "[{}] [{}] {}", time_str, record.level(), record.args())
-        })
-        .init();
-}
-
 async fn set_r2(cfg: &Config) -> Result<()> {
     let s3_config = r2::S3Config {
         endpoint: cfg.endpoint.clone(),
@@ -94,8 +77,7 @@ async fn set_r2(cfg: &Config) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    set_log();
+    ui::init_global_logger(args.verbose)?;
 
     let cfg_result = ui::run_with_spinner(
         "正在加载配置文件...",
@@ -128,7 +110,7 @@ async fn main() -> Result<()> {
         // 分支 1: 正常执行业务逻辑
         res = async {
             session
-                .setup(&args.path, args.chunk_size,args.verbose)
+                .setup(&args.path, args.chunk_size)
                 .await?;
             session.start().await?;
             Ok(())
@@ -138,23 +120,25 @@ async fn main() -> Result<()> {
 
         // 分支 2: 监听 Ctrl+C 信号
         _ = tokio::signal::ctrl_c() => {
+            ui::abandon_download();
             ui::log_warn("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
             Ok(())
         }
     };
 
     if let Err(e) = &result {
-        error!("发生错误: {e:#}");
+        ui::log_error(&format!("发生错误: {e:#}"));
     }
 
     // 无论主逻辑是否成功，都执行清理操作
     if let Err(e) = session.shutdown().await {
-        error!("清理过程中发生错误: {e:#}");
+        ui::log_error(&format!("清理过程中发生错误: {e:#}"));
     }
 
     // 清理 Bucket
     if let Err(e) = r2::delete_bucket_with_retry().await {
-        error!("清理 Bucket 时发生错误: {e:#}");
+        ui::log_error(&format!("清理 Bucket 时发生错误: {e:#}"));
     }
+
     Ok(())
 }

@@ -11,7 +11,6 @@ base64 = "0.22.1"
 bytes = "1.10.1"
 chrono = "0.4.41"
 clap = { version = "4.5.41", features = ["derive"] }
-env_logger = "0.11.8"
 futures = "0.3.31"
 futures-util = "0.3.31"
 gmf-common = { path = "../gmf-common" }

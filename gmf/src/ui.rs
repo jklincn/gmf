@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -12,63 +13,108 @@ pub enum LogLevel {
     Error = 0,
     Warn = 1,
     Info = 2,
+    Debug = 3,
+}
+
+#[repr(u8)]
+enum ProgressBarState {
+    NotStarted = 0,
+    Running = 1,
+    Finished = 2,
 }
 
 pub struct AllProgressBar {
     log_level: LogLevel,
     mp: MultiProgress,
-    download: ProgressBar,
+    download: OnceCell<ProgressBar>,
+    state: AtomicU8,
 }
 
 impl AllProgressBar {
-    fn new(total_chunks: u64, completed_chunks: u64, log_level: LogLevel) -> Result<Self> {
-        let mp: MultiProgress = MultiProgress::new();
-        let download = mp.add(ProgressBar::new(total_chunks));
+    fn new(log_level: LogLevel) -> Self {
+        AllProgressBar {
+            log_level,
+            mp: MultiProgress::new(),
+            download: OnceCell::new(),
+            state: AtomicU8::new(ProgressBarState::NotStarted as u8),
+        }
+    }
 
-        download.set_style(
+    fn init_download_bar(&self, total_chunks: u64, completed_chunks: u64) -> Result<()> {
+        let download_bar = self.mp.add(ProgressBar::new(total_chunks));
+
+        download_bar.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .template("{spinner:.green}  [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
-        download.set_position(completed_chunks);
-        Ok(AllProgressBar {
-            log_level,
-            mp,
-            download,
-        })
+        download_bar.set_position(completed_chunks);
+
+        self.download
+            .set(download_bar)
+            .map_err(|_| anyhow::anyhow!("下载进度条已经初始化过了"))?;
+
+        Ok(())
+    }
+
+    fn get_download_bar(&self) -> &ProgressBar {
+        self.download
+            .get()
+            .expect("下载进度条(download)未初始化，请先调用 init_global_download_bar")
     }
 
     pub fn update_download(&self) {
-        self.download.inc(1);
+        self.get_download_bar().inc(1);
     }
 
     pub fn finish_download(&self) {
-        self.download.finish();
+        self.get_download_bar().finish();
+        self.state
+            .store(ProgressBarState::Finished as u8, Ordering::SeqCst);
     }
 
     pub fn abandon_download(&self) {
-        self.download.abandon();
+        self.get_download_bar().abandon();
+        self.state
+            .store(ProgressBarState::Finished as u8, Ordering::SeqCst);
     }
 
     pub fn start_tick(&self) {
-        self.download.enable_steady_tick(Duration::from_millis(500));
+        self.state
+            .store(ProgressBarState::Running as u8, Ordering::SeqCst);
+        self.get_download_bar()
+            .enable_steady_tick(Duration::from_millis(500));
     }
 
     fn println(&self, msg: &str) {
-        self.mp.println(msg).unwrap_or_else(|_| {
-            println!("{msg}");
-        });
+        let current_state = self.state.load(Ordering::SeqCst);
+
+        match current_state {
+            s if s == ProgressBarState::Running as u8 => {
+                self.mp.println(msg).unwrap_or_else(|_| {
+                    println!("{msg}");
+                });
+            }
+            _ => {
+                println!("{msg}");
+            }
+        }
     }
 
     fn log(&self, level: LogLevel, msg: &str) {
         if level <= self.log_level {
-            let level_str = match level {
-                LogLevel::Error => "[ERROR]",
-                LogLevel::Warn => "[WARN]",
-                LogLevel::Info => "[INFO]",
-            };
-            let timestamp_str = chrono::Local::now().format("%H:%M:%S");
-            self.println(&format!("[{timestamp_str}] {level_str} {msg}"));
+            if level == LogLevel::Info {
+                self.println(&format!("{msg}"));
+            } else {
+                let level_str = match level {
+                    LogLevel::Error => "[ERROR]",
+                    LogLevel::Warn => "[WARN]",
+                    LogLevel::Info => "[INFO]",
+                    LogLevel::Debug => "[DEBUG]",
+                };
+                let timestamp_str = chrono::Local::now().format("%H:%M:%S%.3f");
+                self.println(&format!("[{timestamp_str}] [{level_str}] {msg}"));
+            }
         }
     }
 
@@ -83,19 +129,26 @@ impl AllProgressBar {
     pub fn log_info(&self, msg: &str) {
         self.log(LogLevel::Info, msg);
     }
+    pub fn log_debug(&self, msg: &str) {
+        self.log(LogLevel::Debug, msg);
+    }
 }
 
-// 初始化全局进度条
-pub fn init_global_progress_bar(
-    total_chunks: u64,
-    completed_chunks: u64,
-    log_level: LogLevel,
-) -> Result<()> {
-    let progress_bar = AllProgressBar::new(total_chunks, completed_chunks, log_level)?;
+pub fn init_global_logger(verbose: bool) -> Result<()> {
+    let log_level = if verbose {
+        LogLevel::Debug
+    } else {
+        LogLevel::Info
+    };
+    let progress_bar = AllProgressBar::new(log_level);
     G_PROGRESS_BAR
         .set(progress_bar)
-        .map_err(|_| anyhow::anyhow!("全局进度条已经初始化过了"))?;
+        .map_err(|_| anyhow::anyhow!("全局日志/进度条模块已经初始化过了"))?;
     Ok(())
+}
+
+pub fn init_global_download_bar(total_chunks: u64, completed_chunks: u64) -> Result<()> {
+    global().init_download_bar(total_chunks, completed_chunks)
 }
 
 pub fn start_tick() {
@@ -112,6 +165,11 @@ pub fn finish_download() {
 
 pub fn abandon_download() {
     global().abandon_download();
+}
+
+#[allow(unused)]
+pub fn log_debug(msg: &str) {
+    global().log_debug(msg);
 }
 
 #[allow(unused)]
@@ -132,7 +190,7 @@ pub fn log_error(msg: &str) {
 fn global() -> &'static AllProgressBar {
     G_PROGRESS_BAR
         .get()
-        .expect("全局进度条(G_PROGRESS_BAR)未初始化，请先调用 init_global_progress_bar")
+        .expect("全局日志/进度条(G_PROGRESS_BAR)未初始化，请先调用 init_global_logger")
 }
 
 pub struct Spinner {

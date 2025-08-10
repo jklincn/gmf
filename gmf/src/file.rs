@@ -6,7 +6,6 @@ use aes_gcm::{
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use gmf_common::{consts::NONCE_SIZE, r2};
-use log::{info, warn};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -94,17 +93,17 @@ impl GMFFile {
             match Self::open(&temp_filename, file_size, total_chunks, file_name) {
                 Ok(gmf_file) => {
                     let completed_chunks = gmf_file.header.completed_chunks;
-                    warn!("➡️ 继续未完成的下载任务");
+                    ui::log_info("➡️ 继续未完成的下载任务");
                     return Ok((gmf_file, completed_chunks));
                 }
                 Err(e) => {
-                    warn!("发现旧的临时文件，但验证失败：{e}。将重新创建。");
+                    ui::log_warn(&format!("发现旧的临时文件，但验证失败：{e}。将重新创建。"));
                     fs::remove_file(&temp_filename).context("删除无效的临时文件失败")?;
                 }
             }
         }
 
-        info!("创建新的临时文件: {}", temp_filename.display());
+        ui::log_debug(&format!("创建新的临时文件: {}", temp_filename.display()));
         let gmf_file = Self::create(&temp_filename, file_size, total_chunks, file_name)?;
         Ok((gmf_file, 0))
     }
@@ -287,7 +286,7 @@ impl GmfSession {
             }
         };
 
-        ui::log_info(&format!("开始处理分块 #{chunk_id}"));
+        ui::log_debug(&format!("开始处理分块 #{chunk_id}"));
         let decrypted_tx = self.decrypted_tx.clone();
 
         let result: anyhow::Result<()> = async {
@@ -335,7 +334,7 @@ impl GmfSession {
                 }
             }?;
 
-            ui::log_info(&format!(
+            ui::log_debug(&format!(
                 "分块 #{chunk_id} 下载完成，耗时: {:.2?}",
                 start_time.elapsed()
             ));
@@ -468,7 +467,7 @@ async fn writer(
     while let Some(chunk) = decrypted_rx.recv().await {
         // 如果收到的块是已经写入过的，直接丢弃
         if chunk.id < next_chunk_to_write {
-            ui::log_info(&format!("收到已处理过的分块 #{}，直接丢弃", chunk.id));
+            ui::log_warn(&format!("收到已处理过的分块 #{}，直接丢弃", chunk.id));
             continue;
         }
 
@@ -482,13 +481,13 @@ async fn writer(
                 let mut gmf = gmf_file_arc.lock().await;
                 gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
             }
+            ui::log_debug(&format!("已成功写入分块 #{}", next_chunk_to_write));
             ui::update_download();
             next_chunk_to_write += 1;
             remaining_chunks -= 1;
             if remaining_chunks == 0 {
                 ui::finish_download();
             }
-            ui::log_info(&format!("已成功写入分块 #{}", next_chunk_to_write - 1));
             drop(permit_to_release);
         }
     }

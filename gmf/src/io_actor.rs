@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use gmf_common::interface::{ClientRequest, Message, ServerResponse};
-use log::error;
 use russh::{Channel, ChannelMsg, client::Msg as ClientMsg};
 use tokio::sync::mpsc;
+
+use crate::ui;
 
 /// IoActor 负责所有底层的 SSH I/O 操作。
 pub struct IoActor {
@@ -40,14 +41,14 @@ impl IoActor {
                     match cmd_result {
                         Some(request) => {
                             if self.handle_request(request).await.is_err() {
-                                error!("发送命令失败, I/O Actor 退出。");
+                                ui::log_error("发送命令失败, I/O Actor 退出。");
                                 break;
                             }
                         }
                         None => {
                             command_channel_closed = true;
                             if let Err(e) = self.ssh_channel.eof().await {
-                                error!("发送 EOF 失败: {e:?}");
+                                ui::log_error(&format!("发送 EOF 失败: {e:?}"));
                                 break;
                             }
                         }
@@ -103,7 +104,7 @@ impl IoActor {
                                 return false;
                             }
                         }
-                        _ => error!("收到无效或非响应类型的消息: {line_str}"),
+                        _ => ui::log_error(&format!("收到无效或非响应类型的消息: {line_str}")),
                     }
                 }
             }

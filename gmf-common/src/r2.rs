@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use aws_config::{self, BehaviorVersion, Region, retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_s3::{self as s3, config::Credentials, error::ProvideErrorMetadata};
 use bytes::Bytes;
-use log::error;
 use std::{env, time::Duration};
 use tokio::{
     sync::OnceCell,
@@ -212,10 +211,6 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
                         continue; // 继续下一次循环
                     }
                 }
-
-                // 如果错误不是 BucketNotEmpty，或者无法解析为服务错误，
-                // 则认为是一个无法处理的致命错误，打印并返回。
-                error!("内部错误: 删除存储桶时发生无法处理的错误: {sdk_error:?}");
                 return Err(sdk_error.into());
             }
         }

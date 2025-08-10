@@ -5,7 +5,6 @@ use crate::ssh;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use gmf_common::{interface::*, utils::format_size};
-use log::{error, info, warn};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::mpsc,
@@ -86,7 +85,7 @@ impl InteractiveSession {
         // 检查远程环境并获取 SSH 会话和远程程序路径
         let (mut ssh_session, remote_path) = check_remote(config).await?;
 
-        info!("正在启动 gmf-remote...");
+        ui::log_debug("正在启动 gmf-remote...");
         let command = format!(
             "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' LOG='{}' {}",
             config.endpoint,
@@ -101,7 +100,7 @@ impl InteractiveSession {
             .await?
         {
             ssh::CallResult::Interactive(channel) => {
-                info!("gmf-remote 已成功启动");
+                ui::log_debug("gmf-remote 已成功启动");
                 channel
             }
             ssh::CallResult::Once((code, out)) => {
@@ -130,11 +129,11 @@ impl InteractiveSession {
         })
     }
 
-    pub async fn setup(&mut self, file_path: &str, chunk_size: u64, verbose: bool) -> Result<()> {
+    pub async fn setup(&mut self, file_path: &str, chunk_size: u64) -> Result<()> {
         // 先接收一个 Ready 响应，表示远程程序已准备就绪
         match self.next_response().await? {
             Some(ServerResponse::Ready) => {
-                info!("远程程序已准备就绪");
+                ui::log_debug("远程程序已准备就绪");
             }
             Some(other_response) => {
                 return Err(anyhow!(
@@ -164,7 +163,7 @@ impl InteractiveSession {
                 );
 
                 spinner.finish(&success_msg);
-                self.initialize_session(setup_response, verbose)?;
+                self.initialize_session(setup_response)?;
             }
 
             Ok(Some(ServerResponse::InvalidRequest(msg))) => {
@@ -206,22 +205,14 @@ impl InteractiveSession {
         Ok(())
     }
 
-    fn initialize_session(&mut self, setup_response: SetupResponse, verbose: bool) -> Result<()> {
+    fn initialize_session(&mut self, setup_response: SetupResponse) -> Result<()> {
         let (gmf_file, completed_chunks) = GMFFile::new_or_resume(
             &setup_response.file_name,
             setup_response.file_size,
             setup_response.total_chunks,
         )?;
 
-        ui::init_global_progress_bar(
-            setup_response.total_chunks,
-            completed_chunks,
-            if verbose {
-                ui::LogLevel::Info
-            } else {
-                ui::LogLevel::Warn
-            },
-        )?;
+        ui::init_global_download_bar(setup_response.total_chunks, completed_chunks)?;
 
         self.resume_from_chunk_id = completed_chunks;
         self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
@@ -239,14 +230,14 @@ impl InteractiveSession {
             resume_from_chunk_id: self.resume_from_chunk_id,
         });
 
-        ui::log_info("正在发送 Start 请求...");
+        ui::log_debug("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
 
         let remaining_size = match self.next_response().await? {
             Some(ServerResponse::StartSuccess(response)) => {
-                ui::log_info(&format!(
-                    "服务端确认，需要传输的大小为 {} 字节，开始接收分块信息...",
-                    response.remaining_size
+                ui::log_debug(&format!(
+                    "服务端确认，需要传输的大小为 {} ，开始接收分块信息...",
+                    format_size(response.remaining_size)
                 ));
                 response.remaining_size
             }
@@ -262,8 +253,7 @@ impl InteractiveSession {
 
         match loop_result {
             Ok(time) => {
-                ui::finish_download();
-                info!("等待所有本地任务完成...");
+                ui::log_debug("等待所有本地任务完成...");
 
                 let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
                     anyhow!(
@@ -273,10 +263,10 @@ impl InteractiveSession {
                 })?;
 
                 session_to_finish.wait_for_completion().await?;
-                let speed = (remaining_size as f64 / 1024.0 / 1024.0) / time.as_secs_f64();
-                let speed_str = format!("{speed:.2} MB/s");
-
-                warn!("\n⚡ 下载完成，平均传输速度: {speed_str}");
+                let bytes_per_second = remaining_size as f64 / time.as_secs_f64();
+                let speed_in_mb = bytes_per_second / (1024.0 * 1024.0);
+                let speed_str = format!("{:.2} MB/s", speed_in_mb);
+                ui::log_info(&format!("⚡ 下载完成，平均传输速度: {speed_str}"));
                 Ok(())
             }
             Err(e) => {
@@ -308,8 +298,8 @@ impl InteractiveSession {
 
         match tokio::time::timeout(Duration::from_secs(10), self.actor_handle).await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => error!("等待 I/O Actor 退出时发生错误: {e:?}"),
-            Err(_) => warn!("等待 I/O Actor 退出超时！"),
+            Ok(Err(e)) => ui::log_error(&format!("等待 I/O Actor 退出时发生错误: {e:?}")),
+            Err(_) => ui::log_warn("等待 I/O Actor 退出超时！"),
         }
 
         self.ssh_session.close().await?;
@@ -335,7 +325,7 @@ async fn event_loop(
             Some(res) = join_set.join_next() => {
                 match res {
                     Ok(ChunkResult::Success(id)) => {
-                        ui::log_info(&format!("分块 #{id} 处理成功"));
+                        ui::log_debug(&format!("分块 #{id} 处理成功"));
                     },
                     Ok(ChunkResult::Failure(id, err)) => {
                         let error_msg = format!("分块 #{id} 处理失败: {err:?}");
@@ -367,7 +357,7 @@ async fn event_loop(
                                 bail!(error_msg);
                             },
                             other => {
-                                ui::log_info(&format!("收到非关键消息: {other:?}"));
+                                ui::log_warn(&format!("收到非关键消息: {other:?}"));
                             }
                         }
                     },
