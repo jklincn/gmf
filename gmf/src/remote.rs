@@ -166,24 +166,11 @@ impl InteractiveSession {
                 spinner.finish(&success_msg);
                 self.initialize_session(setup_response)?;
             }
-
-            Ok(Some(ServerResponse::InvalidRequest(msg))) => {
-                let error_msg = format!("❌ 请求无效: {msg}");
-                spinner.abandon();
-                return Err(anyhow!(error_msg));
-            }
-            Ok(Some(ServerResponse::NotFound(msg))) => {
-                let error_msg = format!("❌ 找不到文件: {msg}");
-                spinner.abandon();
-                return Err(anyhow!(error_msg));
-            }
             Ok(Some(ServerResponse::Error(msg))) => {
                 let error_msg = format!("❌ 服务端错误: {msg}");
                 spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
-
-            // --- 发生了意外情况 ---
             Ok(Some(other_response)) => {
                 let error_msg =
                     format!("❌ 意外的响应: 收到了非预期的服务器响应 {other_response:?}");

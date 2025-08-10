@@ -32,8 +32,6 @@ pub enum ServerResponse {
     UploadCompleted,
 
     Error(String),
-    InvalidRequest(String),
-    NotFound(String),
 }
 
 impl From<ServerResponse> for Message {

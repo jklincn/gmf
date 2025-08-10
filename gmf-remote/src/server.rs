@@ -50,9 +50,8 @@ pub async fn handle_message(
     let request = match message {
         Message::Request(req) => req,
         _ => {
-            let error_response = ServerResponse::InvalidRequest(
-                "协议错误：收到了非 Request 类型的消息。".to_string(),
-            );
+            let error_response =
+                ServerResponse::Error("协议错误：收到了非 Request 类型的消息。".to_string());
             if sender.send(error_response.into()).await.is_err() {
                 error!("Channel closed. Could not send InvalidRequest error.");
             }
@@ -97,7 +96,7 @@ pub async fn handle_message(
 
 pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerResponse {
     if payload.chunk_size == 0 {
-        return ServerResponse::InvalidRequest("chunk_size 不能为 0".to_string());
+        return ServerResponse::Error("chunk_size 不能为 0".to_string());
     }
 
     if let Err(e) = init_s3_client(None).await {
@@ -108,10 +107,7 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
     let file_path: PathBuf = match file_path_str.parse() {
         Ok(p) => p,
         Err(_) => {
-            return ServerResponse::InvalidRequest(format!(
-                "提供的文件路径无效: '{}'",
-                payload.path
-            ));
+            return ServerResponse::Error(format!("提供的文件路径无效: '{}'", payload.path));
         }
     };
 
@@ -121,17 +117,14 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
         .map(|s| s.to_string());
 
     if file_name.is_none() {
-        return ServerResponse::InvalidRequest(format!(
-            "无法从路径 '{}' 中提取有效的文件名",
-            payload.path
-        ));
+        return ServerResponse::Error(format!("无法从路径 '{}' 中提取有效的文件名", payload.path));
     }
 
     // 尝试获取文件元数据，如果文件不存在，返回 NotFound
     let metadata = match tokio::fs::metadata(&file_path).await {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return ServerResponse::NotFound(format!("文件未找到: '{}'", file_path.display()));
+            return ServerResponse::Error(format!("文件未找到: '{}'", file_path.display()));
         }
         Err(e) => {
             // 其他文件系统错误（如权限问题）

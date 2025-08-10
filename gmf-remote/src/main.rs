@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         let error_response =
-                            ServerResponse::InvalidRequest(format!("无法解析的JSON: {e}"));
+                            ServerResponse::Error(format!("无法解析的JSON: {e}"));
                         if tx.send(error_response.into()).await.is_err() {
                             break;
                         }
