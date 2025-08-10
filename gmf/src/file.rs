@@ -310,7 +310,7 @@ impl GmfSession {
                         Ok(bytes) => {
                             if attempt > 0 {
                                 ui::log_warn(&format!(
-                                    "分块 #{} 在第 {}/{} 次尝试中成功",
+                                    "分块 #{} 第 {}/{} 次下载成功",
                                     chunk_id,
                                     attempt + 1,
                                     MAX_ATTEMPTS

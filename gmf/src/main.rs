@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let mut session = remote::InteractiveSession::new(&cfg).await?;
+    let mut session = remote::InteractiveSession::new(&cfg, args.verbose).await?;
 
     let result: Result<()> = tokio::select! {
         // 分支 1: 正常执行业务逻辑

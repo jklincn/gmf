@@ -14,7 +14,7 @@ use tokio::{
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
-pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
+async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
     let mut ssh = ui::run_with_spinner(
         "正在连接远程服务器...",
         "✅ 远程服务器连接成功",
@@ -82,14 +82,18 @@ pub struct InteractiveSession {
 
 impl InteractiveSession {
     /// 启动远程程序并创建一个新的交互式会话。
-    pub async fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config, verbose: bool) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
         let (mut ssh_session, remote_path) = check_remote(config).await?;
 
         info!("正在启动 gmf-remote...");
         let command = format!(
-            "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' {}",
-            config.endpoint, config.access_key_id, config.secret_access_key, remote_path
+            "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' LOG='{}' {}",
+            config.endpoint,
+            config.access_key_id,
+            config.secret_access_key,
+            if verbose { "INFO" } else { "None" },
+            remote_path
         );
         // 以交互模式调用远程程序
         let ssh_channel = match ssh_session
@@ -235,15 +239,15 @@ impl InteractiveSession {
             resume_from_chunk_id: self.resume_from_chunk_id,
         });
 
-        info!("正在发送 Start 请求...");
+        ui::log_info("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
 
         let remaining_size = match self.next_response().await? {
             Some(ServerResponse::StartSuccess(response)) => {
-                info!(
+                ui::log_info(&format!(
                     "服务端确认，需要传输的大小为 {} 字节，开始接收分块信息...",
                     response.remaining_size
-                );
+                ));
                 response.remaining_size
             }
             Some(other_response) => bail!(
