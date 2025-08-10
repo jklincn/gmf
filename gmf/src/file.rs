@@ -1,4 +1,4 @@
-use crate::ui::AllProgressBar;
+use crate::ui;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -72,6 +72,7 @@ impl Header {
 }
 
 // 文件上下文
+// TODO：使用稀疏文件，分块无需顺序写入，头部放到文件最后，这样直接截取即可，不用再次搬运
 pub struct GMFFile {
     file: File,
     header: Header,
@@ -252,11 +253,7 @@ pub struct GmfSession {
 }
 
 impl GmfSession {
-    pub fn new(
-        gmf_file: GMFFile,
-        completed_chunks: u64,
-        progress_bar: Arc<AllProgressBar>,
-    ) -> Self {
+    pub fn new(gmf_file: GMFFile, completed_chunks: u64) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
         let buffer_semaphore = Arc::new(Semaphore::new(10));
 
@@ -268,7 +265,6 @@ impl GmfSession {
             decrypted_rx,
             completed_chunks,
             chunk_count,
-            progress_bar.clone(),
         ));
 
         Self {
@@ -291,7 +287,7 @@ impl GmfSession {
             }
         };
 
-        info!("开始处理分块 #{chunk_id}");
+        ui::log_info(&format!("开始处理分块 #{chunk_id}"));
         let decrypted_tx = self.decrypted_tx.clone();
 
         let result: anyhow::Result<()> = async {
@@ -300,39 +296,37 @@ impl GmfSession {
             // 下载分块
             // TODO：二次重试队列
             let content = {
-                const MAX_ATTEMPTS: u32 = 4; // 总共尝试4次，重试3次
+                const MAX_ATTEMPTS: u32 = 3; // 总共尝试3次，重试2次
                 const RETRY_DELAY: Duration = Duration::from_millis(500); // 每次重试间隔500毫秒
                 let mut last_error: Option<anyhow::Error> = None;
                 let mut attempt = 0;
                 loop {
                     if attempt >= MAX_ATTEMPTS {
                         break Err(last_error.unwrap().context(format!(
-                            "Failed to get object '{}' after {} attempts",
-                            chunk_id,
-                            MAX_ATTEMPTS - 1
+                            "分块 #{chunk_id} 下载失败，已尝试 {MAX_ATTEMPTS} 次"
                         )));
                     }
                     match r2::get_object(&chunk_id.to_string()).await {
                         Ok(bytes) => {
                             if attempt > 0 {
-                                warn!(
+                                ui::log_warn(&format!(
                                     "分块 #{} 在第 {}/{} 次尝试中成功",
                                     chunk_id,
                                     attempt + 1,
                                     MAX_ATTEMPTS
-                                );
+                                ));
                             }
                             break Ok(bytes);
                         }
                         Err(e) => {
                             last_error = Some(e);
                             if attempt < MAX_ATTEMPTS - 1 {
-                                warn!(
-                                    "分块 #{} 第 {}/{} 次尝试失败，准备重试...",
+                                ui::log_warn(&format!(
+                                    "分块 #{} 第 {}/{} 次下载超时，准备重试...",
                                     chunk_id,
                                     attempt + 1,
-                                    MAX_ATTEMPTS - 1
-                                );
+                                    MAX_ATTEMPTS
+                                ));
                                 tokio::time::sleep(RETRY_DELAY).await;
                             }
                         }
@@ -341,10 +335,10 @@ impl GmfSession {
                 }
             }?;
 
-            info!(
+            ui::log_info(&format!(
                 "分块 #{chunk_id} 下载完成，耗时: {:.2?}",
                 start_time.elapsed()
-            );
+            ));
 
             // 解密分块
             let plain_data = tokio::task::spawn_blocking(move || {
@@ -463,11 +457,9 @@ impl GmfSession {
 // 后台“写入器”任务
 async fn writer(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
-    // 修改：接收新的 DecryptedChunk 结构体
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
     completed_chunks: u64,
     chunk_count: u64,
-    progress_bar: Arc<AllProgressBar>,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u64, (Vec<u8>, OwnedSemaphorePermit)> = BTreeMap::new();
     let mut next_chunk_to_write = completed_chunks;
@@ -476,7 +468,7 @@ async fn writer(
     while let Some(chunk) = decrypted_rx.recv().await {
         // 如果收到的块是已经写入过的，直接丢弃
         if chunk.id < next_chunk_to_write {
-            progress_bar.log_info(&format!("丢弃已处理过的分块 {}", chunk.id));
+            ui::log_info(&format!("收到已处理过的分块 #{}，直接丢弃", chunk.id));
             continue;
         }
 
@@ -490,13 +482,13 @@ async fn writer(
                 let mut gmf = gmf_file_arc.lock().await;
                 gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
             }
-            progress_bar.update_download();
+            ui::update_download();
             next_chunk_to_write += 1;
             remaining_chunks -= 1;
             if remaining_chunks == 0 {
-                progress_bar.finish_download();
+                ui::finish_download();
             }
-            progress_bar.log_info(&format!("已成功写入分块 #{}", next_chunk_to_write - 1));
+            ui::log_info(&format!("已成功写入分块 #{}", next_chunk_to_write - 1));
             drop(permit_to_release);
         }
     }

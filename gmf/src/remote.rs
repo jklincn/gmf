@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::io_actor::IoActor;
-use crate::ssh::{self};
-use crate::ui::{AllProgressBar, LogLevel, run_with_spinner};
+use crate::ssh;
+use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use gmf_common::{interface::*, utils::format_size};
 use log::{error, info, warn};
@@ -15,7 +15,7 @@ use tokio::{
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
 pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
-    let mut ssh = run_with_spinner(
+    let mut ssh = ui::run_with_spinner(
         "正在连接远程服务器...",
         "✅ 远程服务器连接成功",
         ssh::Session::connect(cfg),
@@ -50,7 +50,7 @@ pub async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
     // 如果需要，则进行安装/更新
     if needs_install {
         let msg = "正在安装服务端至远程目录 (~/.local/bin)...".to_string();
-        run_with_spinner::<_, (), anyhow::Error>(&msg, "✅ 远程服务端安装成功", async {
+        ui::run_with_spinner::<_, (), anyhow::Error>(&msg, "✅ 远程服务端安装成功", async {
             // 第一步：创建目录
             ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
 
@@ -75,10 +75,9 @@ pub struct InteractiveSession {
     actor_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::Session,
-    // 进度条
-    progress_bar: Option<Arc<AllProgressBar>>,
     // GMF 文件管理
     file: Option<Arc<GmfSession>>,
+    resume_from_chunk_id: u64,
 }
 
 impl InteractiveSession {
@@ -122,8 +121,8 @@ impl InteractiveSession {
             response_rx,
             actor_handle,
             ssh_session,
-            progress_bar: None,
             file: None,
+            resume_from_chunk_id: 0,
         })
     }
 
@@ -210,39 +209,30 @@ impl InteractiveSession {
             setup_response.total_chunks,
         )?;
 
-        let progress_bar = Arc::new(AllProgressBar::new(
+        ui::init_global_progress_bar(
             setup_response.total_chunks,
             completed_chunks,
             if verbose {
-                LogLevel::Info
+                ui::LogLevel::Info
             } else {
-                LogLevel::Warn
+                ui::LogLevel::Warn
             },
-        )?);
+        )?;
 
-        self.progress_bar = Some(progress_bar.clone());
-        self.file = Some(Arc::new(GmfSession::new(
-            gmf_file,
-            completed_chunks,
-            progress_bar,
-        )));
+        self.resume_from_chunk_id = completed_chunks;
+        self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
 
         Ok(())
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        let progress_bar = self
-            .progress_bar
-            .clone()
-            .ok_or_else(|| anyhow!("请先调用 setup() 方法以初始化客户端状态"))?;
         let session = self
             .file
             .take()
             .ok_or_else(|| anyhow!("内部状态错误: file 未初始化"))?;
 
-        let resume_from_chunk_id = progress_bar.completed_chunks;
         let client_request = ClientRequest::Start(StartRequestPayload {
-            resume_from_chunk_id,
+            resume_from_chunk_id: self.resume_from_chunk_id,
         });
 
         info!("正在发送 Start 请求...");
@@ -264,11 +254,11 @@ impl InteractiveSession {
         };
 
         // 主事件循环
-        let loop_result = event_loop(&mut self.response_rx, session.clone(), &progress_bar).await;
+        let loop_result = event_loop(&mut self.response_rx, session.clone()).await;
 
         match loop_result {
             Ok(time) => {
-                progress_bar.finish_download();
+                ui::finish_download();
                 info!("等待所有本地任务完成...");
 
                 let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
@@ -280,13 +270,13 @@ impl InteractiveSession {
 
                 session_to_finish.wait_for_completion().await?;
                 let speed = (remaining_size as f64 / 1024.0 / 1024.0) / time.as_secs_f64();
-                let speed_str = format!("{:.2} MB/s", speed);
+                let speed_str = format!("{speed:.2} MB/s");
 
-                warn!("\n⚡ 下载完成，平均传输速度: {}", speed_str);
+                warn!("\n⚡ 下载完成，平均传输速度: {speed_str}");
                 Ok(())
             }
             Err(e) => {
-                progress_bar.abandon_download();
+                ui::abandon_download();
                 Err(e)
             }
         }
@@ -327,13 +317,12 @@ impl InteractiveSession {
 async fn event_loop(
     response_rx: &mut mpsc::Receiver<ServerResponse>,
     session: Arc<GmfSession>,
-    progress_bar: &Arc<AllProgressBar>,
 ) -> Result<Duration> {
     let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
     let mut upload_completed = false;
     let mut upload_time = Duration::ZERO;
     let start_time = std::time::Instant::now();
-    progress_bar.start_tick();
+    ui::start_tick();
 
     loop {
         tokio::select! {
@@ -342,10 +331,10 @@ async fn event_loop(
             Some(res) = join_set.join_next() => {
                 match res {
                     Ok(ChunkResult::Success(id)) => {
-                        progress_bar.log_info(&format!("分块 #{id} 处理成功"));
+                        ui::log_info(&format!("分块 #{id} 处理成功"));
                     },
                     Ok(ChunkResult::Failure(id, err)) => {
-                        let error_msg = format!("分块 #{id} 本地处理失败: {err:?}");
+                        let error_msg = format!("分块 #{id} 处理失败: {err:?}");
                         bail!(error_msg);
                     },
                     Err(join_err) => {
@@ -374,7 +363,7 @@ async fn event_loop(
                                 bail!(error_msg);
                             },
                             other => {
-                                progress_bar.log_info(&format!("收到非关键消息: {other:?}"));
+                                ui::log_info(&format!("收到非关键消息: {other:?}"));
                             }
                         }
                     },

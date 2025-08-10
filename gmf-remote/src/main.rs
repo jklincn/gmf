@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
                             Err(e) => {
                                 error!("处理消息时发生错误: {}", e);
                                 let error_response =
-                                    ServerResponse::Error(format!("消息处理失败: {}", e));
+                                    ServerResponse::Error(format!("消息处理失败: {e}"));
                                 if tx.send(error_response.into()).await.is_err() {
                                     break;
                                 }

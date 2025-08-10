@@ -1,7 +1,11 @@
+use std::future::Future;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tokio::sync::OnceCell;
+
+static G_PROGRESS_BAR: OnceCell<AllProgressBar> = OnceCell::const_new();
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum LogLevel {
@@ -11,15 +15,13 @@ pub enum LogLevel {
 }
 
 pub struct AllProgressBar {
-    pub completed_chunks: u64,
     log_level: LogLevel,
-
     mp: MultiProgress,
     download: ProgressBar,
 }
 
 impl AllProgressBar {
-    pub fn new(total_chunks: u64, completed_chunks: u64, log_level: LogLevel) -> Result<Self> {
+    fn new(total_chunks: u64, completed_chunks: u64, log_level: LogLevel) -> Result<Self> {
         let mp: MultiProgress = MultiProgress::new();
         let download = mp.add(ProgressBar::new(total_chunks));
 
@@ -28,12 +30,9 @@ impl AllProgressBar {
                 .template("{spinner:.green} [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
-
         download.set_position(completed_chunks);
-
         Ok(AllProgressBar {
-            completed_chunks,
-            log_level, // 初始化日志等级
+            log_level,
             mp,
             download,
         })
@@ -55,14 +54,12 @@ impl AllProgressBar {
         self.download.enable_steady_tick(Duration::from_millis(500));
     }
 
-    /// 在进度条上方输出消息，不会干扰进度条显示
     fn println(&self, msg: &str) {
         self.mp.println(msg).unwrap_or_else(|_| {
             println!("{msg}");
         });
     }
 
-    /// 私有的核心日志记录函数
     fn log(&self, level: LogLevel, msg: &str) {
         if level <= self.log_level {
             let level_str = match level {
@@ -72,7 +69,7 @@ impl AllProgressBar {
             };
 
             if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-                let timestamp = duration.as_secs() + 8 * 3600;
+                let timestamp = duration.as_secs() + 8 * 3600; // 注意时区
                 let hours = (timestamp / 3600) % 24;
                 let minutes = (timestamp / 60) % 60;
                 let seconds = timestamp % 60;
@@ -85,23 +82,67 @@ impl AllProgressBar {
         }
     }
 
-    /// 记录一条 ERROR 等级的日志
-    #[allow(unused)]
     pub fn log_error(&self, msg: &str) {
         self.log(LogLevel::Error, msg);
     }
 
-    /// 记录一条 INFO 等级的日志
-    #[allow(unused)]
     pub fn log_warn(&self, msg: &str) {
         self.log(LogLevel::Warn, msg);
     }
 
-    /// 记录一条 DEBUG 等级的日志
-    #[allow(unused)]
     pub fn log_info(&self, msg: &str) {
         self.log(LogLevel::Info, msg);
     }
+}
+
+// 初始化全局进度条
+pub fn init_global_progress_bar(
+    total_chunks: u64,
+    completed_chunks: u64,
+    log_level: LogLevel,
+) -> Result<()> {
+    let progress_bar = AllProgressBar::new(total_chunks, completed_chunks, log_level)?;
+    G_PROGRESS_BAR
+        .set(progress_bar)
+        .map_err(|_| anyhow::anyhow!("全局进度条已经初始化过了"))?;
+    Ok(())
+}
+
+pub fn start_tick() {
+    global().start_tick();
+}
+
+pub fn update_download() {
+    global().update_download();
+}
+
+pub fn finish_download() {
+    global().finish_download();
+}
+
+pub fn abandon_download() {
+    global().abandon_download();
+}
+
+#[allow(unused)]
+pub fn log_info(msg: &str) {
+    global().log_info(msg);
+}
+
+#[allow(unused)]
+pub fn log_warn(msg: &str) {
+    global().log_warn(msg);
+}
+
+#[allow(unused)]
+pub fn log_error(msg: &str) {
+    global().log_error(msg);
+}
+
+fn global() -> &'static AllProgressBar {
+    G_PROGRESS_BAR
+        .get()
+        .expect("全局进度条(G_PROGRESS_BAR)未初始化，请先调用 init_global_progress_bar")
 }
 
 pub struct Spinner {
@@ -146,12 +187,10 @@ where
 
     match task.await {
         Ok(value) => {
-            // 成功
-            spinner.finish(&success_msg);
+            spinner.finish(success_msg);
             Ok(value)
         }
         Err(error) => {
-            // 失败
             let error_message = format!("❌ 运行失败: {error}");
             spinner.finish(&error_message);
             Err(error)

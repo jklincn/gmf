@@ -1,10 +1,10 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose, Engine};
-use futures::{stream, TryStreamExt};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose};
+use futures::{TryStreamExt, stream};
 use gmf_common::{
     consts::NONCE_SIZE,
     interface::*,
@@ -14,7 +14,7 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, BufReader},
-    sync::{mpsc, watch, Mutex},
+    sync::{Mutex, mpsc, watch},
     task::JoinHandle,
 };
 use tracing::{error, info, warn};
@@ -290,16 +290,16 @@ pub async fn start(
         } else {
             false
         };
-        
+
         let encryption_successful = encryption_result.is_ok();
-        
+
         // 如果是非中断错误，则传播错误
         if let Err(e) = encryption_result {
             if e.to_string() != "任务被用户中断" {
                 return Err(e);
             }
         }
-        
+
         drop(upload_tx);
 
         // 等待上传任务完成（处理完队列中剩余的所有项目）

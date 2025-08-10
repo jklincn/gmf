@@ -10,7 +10,7 @@ use clap::Parser;
 use config::{Config, ConfigError};
 use env_logger::{Builder, Env};
 use gmf_common::r2;
-use log::{error, warn};
+use log::error;
 use std::{io::Write, time::SystemTime};
 use tokio::signal;
 
@@ -67,6 +67,7 @@ struct Args {
     verbose: bool,
 }
 
+// TODO：把 warn 换成 info，info 换成 debug（主要是屏蔽其他模块的debug）
 fn set_log() {
     let args = Args::parse();
     let log_level = if args.verbose { "info" } else { "warn" };
@@ -147,7 +148,7 @@ async fn main() -> Result<()> {
 
         // 分支 2: 监听 Ctrl+C 信号
         _ = signal::ctrl_c() => {
-            warn!("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
+            ui::log_warn("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
             Ok(())
         }
     };
