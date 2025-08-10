@@ -11,8 +11,7 @@ use config::{Config, ConfigError};
 use env_logger::{Builder, Env};
 use gmf_common::r2;
 use log::error;
-use std::{io::Write, time::SystemTime};
-use tokio::signal;
+use std::io::Write;
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
 fn parse_chunk_size(s: &str) -> Result<u64> {
@@ -72,19 +71,10 @@ fn set_log() {
     let args = Args::parse();
     let log_level = if args.verbose { "info" } else { "warn" };
     let env = Env::default().default_filter_or(log_level);
+
     Builder::from_env(env)
         .format(|buf, record| {
-            let time_str =
-                if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-                    let timestamp = duration.as_secs() + 8 * 3600;
-                    let hours = (timestamp / 3600) % 24;
-                    let minutes = (timestamp / 60) % 60;
-                    let seconds = timestamp % 60;
-                    format!("{hours:02}:{minutes:02}:{seconds:02}")
-                } else {
-                    "--:--:--".to_string()
-                };
-
+            let time_str = chrono::Local::now().format("%H:%M:%S");
             writeln!(buf, "[{}] [{}] {}", time_str, record.level(), record.args())
         })
         .init();
@@ -147,7 +137,7 @@ async fn main() -> Result<()> {
         },
 
         // 分支 2: 监听 Ctrl+C 信号
-        _ = signal::ctrl_c() => {
+        _ = tokio::signal::ctrl_c() => {
             ui::log_warn("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
             Ok(())
         }

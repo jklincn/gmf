@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -67,18 +67,8 @@ impl AllProgressBar {
                 LogLevel::Warn => "[WARN]",
                 LogLevel::Info => "[INFO]",
             };
-
-            if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-                let timestamp = duration.as_secs() + 8 * 3600; // 注意时区
-                let hours = (timestamp / 3600) % 24;
-                let minutes = (timestamp / 60) % 60;
-                let seconds = timestamp % 60;
-                self.println(&format!(
-                    "[{hours:02}:{minutes:02}:{seconds:02}] {level_str} {msg}"
-                ));
-            } else {
-                self.println(&format!("[--:--:--] {level_str} {msg}"));
-            }
+            let timestamp_str = chrono::Local::now().format("%H:%M:%S");
+            self.println(&format!("[{timestamp_str}] {level_str} {msg}"));
         }
     }
 
