@@ -5,6 +5,7 @@ use crate::ssh;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use gmf_common::{interface::*, utils::format_size};
+use std::collections::HashSet;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::mpsc,
@@ -232,7 +233,6 @@ impl InteractiveSession {
 
         ui::log_debug("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
-
         let remaining_size = match self.next_response().await? {
             Some(ServerResponse::StartSuccess(response)) => {
                 ui::log_debug(&format!(
@@ -248,12 +248,12 @@ impl InteractiveSession {
             None => bail!("连接中断: 在等待 StartSuccess 响应时连接已关闭"),
         };
 
-        // 主事件循环
-        let loop_result = event_loop(&mut self.response_rx, session.clone()).await;
+        // 主事件循环 - 现在将整个 self 传递给事件循环
+        let loop_result = self.event_loop(session.clone()).await;
 
         match loop_result {
             Ok(time) => {
-                ui::log_debug("等待所有本地任务完成...");
+                ui::log_debug("等待本地写入完成...");
 
                 let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
                     anyhow!(
@@ -265,8 +265,8 @@ impl InteractiveSession {
                 session_to_finish.wait_for_completion().await?;
                 let bytes_per_second = remaining_size as f64 / time.as_secs_f64();
                 let speed_in_mb = bytes_per_second / (1024.0 * 1024.0);
-                let speed_str = format!("{:.2} MB/s", speed_in_mb);
-                ui::log_info(&format!("⚡ 下载完成，平均传输速度: {speed_str}"));
+                let speed_str = format!("{speed_in_mb:.2} MB/s");
+                println!("⚡ 下载完成，平均传输速度: {speed_str}");
                 Ok(())
             }
             Err(e) => {
@@ -276,7 +276,105 @@ impl InteractiveSession {
         }
     }
 
-    /// 向远程程序发送一条指令，并自动添加换行符。
+    /// 接收服务端消息的主循环
+    async fn event_loop(&mut self, gmf_session: Arc<GmfSession>) -> Result<Duration> {
+        let total_chunks = gmf_session.total_chunks;
+        let mut completed_chunk_ids: HashSet<u64> = (0..self.resume_from_chunk_id).collect();
+        let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
+        let mut upload_completed = false;
+        let mut upload_time = Duration::ZERO;
+        let start_time = std::time::Instant::now();
+        ui::start_tick();
+
+        ui::log_debug(&format!(
+            "事件循环开始，总分块数: {}, 已完成分块数: {}, 需要下载分块数: {}",
+            total_chunks,
+            completed_chunk_ids.len(),
+            total_chunks - completed_chunk_ids.len() as u64
+        ));
+
+        loop {
+            // 检查是否所有分块都已完成
+            if completed_chunk_ids.len() as u64 == total_chunks {
+                // 等待所有剩余的任务完成
+                while let Some(_) = join_set.join_next().await {}
+                ui::log_debug("所有分块均已成功处理！");
+                break;
+            }
+
+            tokio::select! {
+                biased;
+
+                // 处理已完成的分块任务
+                Some(res) = join_set.join_next() => {
+                    match res {
+                        Ok(ChunkResult::Success(id)) => {
+                            completed_chunk_ids.insert(id);
+                            ui::log_debug(&format!("分块 #{id} 处理成功"));
+                        },
+                        Ok(ChunkResult::Timeout(id)) => {
+                            ui::log_warn(&format!("分块 #{id} 下载超时，正在重试..."));
+                            self.send_request(&ClientRequest::Retry(RetryRequestPayload { chunk_id: id })).await?;
+                        },
+                        Ok(ChunkResult::Failure(id, err)) => {
+                            let error_msg = format!("分块 #{id} 处理失败: {err:?}");
+                            bail!(error_msg);
+                        },
+                        Err(join_err) => {
+                            let error_msg = format!("任务执行出现严重错误 (panic): {join_err:?}");
+                            bail!(error_msg);
+                        },
+                    }
+                },
+
+                // 接收服务端响应（上传超时 30 秒）
+                resp = tokio::time::timeout(Duration::from_secs(30), self.response_rx.recv()), if !upload_completed => {
+                    match resp {
+                        Ok(Some(response)) => {
+                            match response {
+                                ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64, retry } => {
+                                    let session_clone = gmf_session.clone();
+                                    join_set.spawn(async move {
+                                        session_clone.handle_chunk(chunk_id, passphrase_b64, retry).await
+                                    });
+                                },
+                                ServerResponse::UploadCompleted => {
+                                    upload_time = start_time.elapsed();
+                                    upload_completed = true;
+                                    ui::log_debug("服务端上传已完成");
+                                },
+                                ServerResponse::Error(msg) => {
+                                    let error_msg = format!("收到服务端错误: {msg}");
+                                    bail!(error_msg);
+                                },
+                                other => {
+                                    ui::log_warn(&format!("收到非关键消息: {other:?}"));
+                                }
+                            }
+                        },
+                        Ok(None) => {
+                            bail!("连接中断: 服务端在任务完成前关闭了连接");
+                        }
+                        Err(_) => {
+                            bail!("等待远程服务端响应超时，绝大概率为首次上传超时，请重试");
+                        }
+                    }
+                },
+
+                _ = tokio::time::sleep(Duration::from_millis(100)), if upload_completed && !join_set.is_empty() => {
+                },
+
+                else => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ui::log_warn("事件循环中没有可用的分支，这可能是一个逻辑错误");
+                }
+            }
+        }
+
+        Ok(upload_time)
+    }
+
+    /// 向远程程序发送一条指令
     pub async fn send_request(&self, request: &ClientRequest) -> Result<()> {
         self.command_tx
             .send(request.clone())
@@ -284,97 +382,30 @@ impl InteractiveSession {
             .context("向 I/O Actor 发送命令失败，通道可能已关闭")
     }
 
+    /// 接收下一个响应，带有超时机制
     pub async fn next_response(&mut self) -> Result<Option<ServerResponse>> {
         match tokio::time::timeout(Duration::from_secs(10), self.response_rx.recv()).await {
             Ok(Some(response)) => Ok(Some(response)),
             Ok(None) => Ok(None),
-            Err(_) => Err(anyhow!("等待响应超时",)),
+            Err(_) => Err(anyhow!("等待响应超时")),
         }
     }
 
-    /// 发送退出指令，并等待程序结束。
+    /// 发送退出指令，并等待程序结束
     pub async fn shutdown(mut self) -> Result<()> {
+        // 关闭命令发送通道，这将导致 IoActor 退出
         drop(self.command_tx);
 
+        // 等待 IoActor 任务结束
         match tokio::time::timeout(Duration::from_secs(10), self.actor_handle).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => ui::log_error(&format!("等待 I/O Actor 退出时发生错误: {e:?}")),
             Err(_) => ui::log_warn("等待 I/O Actor 退出超时！"),
         }
 
+        // 关闭 SSH 会话
         self.ssh_session.close().await?;
 
         Ok(())
     }
-}
-
-async fn event_loop(
-    response_rx: &mut mpsc::Receiver<ServerResponse>,
-    session: Arc<GmfSession>,
-) -> Result<Duration> {
-    let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
-    let mut upload_completed = false;
-    let mut upload_time = Duration::ZERO;
-    let start_time = std::time::Instant::now();
-    ui::start_tick();
-
-    loop {
-        tokio::select! {
-            biased;
-
-            Some(res) = join_set.join_next() => {
-                match res {
-                    Ok(ChunkResult::Success(id)) => {
-                        ui::log_debug(&format!("分块 #{id} 处理成功"));
-                    },
-                    Ok(ChunkResult::Failure(id, err)) => {
-                        let error_msg = format!("分块 #{id} 处理失败: {err:?}");
-                        bail!(error_msg);
-                    },
-                    Err(join_err) => {
-                        let error_msg = format!("任务执行出现严重错误 (panic): {join_err:?}");
-                        bail!(error_msg);
-                    },
-                }
-            },
-
-            resp = tokio::time::timeout(Duration::from_secs(30), response_rx.recv()), if !upload_completed => {
-                match resp {
-                    Ok(Some(response)) => {
-                        match response {
-                            ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
-                                let session_clone = session.clone();
-                                join_set.spawn(async move {
-                                    session_clone.handle_chunk(chunk_id, passphrase_b64).await
-                                });
-                            },
-                            ServerResponse::UploadCompleted => {
-                                upload_time = start_time.elapsed();
-                                upload_completed = true;
-                            },
-                            ServerResponse::Error(msg) => {
-                                let error_msg = format!("收到服务端错误: {msg}");
-                                bail!(error_msg);
-                            },
-                            other => {
-                                ui::log_warn(&format!("收到非关键消息: {other:?}"));
-                            }
-                        }
-                    },
-                    Ok(None) => { // recv() 返回 None (通道关闭) 或 Err
-                        bail!("连接中断: 服务端在任务完成前关闭了连接");
-                    }
-                    Err(_) => { // `timeout` 触发
-                        bail!("等待远程服务端响应超时，绝大概率为首次上传超时，请重试");
-                    }
-                }
-            },
-        }
-
-        if upload_completed && join_set.is_empty() {
-            break;
-        }
-    }
-
-    Ok(upload_time)
 }

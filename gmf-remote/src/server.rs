@@ -77,15 +77,20 @@ pub async fn handle_message(
                     .context("任务未初始化。请在 'start' 之前先调用 'setup'")?;
                 (metadata.file_size, metadata.chunk_size)
             };
-            let ack = ServerResponse::StartSuccess(StartResponse {
-                remaining_size: file_size - (payload.resume_from_chunk_id * chunk_size),
-            });
+            let sent_bytes = (payload.resume_from_chunk_id as u64) * chunk_size;
+            let remaining_size = file_size.saturating_sub(sent_bytes);
+            let ack = ServerResponse::StartSuccess(StartResponse { remaining_size });
             if sender.send(ack.into()).await.is_err() {
                 error!("Channel closed. Could not send StartSuccess ack.");
                 return Ok(None);
             }
             let handle = tokio::spawn(start(payload, state, sender.clone(), shutdown_rx));
             Ok(Some(handle))
+        }
+        ClientRequest::Retry(payload) => {
+            let chunk_id = payload.chunk_id;
+            tokio::spawn(chunk_retry(chunk_id, state, sender.clone()));
+            Ok(None)
         }
     }
 }
@@ -160,7 +165,7 @@ pub async fn start(
     payload: StartRequestPayload,
     state: SharedState,
     sender: mpsc::Sender<Message>,
-    mut shutdown_rx: watch::Receiver<()>, // 接收关闭信号
+    mut shutdown_rx: watch::Receiver<()>,
 ) {
     let result: Result<()> = async {
         let (file_path, chunk_size) = {
@@ -195,7 +200,7 @@ pub async fn start(
                                     return Err(e.context(format!("分块 #{chunk_id} 上传失败 (已自动重试)")));
                                 }
                                 info!("分块 #{chunk_id} 上传成功, 耗时: {} s", upload_start_time.elapsed().as_secs_f32());
-                                let success_response = ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64 };
+                                let success_response = ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64,retry:false };
                                 if sender_clone.send(success_response.into()).await.is_err() {
                                     error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
                                     return Err(anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"));
@@ -364,4 +369,94 @@ fn encrypt_chunk(input_data: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     result.extend_from_slice(&ciphertext);
 
     Ok((result, general_purpose::STANDARD.encode(key)))
+}
+
+pub async fn chunk_retry(chunk_id: u64, state: SharedState, sender: mpsc::Sender<Message>) {
+    let result: Result<()> = async {
+        info!("开始重试分块 #{chunk_id}...");
+        let (file_path, chunk_size) = {
+            let app_state = state.lock().await;
+            let metadata = app_state
+                .metadata
+                .as_ref()
+                .context("任务未初始化，无法处理单个分块")?;
+            (metadata.file_path.clone(), metadata.chunk_size)
+        };
+
+        let mut file = File::open(&file_path)
+            .await
+            .with_context(|| format!("无法打开文件: {}", file_path.display()))?;
+
+        let offset = chunk_id * chunk_size;
+        file.seek(tokio::io::SeekFrom::Start(offset))
+            .await
+            .with_context(|| format!("无法跳转到文件偏移量 {offset} (分块 #{chunk_id})"))?;
+
+        let mut chunk_data = Vec::with_capacity(chunk_size as usize);
+        let bytes_read = file
+            .take(chunk_size) // 限制最多读取 chunk_size 字节
+            .read_to_end(&mut chunk_data)
+            .await
+            .with_context(|| format!("读取分块 #{chunk_id} 的数据时失败"))?;
+
+        if bytes_read == 0 {
+            return Err(anyhow!(
+                "指定的块号 {} 超出文件范围，没有可读取的数据。",
+                chunk_id
+            ));
+        }
+        info!("成功读取分块 #{chunk_id}，大小: {} 字节", bytes_read);
+
+        let encrypt_start_time = std::time::Instant::now();
+        info!("开始加密分块 #{chunk_id}...");
+        let (encrypted_data, passphrase_b64) =
+            encrypt_chunk(&chunk_data).with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
+        info!(
+            "分块 #{chunk_id} 加密成功，耗时: {} s",
+            encrypt_start_time.elapsed().as_secs_f32()
+        );
+
+        let upload_start_time = std::time::Instant::now();
+        info!("开始上传分块 #{chunk_id}...");
+        put_object(&chunk_id.to_string(), encrypted_data)
+            .await
+            .with_context(|| format!("分块 #{chunk_id} 上传失败 (已自动重试)"))?;
+        info!(
+            "分块 #{chunk_id} 上传成功, 耗时: {} s",
+            upload_start_time.elapsed().as_secs_f32()
+        );
+
+        let success_response = ServerResponse::ChunkReadyForDownload {
+            chunk_id,
+            passphrase_b64,
+            retry: true,
+        };
+        sender
+            .send(success_response.into())
+            .await
+            .context("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭")?;
+
+        Ok(())
+    }
+    .await;
+
+    // 如果上述任何步骤失败，发送一个 Error 消息
+    if let Err(e) = result {
+        let error_chain = e
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join("\n  caused by: ");
+        let error_message = format!("处理分块 #{chunk_id} 失败:\n{error_chain}");
+
+        error!("{}", error_message);
+
+        let error_response = ServerResponse::Error(error_message);
+        if sender.send(error_response.into()).await.is_err() {
+            error!(
+                "通道已关闭。无法为分块 #{chunk_id} 发送错误消息。最终错误是: {:?}",
+                e
+            );
+        }
+    }
 }

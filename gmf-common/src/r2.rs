@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aws_config::{self, BehaviorVersion, Region, retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_s3::{self as s3, config::Credentials, error::ProvideErrorMetadata};
 use bytes::Bytes;
@@ -21,7 +21,7 @@ pub struct S3Config {
 
 pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
     if S3_CLIENT.get().is_some() {
-        return Err(anyhow::anyhow!("S3 客户端已经被初始化"));
+        return Err(anyhow!("S3 客户端已经被初始化"));
     }
 
     let (endpoint, access_key_id, secret_access_key, retry_config, timeout_config) =
@@ -89,7 +89,7 @@ pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
 
     S3_CLIENT
         .set(client)
-        .map_err(|_| anyhow::anyhow!("内部错误: 设置 S3 客户端失败，可能已被其他线程初始化"))?;
+        .map_err(|_| anyhow!("内部错误: 设置 S3 客户端失败，可能已被其他线程初始化"))?;
 
     // 服务端预热
     if config_override.is_none() {
@@ -220,14 +220,14 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
 }
 
 // TODO：上传与下载的完整性验证
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 pub async fn get_object(key: &str) -> Result<Bytes> {
     let client = get_s3_client()?;
     let get_object_override_config = aws_sdk_s3::config::Builder::default()
         .retry_config(RetryConfig::disabled())
         .timeout_config(TimeoutConfig::disabled());
 
-    // 手动控制下载 20 秒超时
+    // 手动控制下载 15 秒超时
     match timeout(ATTEMPT_TIMEOUT, async {
         let resp = client
             .get_object()
@@ -249,10 +249,7 @@ pub async fn get_object(key: &str) -> Result<Bytes> {
     .await
     {
         // 超时
-        Err(_) => Err(anyhow::anyhow!(
-            "Operation timed out after {:?}",
-            ATTEMPT_TIMEOUT
-        )),
+        Err(_) => Err(anyhow!("Operation timed out after {:?}", ATTEMPT_TIMEOUT)),
         // 未超时，但内部有错误
         Ok(Err(e)) => Err(e),
         // 成功

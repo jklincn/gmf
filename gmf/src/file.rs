@@ -12,7 +12,6 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
@@ -71,7 +70,6 @@ impl Header {
 }
 
 // 文件上下文
-// TODO：使用稀疏文件，分块无需顺序写入，头部放到文件最后，这样直接截取即可，不用再次搬运
 pub struct GMFFile {
     file: File,
     header: Header,
@@ -235,12 +233,13 @@ impl GMFFile {
 struct DecryptedChunk {
     id: u64,
     data: Vec<u8>,
-    permit: OwnedSemaphorePermit,
+    pub permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug)]
 pub enum ChunkResult {
     Success(u64),
+    Timeout(u64),
     Failure(u64, anyhow::Error),
 }
 
@@ -249,21 +248,22 @@ pub struct GmfSession {
     decrypted_tx: mpsc::Sender<DecryptedChunk>,
     writer_handle: JoinHandle<Result<()>>,
     buffer_semaphore: Arc<Semaphore>,
+    pub total_chunks: u64,
 }
 
 impl GmfSession {
     pub fn new(gmf_file: GMFFile, completed_chunks: u64) -> Self {
         let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
-        let buffer_semaphore = Arc::new(Semaphore::new(10));
+        let buffer_semaphore = Arc::new(Semaphore::new(20));
 
-        let chunk_count = gmf_file.total_chunks();
+        let total_chunks = gmf_file.total_chunks();
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
 
         let writer_handle = tokio::spawn(writer(
             gmf_file_arc.clone(),
             decrypted_rx,
             completed_chunks,
-            chunk_count,
+            total_chunks,
         ));
 
         Self {
@@ -271,68 +271,57 @@ impl GmfSession {
             decrypted_tx,
             writer_handle,
             buffer_semaphore,
+            total_chunks,
         }
     }
 
     /// 负责下载分块与解密，写入交由写入器操作
-    pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
-        let permit = match self.buffer_semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                return ChunkResult::Failure(
-                    chunk_id,
-                    anyhow!("内部错误: 无法获取信号量许可，会话已关闭"),
-                );
+    pub async fn handle_chunk(
+        &self,
+        chunk_id: u64,
+        passphrase_b64: String,
+        retry: bool,
+    ) -> ChunkResult {
+        let permit = if retry {
+            ui::log_debug(&format!(
+                "分块 #{chunk_id} 是重试任务，跳过获取信号量许可。"
+            ));
+            None
+        } else {
+            match self.buffer_semaphore.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return ChunkResult::Failure(
+                        chunk_id,
+                        anyhow!("内部错误: 无法获取信号量许可，会话已关闭"),
+                    );
+                }
             }
         };
 
-        ui::log_debug(&format!("开始处理分块 #{chunk_id}"));
+        ui::log_debug(&format!("分块 #{chunk_id} 开始处理"));
         let decrypted_tx = self.decrypted_tx.clone();
 
         let result: anyhow::Result<()> = async {
             let start_time = std::time::Instant::now();
 
             // 下载分块
-            // TODO：二次重试队列
-            let content = {
-                const MAX_ATTEMPTS: u32 = 3; // 总共尝试3次，重试2次
-                const RETRY_DELAY: Duration = Duration::from_millis(500); // 每次重试间隔500毫秒
-                let mut last_error: Option<anyhow::Error> = None;
-                let mut attempt = 0;
-                loop {
-                    if attempt >= MAX_ATTEMPTS {
-                        break Err(last_error.unwrap().context(format!(
-                            "分块 #{chunk_id} 下载失败，已尝试 {MAX_ATTEMPTS} 次"
-                        )));
-                    }
-                    match r2::get_object(&chunk_id.to_string()).await {
-                        Ok(bytes) => {
-                            if attempt > 0 {
-                                ui::log_warn(&format!(
-                                    "分块 #{} 第 {}/{} 次下载成功",
-                                    chunk_id,
-                                    attempt + 1,
-                                    MAX_ATTEMPTS
-                                ));
-                            }
-                            break Ok(bytes);
-                        }
-                        Err(e) => {
-                            last_error = Some(e);
-                            if attempt < MAX_ATTEMPTS - 1 {
-                                ui::log_warn(&format!(
-                                    "分块 #{} 第 {}/{} 次下载超时，准备重试...",
-                                    chunk_id,
-                                    attempt + 1,
-                                    MAX_ATTEMPTS
-                                ));
-                                tokio::time::sleep(RETRY_DELAY).await;
-                            }
+            let content = match r2::get_object(&chunk_id.to_string()).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // 只有在非重试模式下才检查是否为超时错误
+                    if !retry {
+                        let error_msg = format!("{e:?}");
+                        ui::log_debug(&format!("分块 #{chunk_id} 下载失败: {error_msg}"));
+                        let is_timeout_error = error_msg.contains("Operation timed out");
+
+                        if is_timeout_error {
+                            return Err(anyhow!("TIMEOUT_ERROR:{}", e));
                         }
                     }
-                    attempt += 1;
+                    return Err(e.context(format!("分块 #{chunk_id} 重试下载失败")));
                 }
-            }?;
+            };
 
             ui::log_debug(&format!(
                 "分块 #{chunk_id} 下载完成，耗时: {:.2?}",
@@ -378,7 +367,15 @@ impl GmfSession {
 
         match result {
             Ok(_) => ChunkResult::Success(chunk_id),
-            Err(e) => ChunkResult::Failure(chunk_id, e),
+            Err(e) => {
+                let error_msg = e.to_string();
+                // 检查是否为超时错误标记
+                if error_msg.starts_with("TIMEOUT_ERROR:") {
+                    ChunkResult::Timeout(chunk_id)
+                } else {
+                    ChunkResult::Failure(chunk_id, e)
+                }
+            }
         }
     }
 
@@ -458,11 +455,11 @@ async fn writer(
     gmf_file_arc: Arc<Mutex<GMFFile>>,
     mut decrypted_rx: mpsc::Receiver<DecryptedChunk>,
     completed_chunks: u64,
-    chunk_count: u64,
+    total_chunks: u64,
 ) -> Result<()> {
-    let mut buffer: BTreeMap<u64, (Vec<u8>, OwnedSemaphorePermit)> = BTreeMap::new();
+    let mut buffer: BTreeMap<u64, (Vec<u8>, Option<OwnedSemaphorePermit>)> = BTreeMap::new();
     let mut next_chunk_to_write = completed_chunks;
-    let mut remaining_chunks = chunk_count - completed_chunks;
+    let mut remaining_chunks = total_chunks - completed_chunks;
 
     while let Some(chunk) = decrypted_rx.recv().await {
         // 如果收到的块是已经写入过的，直接丢弃
@@ -481,14 +478,16 @@ async fn writer(
                 let mut gmf = gmf_file_arc.lock().await;
                 gmf.write_chunk(next_chunk_to_write, &data_to_write)?;
             }
-            ui::log_debug(&format!("已成功写入分块 #{}", next_chunk_to_write));
+            ui::log_debug(&format!("分块 #{next_chunk_to_write} 成功写入"));
             ui::update_download();
             next_chunk_to_write += 1;
             remaining_chunks -= 1;
             if remaining_chunks == 0 {
                 ui::finish_download();
             }
-            drop(permit_to_release);
+            if let Some(permit) = permit_to_release {
+                drop(permit);
+            }
         }
     }
 

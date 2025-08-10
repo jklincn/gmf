@@ -104,13 +104,13 @@ impl AllProgressBar {
     fn log(&self, level: LogLevel, msg: &str) {
         if level <= self.log_level {
             if level == LogLevel::Info {
-                self.println(&format!("{msg}"));
+                self.println(msg);
             } else {
                 let level_str = match level {
-                    LogLevel::Error => "[ERROR]",
-                    LogLevel::Warn => "[WARN]",
-                    LogLevel::Info => "[INFO]",
-                    LogLevel::Debug => "[DEBUG]",
+                    LogLevel::Error => "ERROR",
+                    LogLevel::Warn => "WARN",
+                    LogLevel::Info => "INFO",
+                    LogLevel::Debug => "INFO", // 在 UI 界面，INFO 不输出等级，Debug 展示成 INFO
                 };
                 let timestamp_str = chrono::Local::now().format("%H:%M:%S%.3f");
                 self.println(&format!("[{timestamp_str}] [{level_str}] {msg}"));
