@@ -219,15 +219,14 @@ pub async fn delete_bucket_with_retry() -> Result<()> {
     Ok(())
 }
 
-// TODO：上传与下载的完整性验证
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn get_object(key: &str) -> Result<Bytes> {
     let client = get_s3_client()?;
     let get_object_override_config = aws_sdk_s3::config::Builder::default()
         .retry_config(RetryConfig::disabled())
         .timeout_config(TimeoutConfig::disabled());
 
-    // 手动控制下载 15 秒超时
+    // 手动控制下载 10 秒超时
     match timeout(ATTEMPT_TIMEOUT, async {
         let resp = client
             .get_object()
