@@ -319,7 +319,7 @@ impl GmfSession {
                             return Err(anyhow!("TIMEOUT_ERROR:{}", e));
                         }
                     }
-                    return Err(e.context(format!("分块 #{chunk_id} 重试下载失败")));
+                    return Err(e.context(format!("分块 #{chunk_id} 下载失败（已重试）")));
                 }
             };
 
@@ -344,7 +344,7 @@ impl GmfSession {
                     .map_err(|e| anyhow!("分块数据解密失败: {e:?}"))
             })
             .await
-            .context("解密任务本身发生错误（例如 panic）")??;
+            .context("解密任务本身发生错误，可以尝试重试")??;
 
             // 删除 R2 中已下载的分块
             r2::delete_object(&chunk_id.to_string())

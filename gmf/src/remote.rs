@@ -26,15 +26,7 @@ async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
     const REMOTE_PATH: &str = "$HOME/.local/bin/gmf-remote";
 
     // 检查远程程序 SHA256 的命令
-    let check_sha_cmd = format!(
-        r#"
-        if [ -f "{REMOTE_PATH}" ]; then
-            sha256sum "{REMOTE_PATH}" | cut -d' ' -f1
-        else
-            echo ""
-        fi
-    "#
-    );
+    let check_sha_cmd = format!(r#"sha256sum "{REMOTE_PATH}" 2>/dev/null | cut -d' ' -f1"#);
 
     let needs_install = match ssh.call_once(&check_sha_cmd).await {
         Ok((0, remote_sha)) => {
@@ -87,6 +79,7 @@ impl InteractiveSession {
         let (mut ssh_session, remote_path) = check_remote(config).await?;
 
         ui::log_debug("正在启动 gmf-remote...");
+
         let command = format!(
             "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' LOG='{}' {}",
             config.endpoint,
@@ -147,13 +140,12 @@ impl InteractiveSession {
             }
         }
 
-        let client_request = ClientRequest::Setup {
+        let spinner = crate::ui::Spinner::new("正在取得文件信息...");
+        self.send_request(ClientRequest::Setup {
             path: file_path.to_string(),
             chunk_size,
-        };
-
-        let spinner = crate::ui::Spinner::new("正在取得文件信息...");
-        self.send_request(&client_request).await?;
+        })
+        .await?;
 
         match self.next_response().await {
             Ok(Some(ServerResponse::SetupSuccess {
@@ -214,7 +206,7 @@ impl InteractiveSession {
         };
 
         ui::log_debug("正在发送 Start 请求...");
-        self.send_request(&client_request).await?;
+        self.send_request(client_request).await?;
         let remaining_size = match self.next_response().await? {
             Some(ServerResponse::StartSuccess { remaining_size }) => {
                 ui::log_debug(&format!(
@@ -234,7 +226,7 @@ impl InteractiveSession {
         let loop_result = self.event_loop(session.clone()).await;
 
         match loop_result {
-            Ok(time) => {
+            Ok(upload_time) => {
                 ui::log_debug("等待本地写入完成...");
 
                 let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
@@ -245,9 +237,15 @@ impl InteractiveSession {
                 })?;
 
                 session_to_finish.wait_for_completion().await?;
-                let bytes_per_second = remaining_size as f64 / time.as_secs_f64();
-                let speed_in_mb = bytes_per_second / (1024.0 * 1024.0);
-                let speed_str = format!("{speed_in_mb:.2} MB/s");
+                let secs = upload_time.as_secs_f64();
+                let speed_str = if secs > 0.0 {
+                    format!(
+                        "{:.2} MB/s",
+                        (remaining_size as f64 / secs) / (1024.0 * 1024.0)
+                    )
+                } else {
+                    "N/A".to_string()
+                };
                 println!("⚡ 下载完成，平均传输速度: {speed_str}");
                 Ok(())
             }
@@ -261,6 +259,7 @@ impl InteractiveSession {
     /// 接收服务端消息的主循环
     async fn event_loop(&mut self, gmf_session: Arc<GmfSession>) -> Result<Duration> {
         let total_chunks = gmf_session.total_chunks;
+        // 使用 Hashset 可以自动去重
         let mut completed_chunk_ids: HashSet<u64> = (0..self.resume_from_chunk_id).collect();
         let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
         let mut upload_completed = false;
@@ -295,8 +294,8 @@ impl InteractiveSession {
                             ui::log_debug(&format!("分块 #{chunk_id} 处理成功"));
                         },
                         Ok(ChunkResult::Timeout(chunk_id)) => {
-                            ui::log_warn(&format!("分块 #{chunk_id} 下载超时，正在重试..."));
-                            self.send_request(&ClientRequest::Retry { chunk_id }).await?;
+                            ui::log_debug(&format!("分块 #{chunk_id} 下载超时，正在重试..."));
+                            self.send_request(ClientRequest::Retry { chunk_id }).await?;
                         },
                         Ok(ChunkResult::Failure(chunk_id, err)) => {
                             let error_msg = format!("分块 #{chunk_id} 处理失败: {err:?}");
@@ -343,13 +342,7 @@ impl InteractiveSession {
                     }
                 },
 
-                _ = tokio::time::sleep(Duration::from_millis(100)), if upload_completed && !join_set.is_empty() => {
-                },
-
-                else => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    ui::log_warn("事件循环中没有可用的分支，这可能是一个逻辑错误");
-                }
+                _ = tokio::time::sleep(Duration::from_millis(100)), if upload_completed && !join_set.is_empty() => {},
             }
         }
 
@@ -357,9 +350,9 @@ impl InteractiveSession {
     }
 
     /// 向远程程序发送一条指令
-    pub async fn send_request(&self, request: &ClientRequest) -> Result<()> {
+    pub async fn send_request(&self, request: ClientRequest) -> Result<()> {
         self.command_tx
-            .send(request.clone())
+            .send(request)
             .await
             .context("向 I/O Actor 发送命令失败，通道可能已关闭")
     }
