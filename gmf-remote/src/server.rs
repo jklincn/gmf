@@ -45,7 +45,7 @@ pub async fn handle_message(
     message: Message,
     state: SharedState,
     sender: mpsc::Sender<Message>,
-    shutdown_rx: watch::Receiver<()>, // 接收关闭信号
+    shutdown_rx: watch::Receiver<()>,
 ) -> Result<Option<JoinHandle<()>>> {
     let request = match message {
         Message::Request(req) => req,
@@ -60,14 +60,16 @@ pub async fn handle_message(
     };
 
     match request {
-        ClientRequest::Setup(payload) => {
-            let response = setup(payload, state).await;
+        ClientRequest::Setup { path, chunk_size } => {
+            let response = setup(path, chunk_size, state).await;
             if sender.send(response.into()).await.is_err() {
                 error!("Channel closed. Could not send setup response.");
             }
             Ok(None)
         }
-        ClientRequest::Start(payload) => {
+        ClientRequest::Start {
+            resume_from_chunk_id,
+        } => {
             let (file_size, chunk_size) = {
                 let app_state = state.lock().await;
                 let metadata = app_state
@@ -76,26 +78,30 @@ pub async fn handle_message(
                     .context("任务未初始化。请在 'start' 之前先调用 'setup'")?;
                 (metadata.file_size, metadata.chunk_size)
             };
-            let sent_bytes = (payload.resume_from_chunk_id as u64) * chunk_size;
+            let sent_bytes = resume_from_chunk_id * chunk_size;
             let remaining_size = file_size.saturating_sub(sent_bytes);
-            let ack = ServerResponse::StartSuccess(StartResponse { remaining_size });
+            let ack = ServerResponse::StartSuccess { remaining_size };
             if sender.send(ack.into()).await.is_err() {
                 error!("Channel closed. Could not send StartSuccess ack.");
                 return Ok(None);
             }
-            let handle = tokio::spawn(start(payload, state, sender.clone(), shutdown_rx));
+            let handle = tokio::spawn(start(
+                resume_from_chunk_id,
+                state,
+                sender.clone(),
+                shutdown_rx,
+            ));
             Ok(Some(handle))
         }
-        ClientRequest::Retry(payload) => {
-            let chunk_id = payload.chunk_id;
+        ClientRequest::Retry { chunk_id } => {
             tokio::spawn(chunk_retry(chunk_id, state, sender.clone()));
             Ok(None)
         }
     }
 }
 
-pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerResponse {
-    if payload.chunk_size == 0 {
+pub async fn setup(path: String, chunk_size: u64, state: SharedState) -> ServerResponse {
+    if chunk_size == 0 {
         return ServerResponse::Error("chunk_size 不能为 0".to_string());
     }
 
@@ -103,41 +109,45 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
         return ServerResponse::Error(format!("远程 S3 客户端初始化失败: {e}"));
     }
 
-    let file_path_str = shellexpand::tilde(&payload.path).to_string();
+    // 进行一系列的文件（路径）检查
+    let file_path_str = shellexpand::tilde(&path).to_string();
     let file_path: PathBuf = match file_path_str.parse() {
         Ok(p) => p,
         Err(_) => {
-            return ServerResponse::Error(format!("提供的文件路径无效: '{}'", payload.path));
+            return ServerResponse::Error(format!("提供的文件路径无效: '{}'", path));
         }
     };
 
-    let file_name = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
+    let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name.to_string(),
+        None => {
+            return ServerResponse::Error(format!("无法从路径 '{}' 中提取有效的文件名", path));
+        }
+    };
 
-    if file_name.is_none() {
-        return ServerResponse::Error(format!("无法从路径 '{}' 中提取有效的文件名", payload.path));
-    }
-
-    // 尝试获取文件元数据，如果文件不存在，返回 NotFound
     let metadata = match tokio::fs::metadata(&file_path).await {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return ServerResponse::Error(format!("文件未找到: '{}'", file_path.display()));
         }
         Err(e) => {
-            // 其他文件系统错误（如权限问题）
             return ServerResponse::Error(format!("无法访问文件 '{}': {}", file_path.display(), e));
         }
     };
 
+    if metadata.is_dir() {
+        return ServerResponse::Error(format!(
+            "路径指向一个目录，而不是文件: '{}'",
+            file_path.display()
+        ));
+    }
+
     let file_size = metadata.len();
-    let total_chunks = (file_size as f64 / payload.chunk_size as f64).ceil() as u64;
+    let total_chunks = (file_size as f64 / chunk_size as f64).ceil() as u64;
 
     let task_metadata = TaskMetadata {
         file_path,
-        chunk_size: payload.chunk_size,
+        chunk_size,
         file_size,
         total_chunks,
     };
@@ -147,15 +157,15 @@ pub async fn setup(payload: SetupRequestPayload, state: SharedState) -> ServerRe
         app_state.metadata = Some(task_metadata);
     }
 
-    ServerResponse::SetupSuccess(SetupResponse {
-        file_name: file_name.unwrap(),
+    ServerResponse::SetupSuccess {
+        file_name,
         file_size,
         total_chunks,
-    })
+    }
 }
 
 pub async fn start(
-    payload: StartRequestPayload,
+    resume_from_chunk_id: u64,
     state: SharedState,
     sender: mpsc::Sender<Message>,
     mut shutdown_rx: watch::Receiver<()>,
@@ -217,8 +227,8 @@ pub async fn start(
                 .await
                 .with_context(|| format!("无法打开文件: {}", file_path.display()))?;
 
-            if payload.resume_from_chunk_id > 0 {
-                let offset = payload.resume_from_chunk_id * chunk_size;
+            if resume_from_chunk_id > 0 {
+                let offset = resume_from_chunk_id * chunk_size;
                 file.seek(tokio::io::SeekFrom::Start(offset))
                     .await
                     .with_context(|| format!("无法跳转到文件偏移量 {offset}"))?;
@@ -227,7 +237,7 @@ pub async fn start(
             let reader = BufReader::new(file);
 
             let mut file_reader_stream = Box::pin(stream::try_unfold(
-                (reader, payload.resume_from_chunk_id),
+                (reader, resume_from_chunk_id),
                 move |(mut reader, chunk_id)| async move {
                     let mut buf = vec![0u8; chunk_size as usize];
                     let mut filled = 0;

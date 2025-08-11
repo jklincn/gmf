@@ -12,9 +12,9 @@ pub enum Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ClientRequest {
-    Setup(SetupRequestPayload),
-    Start(StartRequestPayload),
-    Retry(RetryRequestPayload),
+    Setup { path: String, chunk_size: u64 },
+    Start { resume_from_chunk_id: u64 },
+    Retry { chunk_id: u64 },
 }
 
 /// 服务端响应类型的核心枚举。
@@ -22,8 +22,14 @@ pub enum ClientRequest {
 #[serde(tag = "type", content = "data")]
 pub enum ServerResponse {
     Ready,
-    SetupSuccess(SetupResponse),
-    StartSuccess(StartResponse),
+    SetupSuccess {
+        file_name: String,
+        file_size: u64,
+        total_chunks: u64,
+    },
+    StartSuccess {
+        remaining_size: u64,
+    },
     ChunkReadyForDownload {
         chunk_id: u64,
         passphrase_b64: String,
@@ -53,38 +59,4 @@ impl Message {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
-}
-
-// Setup 接口
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SetupRequestPayload {
-    pub path: String,
-    pub chunk_size: u64,
-}
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SetupResponse {
-    pub file_name: String,
-    pub file_size: u64,
-    pub total_chunks: u64,
-}
-
-// Start 接口
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct StartRequestPayload {
-    pub resume_from_chunk_id: u64,
-}
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct StartResponse {
-    pub remaining_size: u64,
-}
-
-// Retry 接口
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RetryRequestPayload {
-    pub chunk_id: u64,
-}
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RetryResponse {
-    pub chunk_id: u64,
-    pub passphrase_b64: String,
 }

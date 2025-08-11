@@ -147,24 +147,34 @@ impl InteractiveSession {
             }
         }
 
-        let client_request = ClientRequest::Setup(SetupRequestPayload {
+        let client_request = ClientRequest::Setup {
             path: file_path.to_string(),
             chunk_size,
-        });
+        };
 
         let spinner = crate::ui::Spinner::new("正在取得文件信息...");
         self.send_request(&client_request).await?;
 
         match self.next_response().await {
-            Ok(Some(ServerResponse::SetupSuccess(setup_response))) => {
+            Ok(Some(ServerResponse::SetupSuccess {
+                file_name,
+                file_size,
+                total_chunks,
+            })) => {
                 let success_msg = format!(
                     "✅ 文件名称: {} (大小: {})",
-                    setup_response.file_name,
-                    format_size(setup_response.file_size)
+                    file_name,
+                    format_size(file_size)
                 );
-
                 spinner.finish(&success_msg);
-                self.initialize_session(setup_response)?;
+
+                let (gmf_file, completed_chunks) =
+                    GMFFile::new_or_resume(&file_name, file_size, total_chunks)?;
+
+                ui::init_global_download_bar(total_chunks, completed_chunks)?;
+
+                self.resume_from_chunk_id = completed_chunks;
+                self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
             }
             Ok(Some(ServerResponse::Error(msg))) => {
                 let error_msg = format!("❌ 服务端错误: {msg}");
@@ -193,40 +203,25 @@ impl InteractiveSession {
         Ok(())
     }
 
-    fn initialize_session(&mut self, setup_response: SetupResponse) -> Result<()> {
-        let (gmf_file, completed_chunks) = GMFFile::new_or_resume(
-            &setup_response.file_name,
-            setup_response.file_size,
-            setup_response.total_chunks,
-        )?;
-
-        ui::init_global_download_bar(setup_response.total_chunks, completed_chunks)?;
-
-        self.resume_from_chunk_id = completed_chunks;
-        self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
-
-        Ok(())
-    }
-
     pub async fn start(&mut self) -> Result<()> {
         let session = self
             .file
             .take()
             .ok_or_else(|| anyhow!("内部状态错误: file 未初始化"))?;
 
-        let client_request = ClientRequest::Start(StartRequestPayload {
+        let client_request = ClientRequest::Start {
             resume_from_chunk_id: self.resume_from_chunk_id,
-        });
+        };
 
         ui::log_debug("正在发送 Start 请求...");
         self.send_request(&client_request).await?;
         let remaining_size = match self.next_response().await? {
-            Some(ServerResponse::StartSuccess(response)) => {
+            Some(ServerResponse::StartSuccess { remaining_size }) => {
                 ui::log_debug(&format!(
                     "服务端确认，需要传输的大小为 {} ，开始接收分块信息...",
-                    format_size(response.remaining_size)
+                    format_size(remaining_size)
                 ));
-                response.remaining_size
+                remaining_size
             }
             Some(other_response) => bail!(
                 "协议错误: 期望收到 StartSuccess，但收到 {:?}",
@@ -235,7 +230,7 @@ impl InteractiveSession {
             None => bail!("连接中断: 在等待 StartSuccess 响应时连接已关闭"),
         };
 
-        // 主事件循环 - 现在将整个 self 传递给事件循环
+        // 主事件循环
         let loop_result = self.event_loop(session.clone()).await;
 
         match loop_result {
@@ -295,16 +290,16 @@ impl InteractiveSession {
                 // 处理已完成的分块任务
                 Some(res) = join_set.join_next() => {
                     match res {
-                        Ok(ChunkResult::Success(id)) => {
-                            completed_chunk_ids.insert(id);
-                            ui::log_debug(&format!("分块 #{id} 处理成功"));
+                        Ok(ChunkResult::Success(chunk_id)) => {
+                            completed_chunk_ids.insert(chunk_id);
+                            ui::log_debug(&format!("分块 #{chunk_id} 处理成功"));
                         },
-                        Ok(ChunkResult::Timeout(id)) => {
-                            ui::log_warn(&format!("分块 #{id} 下载超时，正在重试..."));
-                            self.send_request(&ClientRequest::Retry(RetryRequestPayload { chunk_id: id })).await?;
+                        Ok(ChunkResult::Timeout(chunk_id)) => {
+                            ui::log_warn(&format!("分块 #{chunk_id} 下载超时，正在重试..."));
+                            self.send_request(&ClientRequest::Retry { chunk_id }).await?;
                         },
-                        Ok(ChunkResult::Failure(id, err)) => {
-                            let error_msg = format!("分块 #{id} 处理失败: {err:?}");
+                        Ok(ChunkResult::Failure(chunk_id, err)) => {
+                            let error_msg = format!("分块 #{chunk_id} 处理失败: {err:?}");
                             bail!(error_msg);
                         },
                         Err(join_err) => {
