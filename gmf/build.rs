@@ -3,6 +3,7 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
+use std::time::Instant;
 use std::{env, fs, path::PathBuf};
 use tar::Builder;
 
@@ -103,6 +104,7 @@ fn generate_gmf_remote_asset(out_dir: &Path, profile: &str) -> AssetInfo {
 }
 
 fn main() {
+    let start = Instant::now();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let profile = env::var("PROFILE").expect("PROFILE env var not set by Cargo");
 
@@ -127,4 +129,5 @@ pub const {prefix}_SHA256: &str = "{sha256}";
 
     let embed_rs_path = out_dir.join("embedded_assets.rs");
     fs::write(&embed_rs_path, final_content).expect("Failed to write embedded_assets.rs");
+    println!("cargo:warning=build.rs耗时: {:.2?}", start.elapsed());
 }
