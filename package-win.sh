@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Prerequisites
+# curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# rustup target add x86_64-unknown-linux-musl
+# rustup target add x86_64-pc-windows-gnu
+# sudo apt install mingw-w64 zip musl-tools build-essential cmake ninja-build perl pkg-config
+
 set -e
 
 export CARGO_BUILD_JOBS=6

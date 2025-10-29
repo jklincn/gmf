@@ -129,5 +129,5 @@ pub const {prefix}_SHA256: &str = "{sha256}";
 
     let embed_rs_path = out_dir.join("embedded_assets.rs");
     fs::write(&embed_rs_path, final_content).expect("Failed to write embedded_assets.rs");
-    println!("cargo:warning=build.rs耗时: {:.2?}", start.elapsed());
+    println!("cargo:warning=build.rs 耗时 {:.2?}", start.elapsed());
 }
