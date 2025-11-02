@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose};
+use futures::future::{AbortHandle, Abortable};
 use futures::{TryStreamExt, stream};
 use gmf_common::{
     consts::NONCE_SIZE,
@@ -180,14 +181,16 @@ pub async fn start(
             (metadata.file_path.clone(), metadata.chunk_size)
         };
 
+        // 生产者(加密) -> 消费者(上传)
         let (upload_tx, mut upload_rx) = mpsc::channel::<EncryptedChunk>(4);
 
-        // 3. 启动上传任务 (消费者)
+        // 3) 启动上传任务（消费者）
         let sender_clone = sender.clone();
         let mut upload_shutdown_rx = shutdown_rx.clone();
         let upload_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    // 一旦收到关闭信号，不等待队列清空，直接退出上传协程
                     _ = upload_shutdown_rx.changed() => {
                         info!("上传任务收到关闭信号，正在退出...");
                         break;
@@ -197,16 +200,47 @@ pub async fn start(
                             Some(encrypted_chunk) => {
                                 let chunk_id = encrypted_chunk.id;
                                 let passphrase_b64 = encrypted_chunk.passphrase_b64;
+                                let data = encrypted_chunk.data;
                                 let upload_start_time = std::time::Instant::now();
                                 info!("开始上传分块 #{chunk_id}...");
-                                if let Err(e) = put_object(&chunk_id.to_string(), encrypted_chunk.data).await {
-                                    return Err(e.context(format!("分块 #{chunk_id} 上传失败 (已自动重试)")));
-                                }
-                                info!("分块 #{chunk_id} 上传成功, 耗时: {} s", upload_start_time.elapsed().as_secs_f32());
-                                let success_response = ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64,retry:false };
-                                if sender_clone.send(success_response.into()).await.is_err() {
-                                    error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
-                                    return Err(anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"));
+
+                                let key = chunk_id.to_string();
+                                let (abort_handle, abort_reg) = AbortHandle::new_pair();
+                                let put_fut = put_object(&key, data);
+                                let abortable_put = Abortable::new(put_fut, abort_reg);
+
+                                // 竞争：上传完成 vs. 收到关闭信号 -> 中止上传
+                                tokio::select! {
+                                    res = abortable_put => {
+                                        match res {
+                                            Ok(put_res) => {
+                                                if let Err(e) = put_res {
+                                                    return Err(e.context(format!("分块 #{chunk_id} 上传失败 (已自动重试)")));
+                                                }
+                                                info!(
+                                                    "分块 #{chunk_id} 上传成功, 耗时: {} s",
+                                                    upload_start_time.elapsed().as_secs_f32()
+                                                );
+                                                let success_response = ServerResponse::ChunkReadyForDownload {
+                                                    chunk_id, passphrase_b64, retry:false
+                                                };
+                                                if sender_clone.send(success_response.into()).await.is_err() {
+                                                    error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
+                                                    return Err(anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"));
+                                                }
+                                            }
+                                            Err(Aborted) => {
+                                                // 被优雅关闭中止
+                                                warn!("分块 #{chunk_id} 上传已被中止（优雅关闭）");
+                                                break; // 退出上传协程
+                                            }
+                                        }
+                                    }
+                                    _ = upload_shutdown_rx.changed() => {
+                                        info!("收到关闭信号，正在中止当前分块 #{chunk_id} 上传");
+                                        abort_handle.abort(); // 使 abortable_put 立刻返回 Err(Aborted)
+                                        break; // 退出上传协程
+                                    }
                                 }
                             }
                             None => {
@@ -221,7 +255,7 @@ pub async fn start(
             Ok::<(), anyhow::Error>(())
         });
 
-        // 4. 主任务负责文件读取和加密 (生产者)
+        // 4) 主任务：读取 + 加密（生产者）
         let encryption_result: Result<()> = async {
             let mut file = File::open(&file_path)
                 .await
@@ -236,27 +270,31 @@ pub async fn start(
 
             let reader = BufReader::new(file);
 
-            let mut file_reader_stream = Box::pin(stream::try_unfold(
-                (reader, resume_from_chunk_id),
-                move |(mut reader, chunk_id)| async move {
-                    let mut buf = vec![0u8; chunk_size as usize];
-                    let mut filled = 0;
-                    loop {
-                        if filled == chunk_size as usize { break; }
-                        match reader.read(&mut buf[filled..]).await {
-                            Ok(0) => break,
-                            Ok(n) => filled += n,
-                            Err(e) => return Err(e),
+            let mut file_reader_stream = Box::pin(
+                stream::try_unfold(
+                    (reader, resume_from_chunk_id),
+                    move |(mut reader, chunk_id)| async move {
+                        let mut buf = vec![0u8; chunk_size as usize];
+                        let mut filled = 0;
+                        loop {
+                            if filled == chunk_size as usize { break; }
+                            match reader.read(&mut buf[filled..]).await {
+                                Ok(0) => break,
+                                Ok(n) => filled += n,
+                                Err(e) => return Err(e),
+                            }
                         }
-                    }
-                    if filled == 0 { Ok(None) } else {
-                        buf.truncate(filled);
-                        Ok(Some(((chunk_id, buf), (reader, chunk_id + 1))))
-                    }
-                },
-            ).map_err(anyhow::Error::from));
+                        if filled == 0 {
+                            Ok(None)
+                        } else {
+                            buf.truncate(filled);
+                            Ok(Some(((chunk_id, buf), (reader, chunk_id + 1))))
+                        }
+                    },
+                ).map_err(anyhow::Error::from)
+            );
 
-            // 使用循环和 select! 来处理流，以便可以中断
+            // 使用 select! 监听关闭信号，随时打断生产者
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -268,21 +306,22 @@ pub async fn start(
                             Ok(Some((chunk_id, data))) => {
                                 let encrypt_start_time = std::time::Instant::now();
                                 info!("开始加密分块 #{chunk_id}...");
-                                let (encrypted_data, passphrase_b64) = encrypt_chunk(&data)
-                                    .with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
-                                info!("分块 #{chunk_id} 加密成功，耗时: {} s，已发送到上传队列。", encrypt_start_time.elapsed().as_secs_f32());
+                                let (encrypted_data, passphrase_b64) =
+                                    encrypt_chunk(&data).with_context(|| format!("分块 #{chunk_id} 加密失败"))?;
+                                info!(
+                                    "分块 #{chunk_id} 加密成功，耗时: {} s，已发送到上传队列。",
+                                    encrypt_start_time.elapsed().as_secs_f32()
+                                );
                                 let chunk_to_upload = EncryptedChunk { id: chunk_id, data: encrypted_data, passphrase_b64 };
                                 if upload_tx.send(chunk_to_upload).await.is_err() {
                                     return Err(anyhow!("无法发送加密分块到上传队列：上传任务已终止"));
                                 }
                             }
                             Ok(None) => {
-                                // 文件读取完毕，正常退出循环
                                 info!("文件处理完成，所有分块已发送到上传队列");
                                 break;
                             }
                             Err(e) => {
-                                // 文件流发生错误
                                 return Err(e);
                             }
                         }
@@ -292,29 +331,31 @@ pub async fn start(
             Ok(())
         }.await;
 
-        // 5. 等待所有任务完成并处理结果
-        let was_interrupted = if let Err(e) = &encryption_result {
-            e.to_string() == "任务被用户中断"
-        } else {
-            false
-        };
-
+        // 5) 收尾：根据是否是“用户中断”决定如何处理上传协程
+        let was_interrupted = matches!(&encryption_result, Err(e) if e.to_string() == "任务被用户中断");
         let encryption_successful = encryption_result.is_ok();
 
-        // 如果是非中断错误，则传播错误
         if let Err(e) = encryption_result {
-            if e.to_string() != "任务被用户中断" {
+            if !was_interrupted {
                 return Err(e);
             }
         }
 
+        // 关闭生产者通道
         drop(upload_tx);
 
-        // 等待上传任务完成（处理完队列中剩余的所有项目）
-        info!("等待上传任务处理完队列中剩余的分块...");
-        upload_handle.await??;
+        if was_interrupted {
+            // 优雅关闭：不等待上传把队列吃完，直接中止上传协程
+            warn!("优雅关闭：不再等待上传队列清空，直接结束上传任务");
+            upload_handle.abort();
+            let _ = upload_handle.await; // 回收 JoinHandle，忽略结果
+        } else {
+            // 正常结束：等待上传处理完队列中剩余分块
+            info!("等待上传任务处理完队列中剩余的分块...");
+            upload_handle.await??;
+        }
 
-        // 根据任务完成情况发送不同的响应
+        // 根据任务完成情况发消息
         if was_interrupted {
             warn!("任务因用户中断而停止");
         } else if encryption_successful {
@@ -329,9 +370,8 @@ pub async fn start(
         Ok(())
     }.await;
 
-    // 如果上述任何步骤失败，发送一个 Error 消息（除非是用户中断）
+    // 统一错误出口（用户中断不视为错误）
     if let Err(e) = result {
-        // 如果是用户中断，只记录日志，不向客户端发送消息
         if e.to_string() == "任务被用户中断" {
             warn!("任务被用户中断，不发送错误消息给客户端");
         } else {
