@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use dialoguer::Input;
+use dialoguer::{Confirm, Input};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
@@ -24,6 +24,22 @@ fn config_path() -> PathBuf {
 }
 
 pub fn prompt_config() -> Result<()> {
+    let path = config_path();
+    if path.exists() {
+        eprintln!(
+            "Warning: config already exists at {}. It will be overwritten.",
+            path.display()
+        );
+        let proceed = Confirm::new()
+            .with_prompt("Continue and overwrite?")
+            .default(false)
+            .interact()?;
+        if !proceed {
+            println!("Aborted. No changes made.");
+            return Ok(());
+        }
+    }
+
     let account_id: String = Input::new().with_prompt("account_id").interact_text()?;
     let api_token: String = Input::new().with_prompt("api_token").interact_text()?;
     let subdomain: String = Input::new().with_prompt("subdomain").interact_text()?;
@@ -32,10 +48,9 @@ pub fn prompt_config() -> Result<()> {
         api_token,
         subdomain,
     };
-    let path = config_path();
     let content = toml::to_string_pretty(&cfg)?;
     fs::write(&path, content)?;
-    println!("✅ Config saved to {}", path.display());
+    println!("Config saved to {}", path.display());
     Ok(())
 }
 

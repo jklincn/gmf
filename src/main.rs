@@ -1,8 +1,6 @@
 mod config;
-mod core;
+mod cf;
 
-use crate::config::prompt_config;
-use crate::core::{create_worker, enable_workers_dev};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -17,17 +15,20 @@ struct Cli {
 enum Commands {
     /// Run interactive setup (gmf config)
     Config,
+    /// Push file to Cloudflare (gmf push)
+    Push,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    create_worker().await?;
-    enable_workers_dev().await?;
-
     let cli = Cli::parse();
     match cli.command {
         Commands::Config => {
-            prompt_config()?;
+            config::prompt_config()?;
+        }
+        Commands::Push => {
+            config::load_config()?;
+            cf::push().await?;
         }
     }
 
