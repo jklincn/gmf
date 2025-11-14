@@ -7,8 +7,9 @@ mod ui;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use config::{Config, ConfigError};
 use gmf_common::r2;
+
+use crate::config::set_r2;
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
 fn parse_chunk_size(s: &str) -> Result<u64> {
@@ -63,46 +64,13 @@ struct Args {
     verbose: bool,
 }
 
-async fn set_r2(cfg: &Config) -> Result<()> {
-    let s3_config = r2::S3Config {
-        endpoint: cfg.endpoint.clone(),
-        access_key_id: cfg.access_key_id.clone(),
-        secret_access_key: cfg.secret_access_key.clone(),
-    };
-    r2::init_s3_client(Some(s3_config)).await?;
-    r2::create_bucket().await?;
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     ui::init_global_logger(args.verbose)?;
 
-    let cfg_result = ui::run_with_spinner(
-        "正在加载配置文件...",
-        "✅ 配置文件加载成功",
-        config::load_or_create_config(),
-    )
-    .await;
-
-    let cfg = match cfg_result {
-        Ok(config) => config,
-        Err(e) => {
-            if e.downcast_ref::<ConfigError>().is_some() {
-                std::process::exit(0);
-            } else {
-                return Err(e);
-            }
-        }
-    };
-
-    ui::run_with_spinner(
-        "正在初始化 R2 客户端...",
-        "✅ R2 客户端初始化成功",
-        set_r2(&cfg),
-    )
-    .await?;
+    let cfg = config::load_or_create_config()?;
+    set_r2(&cfg).await?;
 
     let mut session = remote::InteractiveSession::new(&cfg, args.verbose).await?;
 
@@ -136,7 +104,7 @@ async fn main() -> Result<()> {
     }
 
     // 清理 Bucket
-    if let Err(e) = r2::delete_bucket_with_retry().await {
+    if let Err(e) = r2::delete_bucket().await {
         ui::log_error(&format!("清理 Bucket 时发生错误: {e:#}"));
     }
 

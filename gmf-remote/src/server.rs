@@ -9,7 +9,7 @@ use futures::{TryStreamExt, stream};
 use gmf_common::{
     consts::NONCE_SIZE,
     interface::*,
-    r2::{init_s3_client, put_object},
+    r2::{init_s3, put_object},
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
@@ -106,7 +106,7 @@ pub async fn setup(path: String, chunk_size: u64, state: SharedState) -> ServerR
         return ServerResponse::Error("chunk_size 不能为 0".to_string());
     }
 
-    if let Err(e) = init_s3_client(None).await {
+    if let Err(e) = init_s3(None).await {
         return ServerResponse::Error(format!("远程 S3 客户端初始化失败: {e}"));
     }
 
@@ -206,7 +206,7 @@ pub async fn start(
 
                                 let key = chunk_id.to_string();
                                 let (abort_handle, abort_reg) = AbortHandle::new_pair();
-                                let put_fut = put_object(&key, data);
+                                let put_fut = put_object(&key, &data);
                                 let abortable_put = Abortable::new(put_fut, abort_reg);
 
                                 // 竞争：上传完成 vs. 收到关闭信号 -> 中止上传
@@ -229,7 +229,7 @@ pub async fn start(
                                                     return Err(anyhow!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭"));
                                                 }
                                             }
-                                            Err(Aborted) => {
+                                            Err(_) => {
                                                 // 被优雅关闭中止
                                                 warn!("分块 #{chunk_id} 上传已被中止（优雅关闭）");
                                                 break; // 退出上传协程
@@ -461,7 +461,7 @@ pub async fn chunk_retry(chunk_id: u64, state: SharedState, sender: mpsc::Sender
 
         let upload_start_time = std::time::Instant::now();
         info!("开始上传分块 #{chunk_id}...");
-        put_object(&chunk_id.to_string(), encrypted_data)
+        put_object(&chunk_id.to_string(), &encrypted_data)
             .await
             .with_context(|| format!("分块 #{chunk_id} 上传失败 (已自动重试)"))?;
         info!(

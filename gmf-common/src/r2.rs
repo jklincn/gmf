@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, anyhow};
-use aws_config::{self, BehaviorVersion, Region, retry::RetryConfig, timeout::TimeoutConfig};
-use aws_sdk_s3::{self as s3, config::Credentials, error::ProvideErrorMetadata};
 use bytes::Bytes;
-use std::{env, time::Duration};
-use tokio::{
-    sync::OnceCell,
-    time::{sleep, timeout},
-};
+use std::env;
+use tokio::sync::OnceCell;
 
-static S3_CLIENT: OnceCell<s3::Client> = OnceCell::const_new();
+use s3::creds::Credentials;
+use s3::region::Region;
+use s3::{Bucket, BucketConfiguration};
+
+static S3_CONFIG: OnceCell<S3Config> = OnceCell::const_new();
+static BUCKET: OnceCell<Box<Bucket>> = OnceCell::const_new();
 
 const BUCKET_NAME: &str = "gmf";
 
@@ -19,252 +19,124 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
-pub async fn init_s3_client(config_override: Option<S3Config>) -> Result<()> {
-    if S3_CLIENT.get().is_some() {
-        return Err(anyhow!("S3 客户端已经被初始化"));
-    }
+pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
+    S3_CONFIG
+        .set(match config_override {
+            Some(cfg) => cfg,
+            None => S3Config {
+                endpoint: env::var("ENDPOINT").context("环境变量 'ENDPOINT' 未设置")?,
+                access_key_id: env::var("ACCESS_KEY_ID")
+                    .context("环境变量 'ACCESS_KEY_ID' 未设置")?,
+                secret_access_key: env::var("SECRET_ACCESS_KEY")
+                    .context("环境变量 'SECRET_ACCESS_KEY' 未设置")?,
+            },
+        })
+        .map_err(|_| anyhow!("S3 配置已初始化，不可重复初始化"))?;
 
-    let (endpoint, access_key_id, secret_access_key, retry_config, timeout_config) =
-        if let Some(config) = config_override.clone() {
-            // 客户端配置
-            // 超时和重试手动处理
-            let retry_config = RetryConfig::standard()
-                .with_max_attempts(5)
-                .with_initial_backoff(Duration::from_millis(500))
-                .with_max_backoff(Duration::from_millis(500));
-            let timeout_config = TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .operation_attempt_timeout(Duration::from_secs(10))
-                .operation_timeout(Duration::from_secs(60))
-                .build();
-            (
-                config.endpoint,
-                config.access_key_id,
-                config.secret_access_key,
-                retry_config,
-                timeout_config,
-            )
+    let cfg = S3_CONFIG.get().unwrap();
+    let region = Region::Custom {
+        region: "us-east-1".to_string(),
+        endpoint: cfg.endpoint.clone(),
+    };
+    let credentials = Credentials::new(
+        Some(&cfg.access_key_id),
+        Some(&cfg.secret_access_key),
+        None,
+        None,
+        None,
+    )?;
+    let bucket = Bucket::new(BUCKET_NAME, region.clone(), credentials.clone())?.with_path_style();
+    let final_bucket = if !bucket.exists().await? {
+        let config = BucketConfiguration::default();
+        let resp = Bucket::create(BUCKET_NAME, region, credentials, config).await?;
+        if resp.success() {
+            resp.bucket
         } else {
-            // 服务端配置
-            let endpoint = env::var("ENDPOINT").context("环境变量 'ENDPOINT' 未设置")?;
-            let access_key_id =
-                env::var("ACCESS_KEY_ID").context("环境变量 'ACCESS_KEY_ID' 未设置")?;
-            let secret_access_key =
-                env::var("SECRET_ACCESS_KEY").context("环境变量 'SECRET_ACCESS_KEY' 未设置")?;
-            let retry_config = RetryConfig::standard()
-                .with_max_attempts(3)
-                .with_initial_backoff(Duration::from_millis(500))
-                .with_max_backoff(Duration::from_millis(500));
-            let timeout_config = TimeoutConfig::builder()
-                .connect_timeout(Duration::from_secs(3))
-                .operation_timeout(Duration::from_secs(60))
-                .operation_attempt_timeout(Duration::from_secs(20))
-                .build();
-            (
-                endpoint,
-                access_key_id,
-                secret_access_key,
-                retry_config,
-                timeout_config,
-            )
-        };
+            return Err(anyhow!("创建 S3 bucket 失败"));
+        }
+    } else {
+        bucket
+    };
 
-    // 构建配置
-    let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
-        .endpoint_url(endpoint)
-        .region(Region::new("us-east-1"))
-        .credentials_provider(Credentials::new(
-            access_key_id,
-            secret_access_key,
-            None,
-            None,
-            "R2",
-        ))
-        .retry_config(retry_config)
-        .timeout_config(timeout_config)
-        .load()
-        .await;
-
-    let client = s3::Client::new(&config);
-
-    S3_CLIENT
-        .set(client)
-        .map_err(|_| anyhow!("内部错误: 设置 S3 客户端失败，可能已被其他线程初始化"))?;
-
-    // 服务端预热
-    if config_override.is_none() {
-        let client_to_warm_up = S3_CLIENT.get().unwrap();
-        let _ = client_to_warm_up
-            .put_object()
-            .bucket(BUCKET_NAME)
-            .key("0")
-            .body(s3::primitives::ByteStream::from(Vec::new()))
-            .send()
-            .await;
-        let _ = client_to_warm_up
-            .delete_object()
-            .bucket(BUCKET_NAME)
-            .key("0")
-            .send()
-            .await;
-    }
+    BUCKET
+        .set(final_bucket)
+        .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
 
     Ok(())
 }
 
-fn get_s3_client() -> Result<&'static s3::Client> {
-    S3_CLIENT.get().context("内部错误: S3 客户端尚未初始化")
-}
-
-pub async fn list_buckets() -> Result<Vec<String>> {
-    let client = get_s3_client()?;
-    let resp = client.list_buckets().send().await?;
-    let buckets = resp.buckets();
-    let bucket_names: Vec<String> = buckets
-        .iter()
-        .filter_map(|b| b.name().map(|n| n.to_string()))
-        .collect();
-    Ok(bucket_names)
-}
-
-pub async fn create_bucket() -> Result<()> {
-    let client = get_s3_client()?;
-    let exist_buckets = list_buckets().await?;
-    if exist_buckets.contains(&BUCKET_NAME.to_string()) {
-        return Ok(());
-    }
-    client.create_bucket().bucket(BUCKET_NAME).send().await?;
-    Ok(())
+pub fn get_bucket() -> Result<&'static Bucket> {
+    BUCKET
+        .get()
+        .map(|b| b.as_ref())
+        .context("S3 Bucket 尚未初始化，请先调用 init_s3()")
 }
 
 pub async fn list_objects() -> Result<Vec<String>> {
-    let client = get_s3_client()?;
-
-    let list_objects_output = client.list_objects_v2().bucket(BUCKET_NAME).send().await?;
-    let mut object_keys = Vec::new();
-    for object in list_objects_output.contents() {
-        if let Some(key) = object.key() {
-            object_keys.push(key.to_string());
+    let bucket = get_bucket()?;
+    let mut keys = Vec::new();
+    let results = bucket
+        .list("".to_string(), None)
+        .await
+        .context("列出对象失败")?;
+    for page in results {
+        for obj in page.contents {
+            keys.push(obj.key);
         }
     }
-    Ok(object_keys)
+    Ok(keys)
 }
 
 pub async fn delete_object(key: &str) -> Result<()> {
-    let client = get_s3_client()?;
-
-    client
-        .delete_object()
-        .bucket(BUCKET_NAME)
-        .key(key)
-        .send()
-        .await?;
-    Ok(())
-}
-
-pub async fn delete_objects(objects_to_delete: Vec<String>) -> Result<()> {
-    let client = get_s3_client()?;
-
-    let mut delete_object_ids: Vec<aws_sdk_s3::types::ObjectIdentifier> = vec![];
-    for obj in objects_to_delete {
-        let obj_id = aws_sdk_s3::types::ObjectIdentifier::builder()
-            .key(obj)
-            .build()?;
-        delete_object_ids.push(obj_id);
+    let bucket = get_bucket()?;
+    let resp = bucket.delete_object(key).await?;
+    let code = resp.status_code();
+    if code != 204 {
+        return Err(anyhow!("删除对象失败, key={}, 状态码={}", key, code));
     }
-
-    client
-        .delete_objects()
-        .bucket(BUCKET_NAME)
-        .delete(
-            aws_sdk_s3::types::Delete::builder()
-                .set_objects(Some(delete_object_ids))
-                .build()?,
-        )
-        .send()
-        .await?;
     Ok(())
 }
 
-pub async fn delete_bucket_with_retry() -> Result<()> {
-    let client = get_s3_client()?;
-
-    loop {
-        // 尝试删除存储桶
-        match client.delete_bucket().bucket(BUCKET_NAME).send().await {
-            // 如果成功
-            Ok(_) => {
-                break; // 成功，跳出循环
-            }
-            // 如果失败
-            Err(sdk_error) => {
-                if let Some(service_error) = sdk_error.as_service_error() {
-                    // 检查错误码是否为 "BucketNotEmpty"
-                    if service_error.code() == Some("BucketNotEmpty") {
-                        let objects = list_objects().await?;
-                        if !objects.is_empty() {
-                            delete_objects(objects).await?;
-                        }
-
-                        // 等待1秒后重试
-                        sleep(Duration::from_secs(1)).await;
-                        continue; // 继续下一次循环
-                    }
-                }
-                return Err(sdk_error.into());
+pub async fn delete_bucket() -> Result<()> {
+    let bucket = get_bucket()?;
+    let objects = list_objects().await?;
+    if !objects.is_empty() {
+        for key in objects {
+            let resp = bucket.delete_object(&key).await?;
+            let code = resp.status_code();
+            if code != 204 {
+                return Err(anyhow!("删除对象失败, key={}, 状态码={}", key, code));
             }
         }
     }
-
+    bucket.delete().await?;
     Ok(())
 }
 
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn get_object(key: &str) -> Result<Bytes> {
-    let client = get_s3_client()?;
-    let get_object_override_config = aws_sdk_s3::config::Builder::default()
-        .retry_config(RetryConfig::disabled())
-        .timeout_config(TimeoutConfig::disabled());
-
-    // 手动控制下载 10 秒超时
-    match timeout(ATTEMPT_TIMEOUT, async {
-        let resp = client
-            .get_object()
-            .bucket(BUCKET_NAME)
-            .key(key)
-            .customize()
-            .config_override(get_object_override_config.clone())
-            .send()
-            .await?;
-
-        let body = resp
-            .body
-            .collect()
-            .await
-            .context("Failed to collect S3 object body during download")?;
-
-        Ok(body.into_bytes())
-    })
-    .await
-    {
-        // 超时
-        Err(_) => Err(anyhow!("Operation timed out after {:?}", ATTEMPT_TIMEOUT)),
-        // 未超时，但内部有错误
-        Ok(Err(e)) => Err(e),
-        // 成功
-        Ok(Ok(bytes)) => Ok(bytes),
+    let bucket = get_bucket()?;
+    let resp = bucket.get_object(key).await?;
+    let code = resp.status_code();
+    if code != 200 {
+        return Err(anyhow!(
+            "Failed to download object, key={}, status_code={}",
+            key,
+            code
+        ));
     }
+    Ok(Bytes::copy_from_slice(resp.as_slice()))
 }
 
-pub async fn put_object(key: &str, data: Vec<u8>) -> Result<()> {
-    let client = get_s3_client()?;
-    let body = s3::primitives::ByteStream::from(data);
-    client
-        .put_object()
-        .bucket(BUCKET_NAME)
-        .key(key)
-        .body(body)
-        .send()
-        .await?;
+pub async fn put_object(key: &str, data: &[u8]) -> Result<()> {
+    let bucket = get_bucket()?;
+    let resp = bucket.put_object(key, data).await?;
+    let code = resp.status_code();
+    if code != 200 {
+        return Err(anyhow!(
+            "Failed to upload object, key={}, status_code={}",
+            key,
+            code
+        ));
+    }
     Ok(())
 }

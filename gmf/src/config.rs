@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
+use gmf_common::r2;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{fs, path::PathBuf};
 use thiserror::Error;
-
-const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -11,7 +10,7 @@ pub enum ConfigError {
     Created(String),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -24,9 +23,19 @@ pub struct Config {
     pub secret_access_key: String,
 }
 
+fn config_path() -> PathBuf {
+    let base = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .expect("Cannot determine config directory");
+
+    let gmf_dir = base.join("gmf");
+    fs::create_dir_all(&gmf_dir).expect("Failed to create config directory");
+    gmf_dir.join("config.toml")
+}
+
 /// 加载或创建配置文件
-pub async fn load_or_create_config() -> Result<Config> {
-    let path = Path::new(CONFIG_FILE_NAME);
+pub fn load_or_create_config() -> Result<Config> {
+    let path = config_path();
     if path.exists() {
         let content = fs::read_to_string(path).context("读取配置文件失败")?;
         let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
@@ -59,7 +68,7 @@ user = "{}"
 # 密码 (推荐使用密钥登陆，如果启用密码，则会忽略密钥)
 # password = "{}"
 
-# 私钥路径 (Windows中文件路径注意使用单引号或双反斜杠, 例如: 'C:\\Users\\user\\.ssh\\id_rsa)
+# 私钥路径 (Windows中文件路径注意使用单引号或双反斜杠, 例如: 'C:\\Users\\user\\.ssh\\id_rsa')
 private_key_path = '{}'
 
 # ======== Cloudflare R2 对象存储配置 =========
@@ -84,6 +93,16 @@ secret_access_key = "{}"
         );
 
         fs::write(path, config_content).context("写入默认配置失败")?;
-        Err(ConfigError::Created(CONFIG_FILE_NAME.to_string()).into())
+        Err(ConfigError::Created(config_path().to_string_lossy().into_owned()).into())
     }
+}
+
+pub async fn set_r2(cfg: &Config) -> Result<()> {
+    let s3_config = r2::S3Config {
+        endpoint: cfg.endpoint.clone(),
+        access_key_id: cfg.access_key_id.clone(),
+        secret_access_key: cfg.secret_access_key.clone(),
+    };
+    r2::init_s3(Some(s3_config)).await?;
+    Ok(())
 }

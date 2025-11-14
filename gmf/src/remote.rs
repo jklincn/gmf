@@ -169,24 +169,24 @@ impl InteractiveSession {
                 self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
             }
             Ok(Some(ServerResponse::Error(msg))) => {
-                let error_msg = format!("❌ 服务端错误: {msg}");
+                let error_msg = format!("服务端错误: {msg}");
                 spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(other_response)) => {
                 let error_msg =
-                    format!("❌ 意外的响应: 收到了非预期的服务器响应 {other_response:?}");
+                    format!("意外的响应: 收到了非预期的服务器响应 {other_response:?}");
                 spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(None) => {
-                let error_msg = "❌ 连接中断: 在等待设置响应时连接已关闭";
+                let error_msg = "连接中断: 在等待设置响应时连接已关闭";
                 spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Err(e) => {
                 // 这是 next_response() 本身发生的错误，如网络层或反序列化错误
-                let error_msg = format!("❌ 通信错误: {e}");
+                let error_msg = format!("通信错误: {e}");
                 spinner.abandon();
                 return Err(e.context(error_msg));
             }
