@@ -2,13 +2,6 @@ use anyhow::{Context, Result};
 use gmf_common::r2;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum ConfigError {
-    #[error("配置文件 '{0}' 已创建，请根据实际情况修改后重新运行程序。")]
-    Created(String),
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
@@ -23,7 +16,7 @@ pub struct Config {
     pub secret_access_key: String,
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     let base = dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .expect("Cannot determine config directory");
@@ -34,27 +27,27 @@ fn config_path() -> PathBuf {
 }
 
 /// 加载或创建配置文件
-pub fn load_or_create_config() -> Result<Config> {
+pub fn load_or_create_config() -> Result<Option<Config>> {
     let path = config_path();
     if path.exists() {
         let content = fs::read_to_string(path).context("读取配置文件失败")?;
         let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
-        Ok(cfg)
-    } else {
-        // 创建一个默认配置的实例
-        let default = Config {
-            host: "192.168.1.1".into(),
-            port: 22,
-            user: "user".into(),
-            password: Some("password".into()),
-            private_key_path: Some("your_private_key_path".into()),
-            endpoint: "https://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.r2.cloudflarestorage.com".into(),
-            access_key_id: "your_access_key_id".into(),
-            secret_access_key: "your_secret_access_key".into(),
-        };
+        return Ok(Some(cfg))
+    }
+    // 创建一个默认配置的实例
+    let default = Config {
+        host: "192.168.1.1".into(),
+        port: 22,
+        user: "user".into(),
+        password: Some("password".into()),
+        private_key_path: Some("your_private_key_path".into()),
+        endpoint: "https://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.r2.cloudflarestorage.com".into(),
+        access_key_id: "your_access_key_id".into(),
+        secret_access_key: "your_secret_access_key".into(),
+    };
 
-        let config_content = format!(
-            r#"# =============== SSH 连接配置 ================
+    let config_content = format!(
+        r#"# =============== SSH 连接配置 ================
 
 # 目标主机IP或域名
 host = "{}"
@@ -82,19 +75,18 @@ access_key_id = "{}"
 # Cloudflare R2 机密访问密钥
 secret_access_key = "{}"
 "#,
-            default.host,
-            default.port,
-            default.user,
-            default.password.as_deref().unwrap(),
-            default.private_key_path.as_deref().unwrap(),
-            default.endpoint,
-            default.access_key_id,
-            default.secret_access_key
-        );
+        default.host,
+        default.port,
+        default.user,
+        default.password.as_deref().unwrap(),
+        default.private_key_path.as_deref().unwrap(),
+        default.endpoint,
+        default.access_key_id,
+        default.secret_access_key
+    );
 
-        fs::write(path, config_content).context("写入默认配置失败")?;
-        Err(ConfigError::Created(config_path().to_string_lossy().into_owned()).into())
-    }
+    fs::write(&path, config_content).context("写入默认配置失败")?;
+    Ok(None)
 }
 
 pub async fn set_r2(cfg: &Config) -> Result<()> {

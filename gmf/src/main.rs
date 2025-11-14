@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use gmf_common::r2;
 
-use crate::config::set_r2;
+use crate::config::{config_path, set_r2};
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
 fn parse_chunk_size(s: &str) -> Result<u64> {
@@ -69,7 +69,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     ui::init_global_logger(args.verbose)?;
 
-    let cfg = config::load_or_create_config()?;
+    let cfg = match config::load_or_create_config()? {
+        Some(cfg) => cfg,
+        None => {
+            println!("配置文件已创建，请根据实际情况修改后重新运行程序。");
+            println!("路径: {}", config_path().display());
+            return Ok(());
+        }
+    };
     set_r2(&cfg).await?;
 
     let mut session = remote::InteractiveSession::new(&cfg, args.verbose).await?;
