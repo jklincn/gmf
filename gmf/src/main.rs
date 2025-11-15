@@ -1,6 +1,6 @@
+mod comm;
 mod config;
 mod file;
-mod communicator;
 mod remote;
 mod ssh;
 mod ui;
@@ -82,7 +82,7 @@ async fn real_main(args: Args) -> Result<()> {
         // 分支 2: Ctrl+C
         _ = tokio::signal::ctrl_c() => {
             ui::abandon_download();
-            ui::log_warn("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
+            ui::log_warn("正在中断任务...");
             Ok(())
         }
     };

@@ -1,5 +1,5 @@
+use crate::comm::SSHCommunicator;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
-use crate::communicator::SSHCommunicator;
 use crate::ssh;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
@@ -44,7 +44,7 @@ pub struct GMFClient {
     command_tx: mpsc::Sender<ClientRequest>,
     // 用于从 SSHCommunicator 接收响应
     response_rx: mpsc::Receiver<ServerResponse>,
-    // SSHCommunicator 任务的句柄，用于在 shutdown 时等待它结束
+    // 通过 handle 管理 comm 生命周期
     comm_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::SSHSession,
@@ -80,11 +80,13 @@ impl GMFClient {
             .context("以交互模式启动 gmf-remote 失败")?;
         ui::log_debug("gmf-remote 已成功启动");
 
+        // comm 持有发送命令的接收端以及响应的发送端，以及 ssh_channel
+        // client 持有发送命令的发送端以及响应的接收端，以及 ssh_session
         let (command_tx, command_rx) = mpsc::channel(100);
         let (response_tx, response_rx) = mpsc::channel(100);
 
         let comm = SSHCommunicator::new(ssh_channel, command_rx, response_tx);
-        let comm_handle = tokio::spawn(comm.run());
+        let comm_handle = tokio::spawn(comm.run()); // 通过 handle 管理 comm 生命周期
 
         ui::log_debug("本地通信器已成功启动");
 
@@ -346,13 +348,11 @@ impl GMFClient {
         drop(self.command_tx);
 
         // 等待 SSHCommunicator 任务结束
-        match tokio::time::timeout(Duration::from_secs(10), self.comm_handle).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => ui::log_error(&format!("等待 I/O Actor 退出时发生错误: {e:?}")),
-            Err(_) => ui::log_warn("等待 I/O Actor 退出超时！"),
+        if let Err(e) = self.comm_handle.await {
+            ui::log_warn(&format!("I/O Actor 任务异常退出: {e:?}"));
         }
 
-        // 关闭 SSH 会话
+        // 关闭 SSH 会话，触发远程程序退出
         self.ssh_session.close().await?;
 
         Ok(())
