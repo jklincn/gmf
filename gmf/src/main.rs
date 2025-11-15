@@ -69,13 +69,13 @@ async fn real_main(args: Args) -> Result<()> {
     ui::init_global_logger(args.verbose)?;
 
     ui::log_info("正在连接...");
-    let ((), mut session) = try_join!(init_r2(), remote::InteractiveSession::new(args.verbose),)?;
+    let ((), mut client) = try_join!(init_r2(), remote::GMFClient::new(args.verbose),)?;
 
     let result: Result<()> = tokio::select! {
         // 分支 1: 正常执行业务逻辑
         res = async {
-            session.setup(&args.path, args.chunk_size).await?;
-            session.start().await?;
+            client.setup(&args.path, args.chunk_size).await?;
+            client.start().await?;
             Ok(())
         } => res,
 
@@ -87,7 +87,7 @@ async fn real_main(args: Args) -> Result<()> {
         }
     };
 
-    if let Err(e) = session.shutdown().await {
+    if let Err(e) = client.shutdown().await {
         ui::log_error(&format!("清理 session 错误: {e:#}"));
     }
 

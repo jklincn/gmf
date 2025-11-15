@@ -39,13 +39,13 @@ async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
     Ok(REMOTE_PATH.to_string())
 }
 
-pub struct InteractiveSession {
+pub struct GMFClient {
     // 用于向 SSHCommunicator 发送命令
     command_tx: mpsc::Sender<ClientRequest>,
     // 用于从 SSHCommunicator 接收响应
     response_rx: mpsc::Receiver<ServerResponse>,
     // SSHCommunicator 任务的句柄，用于在 shutdown 时等待它结束
-    actor_handle: JoinHandle<()>,
+    comm_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::SSHSession,
     // GMF 文件管理
@@ -53,7 +53,7 @@ pub struct InteractiveSession {
     resume_from_chunk_id: u64,
 }
 
-impl InteractiveSession {
+impl GMFClient {
     /// 启动远程程序并创建一个新的交互式会话。
     pub async fn new(verbose: bool) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
@@ -83,13 +83,15 @@ impl InteractiveSession {
         let (command_tx, command_rx) = mpsc::channel(100);
         let (response_tx, response_rx) = mpsc::channel(100);
 
-        let actor = SSHCommunicator::new(ssh_channel, command_rx, response_tx);
-        let actor_handle = tokio::spawn(actor.run());
+        let comm = SSHCommunicator::new(ssh_channel, command_rx, response_tx);
+        let comm_handle = tokio::spawn(comm.run());
+
+        ui::log_debug("本地通信器已成功启动");
 
         Ok(Self {
             command_tx,
             response_rx,
-            actor_handle,
+            comm_handle,
             ssh_session,
             file: None,
             resume_from_chunk_id: 0,
@@ -344,7 +346,7 @@ impl InteractiveSession {
         drop(self.command_tx);
 
         // 等待 SSHCommunicator 任务结束
-        match tokio::time::timeout(Duration::from_secs(10), self.actor_handle).await {
+        match tokio::time::timeout(Duration::from_secs(10), self.comm_handle).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => ui::log_error(&format!("等待 I/O Actor 退出时发生错误: {e:?}")),
             Err(_) => ui::log_warn("等待 I/O Actor 退出超时！"),
