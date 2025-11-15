@@ -14,13 +14,8 @@ use tokio::{
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
-async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
-    let mut ssh = ui::run_with_spinner(
-        "正在连接远程服务器...",
-        "✅ 远程服务器连接成功",
-        ssh::Session::connect(cfg),
-    )
-    .await?;
+async fn check_remote(cfg: &Config) -> Result<(ssh::SSHSession, String)> {
+    let mut ssh = ssh::SSHSession::connect(cfg).await?;
 
     const REMOTE_BIN_DIR: &str = "$HOME/.local/bin";
     const REMOTE_PATH: &str = "$HOME/.local/bin/gmf-remote";
@@ -41,18 +36,11 @@ async fn check_remote(cfg: &Config) -> Result<(ssh::Session, String)> {
 
     // 如果需要，则进行安装/更新
     if needs_install {
-        let msg = "正在安装服务端至远程目录 (~/.local/bin)...".to_string();
-        ui::run_with_spinner::<_, (), anyhow::Error>(&msg, "✅ 远程服务端安装成功", async {
-            // 第一步：创建目录
-            ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
-
-            // 第二步：上传并解压
-            ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
-                .await?;
-
-            Ok(())
-        })
-        .await?;
+        ui::log_info("正在安装服务端至远程目录 (~/.local/bin)...");
+        ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
+        // 第二步：上传并解压
+        ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
+            .await?;
     }
 
     Ok((ssh, REMOTE_PATH.to_string()))
@@ -66,7 +54,7 @@ pub struct InteractiveSession {
     // IoActor 任务的句柄，用于在 shutdown 时等待它结束
     actor_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
-    ssh_session: ssh::Session,
+    ssh_session: ssh::SSHSession,
     // GMF 文件管理
     file: Option<Arc<GmfSession>>,
     resume_from_chunk_id: u64,

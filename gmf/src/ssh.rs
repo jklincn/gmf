@@ -32,11 +32,11 @@ pub enum CallResult {
     Interactive(Channel<client::Msg>),
 }
 
-pub struct Session {
+pub struct SSHSession {
     session: client::Handle<ClientHandle>,
 }
 
-impl Session {
+impl SSHSession {
     pub async fn connect(cfg: &Config) -> Result<Self> {
         let config = client::Config {
             inactivity_timeout: Some(Duration::from_secs(60)),

@@ -221,27 +221,3 @@ impl Spinner {
         self.sp.abandon();
     }
 }
-
-pub async fn run_with_spinner<F, T, E>(
-    loading_msg: &str,
-    success_msg: &str,
-    task: F,
-) -> Result<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    let spinner = Spinner::new(loading_msg);
-
-    match task.await {
-        Ok(value) => {
-            spinner.finish(success_msg);
-            Ok(value)
-        }
-        Err(error) => {
-            let error_message = format!("❌ 运行失败: {error}");
-            spinner.finish(&error_message);
-            Err(error)
-        }
-    }
-}

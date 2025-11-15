@@ -68,6 +68,7 @@ struct Args {
 async fn real_main(args: Args) -> Result<()> {
     ui::init_global_logger(args.verbose)?;
 
+    ui::log_info("正在连接...");
     let ((), mut session) = try_join!(init_r2(), remote::InteractiveSession::new(args.verbose),)?;
 
     let result: Result<()> = tokio::select! {
