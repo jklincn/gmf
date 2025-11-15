@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use gmf_common::r2;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -16,7 +17,7 @@ pub struct Config {
     pub secret_access_key: String,
 }
 
-pub fn config_path() -> PathBuf {
+fn config_path() -> PathBuf {
     let base = dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .expect("Cannot determine config directory");
@@ -27,12 +28,12 @@ pub fn config_path() -> PathBuf {
 }
 
 /// 加载或创建配置文件
-pub fn load_or_create_config() -> Result<Option<Config>> {
+fn load_or_create_config() -> Result<Option<Config>> {
     let path = config_path();
     if path.exists() {
         let content = fs::read_to_string(path).context("读取配置文件失败")?;
         let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
-        return Ok(Some(cfg))
+        return Ok(Some(cfg));
     }
     // 创建一个默认配置的实例
     let default = Config {
@@ -89,7 +90,8 @@ secret_access_key = "{}"
     Ok(None)
 }
 
-pub async fn set_r2(cfg: &Config) -> Result<()> {
+pub async fn init_r2() -> Result<()> {
+    let cfg = get_config();
     let s3_config = r2::S3Config {
         endpoint: cfg.endpoint.clone(),
         access_key_id: cfg.access_key_id.clone(),
@@ -97,4 +99,21 @@ pub async fn set_r2(cfg: &Config) -> Result<()> {
     };
     r2::init_s3(Some(s3_config)).await?;
     Ok(())
+}
+
+static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
+
+pub fn get_config() -> &'static Config {
+    GLOBAL_CONFIG.get_or_init(|| {
+        let result = load_or_create_config().expect("读取配置失败");
+
+        match result {
+            Some(cfg) => cfg,
+            None => {
+                println!("配置文件已创建，请根据实际情况修改后重新运行程序。");
+                println!("路径: {}", config_path().display());
+                std::process::exit(0);
+            }
+        }
+    })
 }

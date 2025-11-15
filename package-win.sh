@@ -29,3 +29,5 @@ echo ""
 echo "--- 文件大小 ---"
 ls -lh "${SOURCE_PATH}" "${REMOTE_PATH}"
 echo "----------------"
+
+cp ${SOURCE_PATH} .

@@ -74,17 +74,19 @@ pub struct InteractiveSession {
 
 impl InteractiveSession {
     /// 启动远程程序并创建一个新的交互式会话。
-    pub async fn new(config: &Config, verbose: bool) -> Result<Self> {
+    pub async fn new(verbose: bool) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
-        let (mut ssh_session, remote_path) = check_remote(config).await?;
+        let cfg = crate::config::get_config();
+        let (mut ssh_session, remote_path) = check_remote(cfg).await?;
 
         ui::log_debug("正在启动 gmf-remote...");
 
+        // 注入环境变量
         let command = format!(
             "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' LOG='{}' {}",
-            config.endpoint,
-            config.access_key_id,
-            config.secret_access_key,
+            cfg.endpoint,
+            cfg.access_key_id,
+            cfg.secret_access_key,
             if verbose { "INFO" } else { "None" },
             remote_path
         );
@@ -98,7 +100,6 @@ impl InteractiveSession {
                 channel
             }
             ssh::CallResult::Once((code, out)) => {
-                // 如果程序立即退出，说明启动失败，这是一个致命错误。
                 return Err(anyhow!(
                     "尝试以交互模式启动 gmf-remote 失败，程序立即退出。退出码: {}, 输出: {}",
                     code,
@@ -174,8 +175,7 @@ impl InteractiveSession {
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(other_response)) => {
-                let error_msg =
-                    format!("意外的响应: 收到了非预期的服务器响应 {other_response:?}");
+                let error_msg = format!("意外的响应: 收到了非预期的服务器响应 {other_response:?}");
                 spinner.abandon();
                 return Err(anyhow!(error_msg));
             }

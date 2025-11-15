@@ -8,8 +8,9 @@ mod ui;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use gmf_common::r2;
+use tokio::try_join;
 
-use crate::config::{config_path, set_r2};
+use crate::config::init_r2;
 
 /// 解析支持单位 (kb, mb, gb) 的字符串为字节数 (usize)
 fn parse_chunk_size(s: &str) -> Result<u64> {
@@ -64,36 +65,20 @@ struct Args {
     verbose: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+async fn real_main(args: Args) -> Result<()> {
     ui::init_global_logger(args.verbose)?;
 
-    let cfg = match config::load_or_create_config()? {
-        Some(cfg) => cfg,
-        None => {
-            println!("配置文件已创建，请根据实际情况修改后重新运行程序。");
-            println!("路径: {}", config_path().display());
-            return Ok(());
-        }
-    };
-    set_r2(&cfg).await?;
-
-    let mut session = remote::InteractiveSession::new(&cfg, args.verbose).await?;
+    let ((), mut session) = try_join!(init_r2(), remote::InteractiveSession::new(args.verbose),)?;
 
     let result: Result<()> = tokio::select! {
         // 分支 1: 正常执行业务逻辑
         res = async {
-            session
-                .setup(&args.path, args.chunk_size)
-                .await?;
+            session.setup(&args.path, args.chunk_size).await?;
             session.start().await?;
             Ok(())
-        } => {
-            res
-        },
+        } => res,
 
-        // 分支 2: 监听 Ctrl+C 信号
+        // 分支 2: Ctrl+C
         _ = tokio::signal::ctrl_c() => {
             ui::abandon_download();
             ui::log_warn("⛔ 收到 Ctrl+C 信号，正在清理...请不要再次输入 Ctrl+C");
@@ -101,19 +86,22 @@ async fn main() -> Result<()> {
         }
     };
 
-    if let Err(e) = &result {
-        ui::log_error(&format!("发生错误: {e:#}"));
-    }
-
-    // 无论主逻辑是否成功，都执行清理操作
     if let Err(e) = session.shutdown().await {
-        ui::log_error(&format!("清理过程中发生错误: {e:#}"));
+        ui::log_error(&format!("清理 session 错误: {e:#}"));
     }
 
-    // 清理 Bucket
     if let Err(e) = r2::delete_bucket().await {
         ui::log_error(&format!("清理 Bucket 时发生错误: {e:#}"));
     }
 
+    result
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    if let Err(e) = real_main(args).await {
+        ui::log_error(&format!("{e:#}"));
+    }
     Ok(())
 }
