@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 

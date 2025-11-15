@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::io_actor::IoActor;
 use crate::ssh;
@@ -14,36 +13,30 @@ use tokio::{
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
-async fn check_remote(cfg: &Config) -> Result<(ssh::SSHSession, String)> {
-    let mut ssh = ssh::SSHSession::connect(cfg).await?;
-
+async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
     const REMOTE_BIN_DIR: &str = "$HOME/.local/bin";
     const REMOTE_PATH: &str = "$HOME/.local/bin/gmf-remote";
 
     // 检查远程程序 SHA256 的命令
     let check_sha_cmd = format!(r#"sha256sum "{REMOTE_PATH}" 2>/dev/null | cut -d' ' -f1"#);
 
-    let needs_install = match ssh.call_once(&check_sha_cmd).await {
-        Ok((0, remote_sha)) => {
+    let needs_install = match ssh.exec_once(&check_sha_cmd).await {
+        Ok(out) if out.exit_code == 0 => {
             // 检查 SHA256 是否匹配
-            remote_sha.trim() != GMF_REMOTE_SHA256
+            out.output.trim() != GMF_REMOTE_SHA256
         }
-        _ => {
-            // 任何错误（如命令不存在）都视为需要安装
-            true
-        }
+        // 任何错误（如命令不存在）都视为需要安装
+        _ => true,
     };
 
     // 如果需要，则进行安装/更新
     if needs_install {
-        ui::log_info("正在安装服务端至远程目录 (~/.local/bin)...");
-        ssh.call_once(&format!("mkdir -p {REMOTE_BIN_DIR}")).await?;
-        // 第二步：上传并解压
+        ui::log_info("正在安装服务端至远程目录 (~/.local/bin/gmf-remote)...");
         ssh.untar_from_memory(GMF_REMOTE_TAR_GZ, REMOTE_BIN_DIR)
             .await?;
     }
 
-    Ok((ssh, REMOTE_PATH.to_string()))
+    Ok(REMOTE_PATH.to_string())
 }
 
 pub struct InteractiveSession {
@@ -65,7 +58,8 @@ impl InteractiveSession {
     pub async fn new(verbose: bool) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
         let cfg = crate::config::get_config();
-        let (mut ssh_session, remote_path) = check_remote(cfg).await?;
+        let mut ssh_session = ssh::SSHSession::connect(cfg).await?;
+        let remote_path = check_remote(&mut ssh_session).await?;
 
         ui::log_debug("正在启动 gmf-remote...");
 
@@ -78,23 +72,13 @@ impl InteractiveSession {
             if verbose { "INFO" } else { "None" },
             remote_path
         );
+
         // 以交互模式调用远程程序
-        let ssh_channel = match ssh_session
-            .call(&command, ssh::ExecutionMode::Interactive)
-            .await?
-        {
-            ssh::CallResult::Interactive(channel) => {
-                ui::log_debug("gmf-remote 已成功启动");
-                channel
-            }
-            ssh::CallResult::Once((code, out)) => {
-                return Err(anyhow!(
-                    "尝试以交互模式启动 gmf-remote 失败，程序立即退出。退出码: {}, 输出: {}",
-                    code,
-                    out
-                ));
-            }
-        };
+        let ssh_channel = ssh_session
+            .exec_interactive(&command)
+            .await
+            .context("以交互模式启动 gmf-remote 失败")?;
+        ui::log_debug("gmf-remote 已成功启动");
 
         let (command_tx, command_rx) = mpsc::channel(100);
         let (response_tx, response_rx) = mpsc::channel(100);

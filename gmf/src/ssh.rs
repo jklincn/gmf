@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::config::Config;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use russh::{keys::*, *};
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::io::AsyncWriteExt;
@@ -19,17 +19,11 @@ impl client::Handler for ClientHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Once,
-    Interactive,
-}
-
-/// 封装 `call` 方法的两种可能返回结果
+/// 一次性执行命令的返回结果
 #[derive(Debug)]
-pub enum CallResult {
-    Once((u32, String)),
-    Interactive(Channel<client::Msg>),
+pub struct ExecOutput {
+    pub exit_code: u32,
+    pub output: String,
 }
 
 pub struct SSHSession {
@@ -42,88 +36,84 @@ impl SSHSession {
             inactivity_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
         };
-
         let config = Arc::new(config);
-        let sh = ClientHandle {};
 
+        let sh = ClientHandle {};
         let addr = (cfg.host.as_str(), cfg.port);
+
+        // 建立 TCP + SSH 握手
         let mut session = client::connect(config, addr, sh).await?;
 
-        // 根据配置选择认证方式：有密码时使用密码，否则使用密钥
-        let auth_res = if let Some(password) = &cfg.password {
-            session
-                .authenticate_password(cfg.user.as_str(), password)
-                .await?
-        } else if let Some(private_key_path) = &cfg.private_key_path {
-            let key_pair = load_secret_key(private_key_path, None)?;
-            session
-                .authenticate_publickey(
-                    cfg.user.as_str(),
-                    PrivateKeyWithHashAlg::new(
-                        Arc::new(key_pair),
-                        session.best_supported_rsa_hash().await?.flatten(),
-                    ),
-                )
-                .await?
-        } else {
-            anyhow::bail!("未配置认证方式：需要密码或私钥路径");
+        // 认证
+        let auth_res = match (&cfg.password, &cfg.private_key_path) {
+            (Some(password), _) => {
+                session
+                    .authenticate_password(cfg.user.as_str(), password)
+                    .await?
+            }
+            (None, Some(private_key_path)) => {
+                let key_pair = load_secret_key(private_key_path, None)?;
+                let hash_alg = session.best_supported_rsa_hash().await?.flatten();
+                let pk = PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg);
+
+                session
+                    .authenticate_publickey(cfg.user.as_str(), pk)
+                    .await?
+            }
+            (None, None) => {
+                bail!("未配置认证方式：需要密码或私钥路径");
+            }
         };
 
-        if !auth_res.success() {
-            anyhow::bail!("SSH认证失败");
-        }
+        ensure!(auth_res.success(), "SSH 认证失败");
 
         Ok(Self { session })
     }
 
-    pub async fn call(&mut self, command: &str, mode: ExecutionMode) -> Result<CallResult> {
-        let mut channel = self.session.channel_open_session().await?;
+    /// 内部工具：打开一个执行命令的 channel，并发送 exec
+    async fn open_exec_channel(&mut self, command: &str) -> Result<Channel<client::Msg>> {
+        let channel = self.session.channel_open_session().await?;
         channel.exec(true, command).await?;
-        match mode {
-            ExecutionMode::Once => {
-                let mut code = None;
-                let mut output_buffer = Vec::new();
+        Ok(channel)
+    }
 
-                loop {
-                    let Some(msg) = channel.wait().await else {
-                        break;
-                    };
-                    match msg {
-                        ChannelMsg::Data { ref data } => {
-                            // 收集 stdout
-                            output_buffer.extend_from_slice(data);
-                        }
-                        // 捕获 stderr
-                        ChannelMsg::ExtendedData { ext: 1, ref data } => {
-                            output_buffer.extend_from_slice(data);
-                        }
-                        ChannelMsg::ExitStatus { exit_status } => {
-                            code = Some(exit_status);
-                        }
-                        _ => {}
-                    }
+    /// 一次性执行命令，等待退出码和全部输出
+    pub async fn exec_once(&mut self, command: &str) -> Result<ExecOutput> {
+        let mut channel = self.open_exec_channel(command).await?;
+
+        let mut code = None;
+        let mut output_buffer = Vec::new();
+
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } => {
+                    // 收集 stdout
+                    output_buffer.extend_from_slice(data);
                 }
-
-                // 使用 from_utf8_lossy 更安全，避免因非UTF8字符导致panic
-                let output_string = String::from_utf8_lossy(&output_buffer).to_string();
-                let exit_code = code.context("远程命令执行完毕，但未收到退出码")?;
-
-                Ok(CallResult::Once((exit_code, output_string)))
+                // 捕获 stderr
+                ChannelMsg::ExtendedData { ext: 1, ref data } => {
+                    output_buffer.extend_from_slice(data);
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    code = Some(exit_status);
+                }
+                _ => {}
             }
-            ExecutionMode::Interactive => Ok(CallResult::Interactive(channel)),
         }
+
+        // 使用 from_utf8_lossy 更安全，避免因非UTF8字符导致panic
+        let output = String::from_utf8_lossy(&output_buffer).to_string();
+        let exit_code = code.context("远程命令执行完毕，但未收到退出码")?;
+
+        Ok(ExecOutput { exit_code, output })
     }
 
-    pub async fn call_once(&mut self, command: &str) -> Result<(u32, String)> {
-        match self.call(command, ExecutionMode::Once).await? {
-            CallResult::Once(result) => Ok(result),
-            CallResult::Interactive(_) => Err(anyhow::anyhow!(
-                "内部逻辑错误：请求 Once 模式但收到了 Interactive 结果"
-            )),
-        }
+    /// 交互式执行命令：返回底层 Channel，由调用方自己收发数据
+    pub async fn exec_interactive(&mut self, command: &str) -> Result<Channel<client::Msg>> {
+        self.open_exec_channel(command).await
     }
 
-    pub async fn upload_file(&mut self, remote_path: &str, data: &[u8]) -> Result<()> {
+    async fn upload_file(&mut self, remote_path: &str, data: &[u8]) -> Result<()> {
         let channel = self.session.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
         let sftp = SftpSession::new(channel.into_stream()).await?;
@@ -149,35 +139,29 @@ impl SSHSession {
         Ok(())
     }
 
-    // 流式解压会因为缓冲区大小限制而失败，因此改为先上传到临时文件再解压
+    // 流式解压会因为缓冲区大小限制而失败，因此改为先上传到/tmp目录下再解压
     pub async fn untar_from_memory(&mut self, data: &[u8], remote_dest_dir: &str) -> Result<()> {
-        // 1. 生成临时文件名
+        // 生成临时文件名
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let temp_file = format!("/tmp/upload_{timestamp}.tar.gz");
+        let temp_file = format!("/tmp/gmf_upload_{timestamp}.tar.gz");
 
-        // 2. 使用 SFTP 上传数据到临时文件
+        // 使用 SFTP 上传数据到/tmp目录下
         self.upload_file(&temp_file, data).await?;
 
-        // 3. 创建目标目录并解压，然后删除临时文件
+        // 创建目标目录并解压，然后删除临时文件
         let extract_cmd = format!(
             r#"mkdir -p "{remote_dest_dir}" && tar -xf "{temp_file}" -C "{remote_dest_dir}" && rm "{temp_file}""#
         );
 
-        match self.call(&extract_cmd, ExecutionMode::Once).await? {
-            CallResult::Once((code, output)) => {
-                if code != 0 {
-                    // 如果解压失败，尝试清理临时文件
-                    let cleanup_cmd = format!("rm -f '{temp_file}'");
-                    let _ = self.call(&cleanup_cmd, ExecutionMode::Once).await;
+        let ExecOutput { exit_code, output } = self.exec_once(&extract_cmd).await?;
 
-                    return Err(anyhow!("解压失败，退出码: {}, 输出: {}", code, output));
-                }
-            }
-            _ => unreachable!(),
+        if exit_code != 0 {
+            return Err(anyhow!("解压失败，退出码: {}, 输出: {}", exit_code, output));
         }
+
         Ok(())
     }
 
