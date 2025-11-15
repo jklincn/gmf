@@ -3,7 +3,7 @@ use gmf_common::r2;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::{fs, path::PathBuf};
-
+use std::io::{self, Write};
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
     pub host: String,
@@ -27,15 +27,9 @@ fn config_path() -> PathBuf {
     gmf_dir.join("config.toml")
 }
 
-/// 加载或创建配置文件
-fn load_or_create_config() -> Result<Option<Config>> {
+fn write_default_config() -> Result<()> {
     let path = config_path();
-    if path.exists() {
-        let content = fs::read_to_string(path).context("读取配置文件失败")?;
-        let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
-        return Ok(Some(cfg));
-    }
-    // 创建一个默认配置的实例
+
     let default = Config {
         host: "192.168.1.1".into(),
         port: 22,
@@ -79,16 +73,52 @@ secret_access_key = "{}"
         default.host,
         default.port,
         default.user,
-        default.password.as_deref().unwrap(),
-        default.private_key_path.as_deref().unwrap(),
+        default.password.as_deref().unwrap_or(""),
+        default.private_key_path.as_deref().unwrap_or(""),
         default.endpoint,
         default.access_key_id,
         default.secret_access_key
     );
 
     fs::write(&path, config_content).context("写入默认配置失败")?;
+    Ok(())
+}
+
+fn load_or_create_config() -> Result<Option<Config>> {
+    let path = config_path();
+    if path.exists() {
+        let content = fs::read_to_string(path).context("读取配置文件失败")?;
+        let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
+        return Ok(Some(cfg));
+    }
+    write_default_config()?;
     Ok(None)
 }
+
+pub fn reset_config() -> Result<()> {
+    let path = config_path();
+    if path.exists() {
+        println!("检测到已有配置文件：{}", path.display());
+        print!("是否确认重置为默认配置？(y/N): ");
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).ok();
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            println!("操作已取消，未修改配置文件。");
+            return Ok(());
+        }
+        fs::remove_file(&path).context("删除旧配置文件失败")?;
+    }
+
+    write_default_config()?;
+
+    println!("配置文件已重置为默认值");
+    println!("路径: {}", path.display());
+
+    Ok(())
+}
+
 
 pub async fn init_r2() -> Result<()> {
     let cfg = get_config();
@@ -97,7 +127,9 @@ pub async fn init_r2() -> Result<()> {
         access_key_id: cfg.access_key_id.clone(),
         secret_access_key: cfg.secret_access_key.clone(),
     };
-    r2::init_s3(Some(s3_config)).await?;
+    r2::init_s3(Some(s3_config))
+        .await
+        .context("连接 Cloudflare R2 失败")?;
     Ok(())
 }
 

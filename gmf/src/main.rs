@@ -7,14 +7,14 @@ mod ssh;
 mod ui;
 
 use anyhow::Result;
-use args::Args;
+use args::{Command, GetArgs};
 
 use gmf_common::r2;
 use tokio::try_join;
 
 use crate::config::init_r2;
 
-async fn real_main(args: Args) -> Result<()> {
+async fn real_main(args: GetArgs) -> Result<()> {
     ui::init_global_logger(args.verbose)?;
 
     ui::log_info("正在连接...");
@@ -49,9 +49,32 @@ async fn real_main(args: Args) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = args::get_args();
-    if let Err(e) = real_main(args).await {
-        ui::log_error(&format!("{e:#}"));
+    let args = args::get_cli_args();
+
+    match args.command {
+        // gmf config
+        Command::Config => {
+            if let Err(e) = config::reset_config() {
+                ui::log_error(&format!("{e:#}"));
+            }
+        }
+        // gmf get <path>
+        Command::Get {
+            path,
+            chunk_size,
+            verbose,
+        } => {
+            let get_args = GetArgs {
+                path,
+                chunk_size,
+                verbose,
+            };
+
+            if let Err(e) = real_main(get_args).await {
+                ui::log_error(&format!("{e:#}"));
+            }
+        }
     }
+
     Ok(())
 }

@@ -1,4 +1,4 @@
-use crate::args::Args;
+use crate::args::GetArgs;
 use crate::comm::SSHCommunicator;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::ssh;
@@ -41,7 +41,7 @@ async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
 }
 
 pub struct GMFClient {
-    args: Args,
+    args: GetArgs,
     // 用于向 SSHCommunicator 发送命令
     command_tx: mpsc::Sender<ClientRequest>,
     // 用于从 SSHCommunicator 接收响应
@@ -57,11 +57,15 @@ pub struct GMFClient {
 
 impl GMFClient {
     /// 启动远程程序并创建一个新的交互式会话。
-    pub async fn new(args: Args) -> Result<Self> {
+    pub async fn new(args: GetArgs) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
         let cfg = crate::config::get_config();
-        let mut ssh_session = ssh::SSHSession::connect(cfg).await?;
-        let remote_path = check_remote(&mut ssh_session).await?;
+        let mut ssh_session = ssh::SSHSession::connect(cfg)
+            .await
+            .context("连接远程服务器失败")?;
+        let remote_path = check_remote(&mut ssh_session)
+            .await
+            .context("检查远程程序失败")?;
 
         ui::log_debug("正在启动 gmf-remote...");
 
@@ -135,11 +139,8 @@ impl GMFClient {
                 file_size,
                 total_chunks,
             })) => {
-                let success_msg = format!(
-                    "文件名称: {} (大小: {})",
-                    file_name,
-                    format_size(file_size)
-                );
+                let success_msg =
+                    format!("文件名称: {} (大小: {})", file_name, format_size(file_size));
                 ui::log_info(&success_msg);
                 let (gmf_file, completed_chunks) =
                     GMFFile::new_or_resume(&file_name, file_size, total_chunks)?;
