@@ -1,3 +1,4 @@
+use crate::args::Args;
 use crate::comm::SSHCommunicator;
 use crate::file::{ChunkResult, GMFFile, GmfSession};
 use crate::ssh;
@@ -40,6 +41,7 @@ async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
 }
 
 pub struct GMFClient {
+    args: Args,
     // 用于向 SSHCommunicator 发送命令
     command_tx: mpsc::Sender<ClientRequest>,
     // 用于从 SSHCommunicator 接收响应
@@ -55,7 +57,7 @@ pub struct GMFClient {
 
 impl GMFClient {
     /// 启动远程程序并创建一个新的交互式会话。
-    pub async fn new(verbose: bool) -> Result<Self> {
+    pub async fn new(args: Args) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
         let cfg = crate::config::get_config();
         let mut ssh_session = ssh::SSHSession::connect(cfg).await?;
@@ -69,7 +71,7 @@ impl GMFClient {
             cfg.endpoint,
             cfg.access_key_id,
             cfg.secret_access_key,
-            if verbose { "INFO" } else { "None" },
+            if args.verbose { "INFO" } else { "None" },
             remote_path
         );
 
@@ -91,6 +93,7 @@ impl GMFClient {
         ui::log_debug("本地通信器已成功启动");
 
         Ok(Self {
+            args: args,
             command_tx,
             response_rx,
             comm_handle,
@@ -100,7 +103,9 @@ impl GMFClient {
         })
     }
 
-    pub async fn setup(&mut self, file_path: &str, chunk_size: u64) -> Result<()> {
+    pub async fn setup(&mut self) -> Result<()> {
+        let file_path = self.args.path.clone();
+        let chunk_size = self.args.chunk_size;
         // 先接收一个 Ready 响应，表示远程程序已准备就绪
         match self.next_response().await? {
             Some(ServerResponse::Ready) => {
