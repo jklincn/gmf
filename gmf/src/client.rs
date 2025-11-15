@@ -342,14 +342,13 @@ impl GMFClient {
         }
     }
 
-    /// 发送退出指令，并等待程序结束
     pub async fn shutdown(mut self) -> Result<()> {
         // 关闭命令发送通道，这将导致 SSHCommunicator 退出
         drop(self.command_tx);
 
         // 等待 SSHCommunicator 任务结束
         if let Err(e) = self.comm_handle.await {
-            ui::log_warn(&format!("I/O Actor 任务异常退出: {e:?}"));
+            ui::log_warn(&format!("Communicator 异常退出: {e:?}"));
         }
 
         // 关闭 SSH 会话，触发远程程序退出

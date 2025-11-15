@@ -1,7 +1,7 @@
 mod comm;
 mod config;
 mod file;
-mod remote;
+mod client;
 mod ssh;
 mod ui;
 
@@ -69,17 +69,17 @@ async fn real_main(args: Args) -> Result<()> {
     ui::init_global_logger(args.verbose)?;
 
     ui::log_info("正在连接...");
-    let ((), mut client) = try_join!(init_r2(), remote::GMFClient::new(args.verbose),)?;
+    let ((), mut client) = try_join!(init_r2(), client::GMFClient::new(args.verbose),)?;
 
     let result: Result<()> = tokio::select! {
-        // 分支 1: 正常执行业务逻辑
+        // 正常执行业务逻辑
         res = async {
             client.setup(&args.path, args.chunk_size).await?;
             client.start().await?;
             Ok(())
         } => res,
 
-        // 分支 2: Ctrl+C
+        // 捕捉 Ctrl+C
         _ = tokio::signal::ctrl_c() => {
             ui::abandon_download();
             ui::log_warn("正在中断任务...");
