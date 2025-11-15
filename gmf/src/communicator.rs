@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 
 use crate::ui;
 
-/// IoActor 负责所有底层的 SSH I/O 操作。
-pub struct IoActor {
+/// SSHCommunicator 负责所有底层的 SSH I/O 操作。
+pub struct SSHCommunicator {
     // SSH 通道，这是它独占的资源
     ssh_channel: Channel<ClientMsg>,
     // 用于接收上层（Session）发来的待发送命令
@@ -15,8 +15,8 @@ pub struct IoActor {
     response_tx: mpsc::Sender<ServerResponse>,
 }
 
-impl IoActor {
-    /// 创建一个新的 IoActor 实例。
+impl SSHCommunicator {
+    /// 创建一个新的 SSHCommunicator 实例。
     pub fn new(
         ssh_channel: Channel<ClientMsg>,
         command_rx: mpsc::Receiver<ClientRequest>,

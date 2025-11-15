@@ -1,6 +1,6 @@
 mod config;
 mod file;
-mod io_actor;
+mod communicator;
 mod remote;
 mod ssh;
 mod ui;

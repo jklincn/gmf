@@ -1,5 +1,5 @@
 use crate::file::{ChunkResult, GMFFile, GmfSession};
-use crate::io_actor::IoActor;
+use crate::communicator::SSHCommunicator;
 use crate::ssh;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,11 +40,11 @@ async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
 }
 
 pub struct InteractiveSession {
-    // 用于向 IoActor 发送命令
+    // 用于向 SSHCommunicator 发送命令
     command_tx: mpsc::Sender<ClientRequest>,
-    // 用于从 IoActor 接收响应
+    // 用于从 SSHCommunicator 接收响应
     response_rx: mpsc::Receiver<ServerResponse>,
-    // IoActor 任务的句柄，用于在 shutdown 时等待它结束
+    // SSHCommunicator 任务的句柄，用于在 shutdown 时等待它结束
     actor_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::SSHSession,
@@ -83,7 +83,7 @@ impl InteractiveSession {
         let (command_tx, command_rx) = mpsc::channel(100);
         let (response_tx, response_rx) = mpsc::channel(100);
 
-        let actor = IoActor::new(ssh_channel, command_rx, response_tx);
+        let actor = SSHCommunicator::new(ssh_channel, command_rx, response_tx);
         let actor_handle = tokio::spawn(actor.run());
 
         Ok(Self {
@@ -340,10 +340,10 @@ impl InteractiveSession {
 
     /// 发送退出指令，并等待程序结束
     pub async fn shutdown(mut self) -> Result<()> {
-        // 关闭命令发送通道，这将导致 IoActor 退出
+        // 关闭命令发送通道，这将导致 SSHCommunicator 退出
         drop(self.command_tx);
 
-        // 等待 IoActor 任务结束
+        // 等待 SSHCommunicator 任务结束
         match tokio::time::timeout(Duration::from_secs(10), self.actor_handle).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => ui::log_error(&format!("等待 I/O Actor 退出时发生错误: {e:?}")),
