@@ -44,7 +44,7 @@ impl AllProgressBar {
 
         download_bar.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green}  [{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
+                .template("[{bar:40.cyan/blue}] {percent}% ({pos}/{len}) | ETD: {elapsed_precise} | ETA: {eta_precise}")?
                 .progress_chars("#>-"),
         );
         download_bar.set_position(completed_chunks);
@@ -190,33 +190,4 @@ fn global() -> &'static AllProgressBar {
     G_PROGRESS_BAR
         .get()
         .expect("全局日志/进度条(G_PROGRESS_BAR)未初始化，请先调用 init_global_logger")
-}
-
-pub struct Spinner {
-    sp: ProgressBar,
-}
-
-impl Spinner {
-    pub fn new(msg: &str) -> Self {
-        let spinner_style = ProgressStyle::default_spinner()
-            .template("{spinner:.green}  {msg}")
-            .expect("设置样式失败");
-
-        let sp = ProgressBar::new_spinner();
-        sp.set_style(spinner_style);
-        sp.set_message(msg.to_string());
-        sp.enable_steady_tick(Duration::from_millis(100));
-
-        Self { sp }
-    }
-
-    pub fn finish(self, msg: &str) {
-        let finish_template = ProgressStyle::with_template("{msg}").expect("创建完成样式失败");
-        self.sp.set_style(finish_template);
-        self.sp.finish_with_message(msg.to_string());
-    }
-
-    pub fn abandon(self) {
-        self.sp.abandon();
-    }
 }

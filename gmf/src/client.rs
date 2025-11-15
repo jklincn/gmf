@@ -122,7 +122,7 @@ impl GMFClient {
             }
         }
 
-        let spinner = crate::ui::Spinner::new("正在取得文件信息...");
+        ui::log_info("正在取得文件信息...");
         self.send_request(ClientRequest::Setup {
             path: file_path.to_string(),
             chunk_size,
@@ -136,12 +136,11 @@ impl GMFClient {
                 total_chunks,
             })) => {
                 let success_msg = format!(
-                    "✅ 文件名称: {} (大小: {})",
+                    "文件名称: {} (大小: {})",
                     file_name,
                     format_size(file_size)
                 );
-                spinner.finish(&success_msg);
-
+                ui::log_info(&success_msg);
                 let (gmf_file, completed_chunks) =
                     GMFFile::new_or_resume(&file_name, file_size, total_chunks)?;
 
@@ -152,23 +151,19 @@ impl GMFClient {
             }
             Ok(Some(ServerResponse::Error(msg))) => {
                 let error_msg = format!("服务端错误: {msg}");
-                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(Some(other_response)) => {
                 let error_msg = format!("意外的响应: 收到了非预期的服务器响应 {other_response:?}");
-                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Ok(None) => {
                 let error_msg = "连接中断: 在等待设置响应时连接已关闭";
-                spinner.abandon();
                 return Err(anyhow!(error_msg));
             }
             Err(e) => {
                 // 这是 next_response() 本身发生的错误，如网络层或反序列化错误
                 let error_msg = format!("通信错误: {e}");
-                spinner.abandon();
                 return Err(e.context(error_msg));
             }
         }
@@ -227,7 +222,7 @@ impl GMFClient {
                 } else {
                     "N/A".to_string()
                 };
-                println!("⚡ 下载完成，平均传输速度: {speed_str}");
+                println!("下载完成，平均传输速度: {speed_str}");
                 Ok(())
             }
             Err(e) => {
