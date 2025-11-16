@@ -8,7 +8,7 @@ use gmf_common::{interface::*, utils::format_size};
 use std::collections::HashSet;
 use std::{sync::Arc, time::Duration};
 use tokio::{
-    sync::mpsc,
+    sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
 
@@ -40,12 +40,31 @@ async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
     Ok(REMOTE_PATH.to_string())
 }
 
+struct SetupInfo {
+    file_name: String,
+    file_size: u64,
+    total_chunks: u64,
+}
+
+struct StartInfo {
+    remaining_size: u64,
+}
+
+enum DownloadEvent {
+    ChunkReady {
+        chunk_id: u64,
+        passphrase_b64: String,
+        retry: bool,
+    },
+    UploadCompleted,
+}
+
 pub struct GMFClient {
     args: GetArgs,
     // 用于向 SSHCommunicator 发送命令
     command_tx: mpsc::Sender<ClientRequest>,
     // 用于从 SSHCommunicator 接收响应
-    response_rx: mpsc::Receiver<ServerResponse>,
+    response_rx: Option<mpsc::Receiver<ServerResponse>>,
     // 通过 handle 管理 comm 生命周期
     comm_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
@@ -53,6 +72,14 @@ pub struct GMFClient {
     // GMF 文件管理
     file: Option<Arc<GmfSession>>,
     resume_from_chunk_id: u64,
+
+    // 等待 setup / start 结果的 oneshot sender
+    setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupInfo>>>>,
+    start_waiter: Arc<Mutex<Option<oneshot::Sender<StartInfo>>>>,
+
+    // dispatcher -> 下载循环 的事件通道
+    download_tx: mpsc::Sender<DownloadEvent>,
+    download_rx: mpsc::Receiver<DownloadEvent>,
 }
 
 impl GMFClient {
@@ -93,37 +120,121 @@ impl GMFClient {
 
         let comm = SSHCommunicator::new(ssh_channel, command_rx, response_tx);
         let comm_handle = tokio::spawn(comm.run()); // 通过 handle 管理 comm 生命周期
+        let (download_tx, download_rx) = mpsc::channel(100);
 
         ui::log_debug("本地通信器已成功启动");
 
         Ok(Self {
             args: args,
             command_tx,
-            response_rx,
+            response_rx: Some(response_rx),
             comm_handle,
             ssh_session,
             file: None,
             resume_from_chunk_id: 0,
+            setup_waiter: Arc::new(Mutex::new(None)),
+            start_waiter: Arc::new(Mutex::new(None)),
+            download_tx,
+            download_rx,
         })
+    }
+
+    async fn run_dispatcher(
+        mut response_rx: mpsc::Receiver<ServerResponse>,
+        download_tx: mpsc::Sender<DownloadEvent>,
+        setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupInfo>>>>,
+        start_waiter: Arc<Mutex<Option<oneshot::Sender<StartInfo>>>>,
+    ) -> Result<()> {
+        while let Some(resp) = response_rx.recv().await {
+            match resp {
+                ServerResponse::Heartbeat => {
+                    ui::log_debug("收到心跳");
+                }
+
+                ServerResponse::SetupSuccess {
+                    file_name,
+                    file_size,
+                    total_chunks,
+                } => {
+                    let info = SetupInfo {
+                        file_name,
+                        file_size,
+                        total_chunks,
+                    };
+                    if let Some(tx) = setup_waiter.lock().await.take() {
+                        let _ = tx.send(info);
+                    } else {
+                        ui::log_warn("收到 SetupSuccess 但没有等待者");
+                    }
+                }
+
+                ServerResponse::StartSuccess { remaining_size } => {
+                    let info = StartInfo { remaining_size };
+                    if let Some(tx) = start_waiter.lock().await.take() {
+                        let _ = tx.send(info);
+                    } else {
+                        ui::log_warn("收到 StartSuccess 但没有等待者");
+                    }
+                }
+
+                ServerResponse::ChunkReadyForDownload {
+                    chunk_id,
+                    passphrase_b64,
+                    retry,
+                } => {
+                    // 转发给下载循环
+                    let ev = DownloadEvent::ChunkReady {
+                        chunk_id,
+                        passphrase_b64,
+                        retry,
+                    };
+                    if let Err(e) = download_tx.send(ev).await {
+                        ui::log_error(&format!("发送 DownloadEvent 失败: {e}"));
+                    }
+                }
+
+                ServerResponse::UploadCompleted => {
+                    if let Err(e) = download_tx.send(DownloadEvent::UploadCompleted).await {
+                        ui::log_error(&format!("发送 UploadCompleted 事件失败: {e}"));
+                    }
+                }
+
+                ServerResponse::Error(msg) => {
+                    ui::log_error(&format!("服务端错误: {msg}"));
+                    return Err(anyhow!("服务端错误: {msg}"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn spawn_dispatcher(&mut self) {
+        let response_rx = self.response_rx.take().expect("dispatcher 已经被启动过了");
+
+        let download_tx = self.download_tx.clone();
+        let setup_waiter = Arc::clone(&self.setup_waiter);
+        let start_waiter = Arc::clone(&self.start_waiter);
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                GMFClient::run_dispatcher(response_rx, download_tx, setup_waiter, start_waiter)
+                    .await
+            {
+                ui::log_error(&format!("dispatcher 出错退出: {e:#}"));
+            }
+        });
     }
 
     pub async fn setup(&mut self) -> Result<()> {
         let file_path = self.args.path.clone();
         let chunk_size = self.args.chunk_size;
-        // 先接收一个 Ready 响应，表示远程程序已准备就绪
-        match self.next_response().await? {
-            Some(ServerResponse::Ready) => {
-                ui::log_debug("远程程序已准备就绪");
-            }
-            Some(other_response) => {
-                return Err(anyhow!(
-                    "协议错误：期望收到 Ready 响应，但收到了 {:?}",
-                    other_response
-                ));
-            }
-            None => {
-                return Err(anyhow!("连接已关闭，未收到任何响应"));
-            }
+
+        // 创建一个 oneshot 用来等待 SetupSuccess
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.setup_waiter.lock().await;
+            *guard = Some(tx);
         }
 
         ui::log_info("正在取得文件信息...");
@@ -133,41 +244,23 @@ impl GMFClient {
         })
         .await?;
 
-        match self.next_response().await {
-            Ok(Some(ServerResponse::SetupSuccess {
-                file_name,
-                file_size,
-                total_chunks,
-            })) => {
-                let success_msg =
-                    format!("文件名称: {} (大小: {})", file_name, format_size(file_size));
-                ui::log_info(&success_msg);
-                let (gmf_file, completed_chunks) =
-                    GMFFile::new_or_resume(&file_name, file_size, total_chunks)?;
+        // 在这里等待 dispatcher 把结果发回来
+        let info = rx.await.context("等待 SetupSuccess 被取消或连接关闭")?;
 
-                ui::init_global_download_bar(total_chunks, completed_chunks)?;
+        let success_msg = format!(
+            "文件名称: {} (大小: {})",
+            info.file_name,
+            format_size(info.file_size)
+        );
+        ui::log_info(&success_msg);
 
-                self.resume_from_chunk_id = completed_chunks;
-                self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
-            }
-            Ok(Some(ServerResponse::Error(msg))) => {
-                let error_msg = format!("服务端错误: {msg}");
-                return Err(anyhow!(error_msg));
-            }
-            Ok(Some(other_response)) => {
-                let error_msg = format!("意外的响应: 收到了非预期的服务器响应 {other_response:?}");
-                return Err(anyhow!(error_msg));
-            }
-            Ok(None) => {
-                let error_msg = "连接中断: 在等待设置响应时连接已关闭";
-                return Err(anyhow!(error_msg));
-            }
-            Err(e) => {
-                // 这是 next_response() 本身发生的错误，如网络层或反序列化错误
-                let error_msg = format!("通信错误: {e}");
-                return Err(e.context(error_msg));
-            }
-        }
+        let (gmf_file, completed_chunks) =
+            GMFFile::new_or_resume(&info.file_name, info.file_size, info.total_chunks)?;
+
+        ui::init_global_download_bar(info.total_chunks, completed_chunks)?;
+
+        self.resume_from_chunk_id = completed_chunks;
+        self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
 
         Ok(())
     }
@@ -178,30 +271,31 @@ impl GMFClient {
             .take()
             .ok_or_else(|| anyhow!("内部状态错误: file 未初始化"))?;
 
-        let client_request = ClientRequest::Start {
-            resume_from_chunk_id: self.resume_from_chunk_id,
-        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.start_waiter.lock().await;
+            *guard = Some(tx);
+        }
 
         ui::log_debug("正在发送 Start 请求...");
-        self.send_request(client_request).await?;
-        let remaining_size = match self.next_response().await? {
-            Some(ServerResponse::StartSuccess { remaining_size }) => {
-                ui::log_debug(&format!(
-                    "服务端确认，需要传输的大小为 {} ，开始接收分块信息...",
-                    format_size(remaining_size)
-                ));
-                remaining_size
-            }
-            Some(other_response) => bail!(
-                "协议错误: 期望收到 StartSuccess，但收到 {:?}",
-                other_response
-            ),
-            None => bail!("连接中断: 在等待 StartSuccess 响应时连接已关闭"),
-        };
+        self.send_request(ClientRequest::Start {
+            resume_from_chunk_id: self.resume_from_chunk_id,
+        })
+        .await?;
 
-        // 主事件循环
-        let loop_result = self.event_loop(session.clone()).await;
+        // 等待 StartSuccess
+        let start_info = rx.await.context("等待 StartSuccess 时被取消或连接关闭")?;
+        let remaining_size = start_info.remaining_size;
 
+        ui::log_debug(&format!(
+            "服务端确认，需要传输的大小为 {} ，开始接收分块信息...",
+            format_size(remaining_size)
+        ));
+
+        // 开始下载循环（基本就是你原来的 event_loop，但从 download_rx 收消息）
+        let loop_result = self.download_loop(session.clone()).await;
+
+        // 后面这段可以沿用你原来的逻辑
         match loop_result {
             Ok(upload_time) => {
                 ui::log_debug("等待本地写入完成...");
@@ -234,9 +328,11 @@ impl GMFClient {
     }
 
     /// 接收服务端消息的主循环
-    async fn event_loop(&mut self, gmf_session: Arc<GmfSession>) -> Result<Duration> {
+    async fn download_loop(
+        &mut self,
+        gmf_session: Arc<GmfSession>,
+    ) -> Result<Duration> {
         let total_chunks = gmf_session.total_chunks;
-        // 使用 Hashset 可以自动去重
         let mut completed_chunk_ids: HashSet<u64> = (0..self.resume_from_chunk_id).collect();
         let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
         let mut upload_completed = false;
@@ -245,7 +341,7 @@ impl GMFClient {
         ui::start_tick();
 
         ui::log_debug(&format!(
-            "事件循环开始，总分块数: {}, 已完成分块数: {}, 需要下载分块数: {}",
+            "下载事件循环开始，总分块数: {}, 已完成分块数: {}, 需要下载分块数: {}",
             total_chunks,
             completed_chunk_ids.len(),
             total_chunks - completed_chunk_ids.len() as u64
@@ -285,39 +381,23 @@ impl GMFClient {
                     }
                 },
 
-                // 接收服务端响应（上传超时 30 秒）
-                resp = tokio::time::timeout(Duration::from_secs(30), self.response_rx.recv()), if !upload_completed => {
-                    match resp {
-                        Ok(Some(response)) => {
-                            match response {
-                                ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64, retry } => {
-                                    let session_clone = gmf_session.clone();
-                                    join_set.spawn(async move {
-                                        session_clone.handle_chunk(chunk_id, passphrase_b64, retry).await
-                                    });
-                                },
-                                ServerResponse::UploadCompleted => {
-                                    upload_time = start_time.elapsed();
-                                    upload_completed = true;
-                                    ui::log_debug("服务端上传已完成");
-                                },
-                                ServerResponse::Error(msg) => {
-                                    let error_msg = format!("收到服务端错误: {msg}");
-                                    bail!(error_msg);
-                                },
-                                other => {
-                                    ui::log_warn(&format!("收到非关键消息: {other:?}"));
-                                }
-                            }
-                        },
-                        Ok(None) => {
-                            bail!("连接中断: 服务端在任务完成前关闭了连接");
+                Some(ev) = self.download_rx.recv(), if !upload_completed => {
+                    match ev {
+                        DownloadEvent::ChunkReady { chunk_id, passphrase_b64, retry } => {
+                            let session_clone = gmf_session.clone();
+                            join_set.spawn(async move {
+                                session_clone
+                                    .handle_chunk(chunk_id, passphrase_b64, retry)
+                                    .await
+                            });
                         }
-                        Err(_) => {
-                            bail!("等待远程服务端响应超时，绝大概率为首次上传超时，请重试");
+                        DownloadEvent::UploadCompleted => {
+                            upload_time = start_time.elapsed();
+                            upload_completed = true;
+                            ui::log_debug("服务端上传已完成");
                         }
                     }
-                },
+                }
 
                 _ = tokio::time::sleep(Duration::from_millis(100)), if upload_completed && !join_set.is_empty() => {},
             }
@@ -332,15 +412,6 @@ impl GMFClient {
             .send(request)
             .await
             .context("向 I/O Actor 发送命令失败，通道可能已关闭")
-    }
-
-    /// 接收下一个响应，带有超时机制
-    pub async fn next_response(&mut self) -> Result<Option<ServerResponse>> {
-        match tokio::time::timeout(Duration::from_secs(10), self.response_rx.recv()).await {
-            Ok(Some(response)) => Ok(Some(response)),
-            Ok(None) => Ok(None),
-            Err(_) => Err(anyhow!("等待响应超时")),
-        }
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

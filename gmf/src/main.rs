@@ -10,6 +10,7 @@ use anyhow::Result;
 use args::{Command, GetArgs};
 
 use gmf_common::r2;
+use gmf_common::consts::CHUNK_SIZE;
 use tokio::try_join;
 
 use crate::config::init_r2;
@@ -19,7 +20,7 @@ async fn real_main(args: GetArgs) -> Result<()> {
 
     ui::log_info("正在连接...");
     let ((), mut client) = try_join!(init_r2(), client::GMFClient::new(args))?;
-
+    client.spawn_dispatcher();
     let result: Result<()> = tokio::select! {
         // 正常执行业务逻辑
         res = async {
@@ -31,7 +32,7 @@ async fn real_main(args: GetArgs) -> Result<()> {
         // 捕捉 Ctrl+C
         _ = tokio::signal::ctrl_c() => {
             ui::abandon_download();
-            ui::log_warn("正在中断任务...");
+            ui::log_info("正在中断任务...");
             Ok(())
         }
     };
@@ -63,10 +64,9 @@ async fn main() -> Result<()> {
             path,
             verbose,
         } => {
-            let chunk_size = 10 * 1024 * 1024;
             let get_args = GetArgs {
                 path,
-                chunk_size,
+                chunk_size: CHUNK_SIZE,
                 verbose,
             };
 

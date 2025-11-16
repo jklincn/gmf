@@ -21,7 +21,7 @@ pub enum ClientRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ServerResponse {
-    Ready,
+    Heartbeat,
     SetupSuccess {
         file_name: String,
         file_size: u64,

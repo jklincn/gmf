@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 
     // 初始化
     let state: SharedState = Arc::new(Mutex::new(AppState::default()));
-    if tx.send(ServerResponse::Ready.into()).await.is_err() {
+    if tx.send(ServerResponse::Heartbeat.into()).await.is_err() {
         error!("无法发送 Ready 消息，通信通道已关闭");
         return Ok(());
     }
