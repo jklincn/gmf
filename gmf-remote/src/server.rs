@@ -81,7 +81,7 @@ pub async fn handle_message(
             };
             let sent_bytes = resume_from_chunk_id * chunk_size;
             let remaining_size = file_size.saturating_sub(sent_bytes);
-            let ack = ServerResponse::StartSuccess { remaining_size };
+            let ack = ServerResponse::StartSuccess(StartResponse { remaining_size });
             if sender.send(ack.into()).await.is_err() {
                 error!("Channel closed. Could not send StartSuccess ack.");
                 return Ok(None);
@@ -158,11 +158,11 @@ pub async fn setup(path: String, chunk_size: u64, state: SharedState) -> ServerR
         app_state.metadata = Some(task_metadata);
     }
 
-    ServerResponse::SetupSuccess {
+    ServerResponse::SetupSuccess(SetupResponse {
         file_name,
         file_size,
         total_chunks,
-    }
+    })
 }
 
 pub async fn start(

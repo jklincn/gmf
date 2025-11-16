@@ -41,25 +41,6 @@ async fn check_remote(ssh: &mut ssh::SSHSession) -> Result<String> {
     Ok(REMOTE_PATH.to_string())
 }
 
-struct SetupInfo {
-    file_name: String,
-    file_size: u64,
-    total_chunks: u64,
-}
-
-struct StartInfo {
-    remaining_size: u64,
-}
-
-enum DownloadEvent {
-    ChunkReady {
-        chunk_id: u64,
-        passphrase_b64: String,
-        retry: bool,
-    },
-    UploadCompleted,
-}
-
 pub struct GMFClient {
     args: GetArgs,
     // 用于向 SSHCommunicator 发送命令
@@ -76,8 +57,8 @@ pub struct GMFClient {
 
     // 等待 setup / start 结果的 oneshot sender
     ready_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupInfo>>>>,
-    start_waiter: Arc<Mutex<Option<oneshot::Sender<StartInfo>>>>,
+    setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupResponse>>>>,
+    start_waiter: Arc<Mutex<Option<oneshot::Sender<StartResponse>>>>,
 
     // dispatcher -> 下载循环 的事件通道
     download_tx: mpsc::Sender<DownloadEvent>,
@@ -146,8 +127,8 @@ impl GMFClient {
         mut response_rx: mpsc::Receiver<ServerResponse>,
         download_tx: mpsc::Sender<DownloadEvent>,
         ready_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-        setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupInfo>>>>,
-        start_waiter: Arc<Mutex<Option<oneshot::Sender<StartInfo>>>>,
+        setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupResponse>>>>,
+        start_waiter: Arc<Mutex<Option<oneshot::Sender<StartResponse>>>>,
     ) -> Result<()> {
         use std::time::{Duration, Instant};
 
@@ -170,8 +151,7 @@ impl GMFClient {
                                     }
                                 }
 
-                                ServerResponse::SetupSuccess { file_name, file_size, total_chunks } => {
-                                    let info = SetupInfo { file_name, file_size, total_chunks };
+                                ServerResponse::SetupSuccess(info) => {
                                     if let Some(tx) = setup_waiter.lock().await.take() {
                                         let _ = tx.send(info);
                                     } else {
@@ -179,8 +159,7 @@ impl GMFClient {
                                     }
                                 }
 
-                                ServerResponse::StartSuccess { remaining_size } => {
-                                    let info = StartInfo { remaining_size };
+                                ServerResponse::StartSuccess(info) => {
                                     if let Some(tx) = start_waiter.lock().await.take() {
                                         let _ = tx.send(info);
                                     } else {

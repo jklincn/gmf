@@ -17,26 +17,41 @@ pub enum ClientRequest {
     Retry { chunk_id: u64 },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupResponse {
+    pub file_name: String,
+    pub file_size: u64,
+    pub total_chunks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartResponse {
+    pub remaining_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DownloadEvent {
+    ChunkReady {
+        chunk_id: u64,
+        passphrase_b64: String,
+        retry: bool,
+    },
+    UploadCompleted,
+}
+
 /// 服务端响应类型的核心枚举。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ServerResponse {
     Heartbeat,
-    SetupSuccess {
-        file_name: String,
-        file_size: u64,
-        total_chunks: u64,
-    },
-    StartSuccess {
-        remaining_size: u64,
-    },
+    SetupSuccess(SetupResponse),
+    StartSuccess(StartResponse),
     ChunkReadyForDownload {
         chunk_id: u64,
         passphrase_b64: String,
         retry: bool,
     },
     UploadCompleted,
-
     Error(String),
 }
 
