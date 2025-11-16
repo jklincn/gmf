@@ -6,11 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose};
 use futures::future::{AbortHandle, Abortable};
 use futures::{TryStreamExt, stream};
-use gmf_common::{
-    consts::NONCE_SIZE,
-    interface::*,
-    r2::{init_s3, put_object},
-};
+use gmf_common::{consts::NONCE_SIZE, interface::*, r2::put_object, utils::calc_xxh3};
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
     fs::File,
@@ -43,23 +39,11 @@ struct EncryptedChunk {
 }
 
 pub async fn handle_message(
-    message: Message,
+    request: ClientRequest,
     state: SharedState,
     sender: mpsc::Sender<Message>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<Option<JoinHandle<()>>> {
-    let request = match message {
-        Message::Request(req) => req,
-        _ => {
-            let error_response =
-                ServerResponse::Error("协议错误：收到了非 Request 类型的消息。".to_string());
-            if sender.send(error_response.into()).await.is_err() {
-                error!("Channel closed. Could not send InvalidRequest error.");
-            }
-            return Ok(None);
-        }
-    };
-
     match request {
         ClientRequest::Setup { path, chunk_size } => {
             let response = setup(path, chunk_size, state).await;
@@ -106,10 +90,6 @@ pub async fn setup(path: String, chunk_size: u64, state: SharedState) -> ServerR
         return ServerResponse::Error("chunk_size 不能为 0".to_string());
     }
 
-    if let Err(e) = init_s3(None).await {
-        return ServerResponse::Error(format!("远程 S3 客户端初始化失败: {e}"));
-    }
-
     // 进行一系列的文件（路径）检查
     let file_path_str = shellexpand::tilde(&path).to_string();
     let file_path: PathBuf = match file_path_str.parse() {
@@ -145,6 +125,7 @@ pub async fn setup(path: String, chunk_size: u64, state: SharedState) -> ServerR
 
     let file_size = metadata.len();
     let total_chunks = (file_size as f64 / chunk_size as f64).ceil() as u64;
+    let xxh3 = calc_xxh3(&file_path).unwrap();
 
     let task_metadata = TaskMetadata {
         file_path,
@@ -162,6 +143,7 @@ pub async fn setup(path: String, chunk_size: u64, state: SharedState) -> ServerR
         file_name,
         file_size,
         total_chunks,
+        xxh3,
     })
 }
 

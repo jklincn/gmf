@@ -5,20 +5,19 @@ use crate::logging::init_logging;
 use crate::server::{AppState, SharedState};
 use anyhow::Result;
 use gmf_common::interface::{Message, ServerResponse};
+use gmf_common::r2::init_s3;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::{Mutex, mpsc, watch},
     task::JoinHandle,
+    time::interval,
 };
 use tracing::{error, info};
 
 fn start_heartbeat_task(tx: mpsc::Sender<Message>, mut shutdown_rx: watch::Receiver<()>) {
     tokio::spawn(async move {
-        use std::time::Duration;
-        use tokio::time::interval;
-
         let mut ticker = interval(Duration::from_secs(1));
 
         // 启动后先立即发一次心跳
@@ -69,6 +68,15 @@ async fn main() -> Result<()> {
     // 创建用于优雅关闭的 watch channel
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
+    if let Err(e) = init_s3(None).await {
+        let _ = tx
+            .send(ServerResponse::Error(format!("远程 S3 客户端初始化失败: {e}")).into())
+            .await;
+        error!("远程 S3 客户端初始化失败: {e}");
+        return Ok(());
+    }
+
+    // 开启心跳
     start_heartbeat_task(tx.clone(), shutdown_rx.clone());
 
     info!("服务端启动成功, 开始监听 stdin...");
@@ -98,9 +106,28 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                let request = match msg {
+                    Message::Request(req) => req,
+                    _ => {
+                        let _ = tx
+                            .send(
+                                ServerResponse::Error(
+                                    "协议错误：收到了非 Request 类型的消息。".to_string(),
+                                )
+                                .into(),
+                            )
+                            .await;
+                        continue;
+                    }
+                };
                 // 业务处理
-                match server::handle_message(msg, state.clone(), tx.clone(), shutdown_rx.clone())
-                    .await
+                match server::handle_message(
+                    request,
+                    state.clone(),
+                    tx.clone(),
+                    shutdown_rx.clone(),
+                )
+                .await
                 {
                     Ok(Some(handle)) => {
                         if let Some(old) = task_handle.take() {

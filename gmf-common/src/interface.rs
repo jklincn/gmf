@@ -22,6 +22,7 @@ pub struct SetupResponse {
     pub file_name: String,
     pub file_size: u64,
     pub total_chunks: u64,
+    pub xxh3: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
