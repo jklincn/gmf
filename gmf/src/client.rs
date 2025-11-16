@@ -6,7 +6,8 @@ use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use gmf_common::{interface::*, utils::format_size};
 use std::collections::HashSet;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
@@ -74,6 +75,7 @@ pub struct GMFClient {
     resume_from_chunk_id: u64,
 
     // 等待 setup / start 结果的 oneshot sender
+    ready_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupInfo>>>>,
     start_waiter: Arc<Mutex<Option<oneshot::Sender<StartInfo>>>>,
 
@@ -132,6 +134,7 @@ impl GMFClient {
             ssh_session,
             file: None,
             resume_from_chunk_id: 0,
+            ready_waiter: Arc::new(Mutex::new(None)),
             setup_waiter: Arc::new(Mutex::new(None)),
             start_waiter: Arc::new(Mutex::new(None)),
             download_tx,
@@ -142,88 +145,118 @@ impl GMFClient {
     async fn run_dispatcher(
         mut response_rx: mpsc::Receiver<ServerResponse>,
         download_tx: mpsc::Sender<DownloadEvent>,
+        ready_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
         setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupInfo>>>>,
         start_waiter: Arc<Mutex<Option<oneshot::Sender<StartInfo>>>>,
     ) -> Result<()> {
-        while let Some(resp) = response_rx.recv().await {
-            match resp {
-                ServerResponse::Heartbeat => {
-                    ui::log_debug("收到心跳");
-                }
+        use std::time::{Duration, Instant};
 
-                ServerResponse::SetupSuccess {
-                    file_name,
-                    file_size,
-                    total_chunks,
-                } => {
-                    let info = SetupInfo {
-                        file_name,
-                        file_size,
-                        total_chunks,
-                    };
-                    if let Some(tx) = setup_waiter.lock().await.take() {
-                        let _ = tx.send(info);
-                    } else {
-                        ui::log_warn("收到 SetupSuccess 但没有等待者");
+        let mut last_heartbeat = Instant::now();
+        let timeout = Duration::from_secs(5);
+
+        loop {
+            tokio::select! {
+                // 收到服务端消息
+                maybe_resp = response_rx.recv() => {
+                    match maybe_resp {
+                        Some(resp) => {
+                            match resp {
+                                ServerResponse::Heartbeat => {
+                                    last_heartbeat = Instant::now();
+                                    ui::log_debug("收到心跳");
+
+                                    if let Some(tx) = ready_waiter.lock().await.take() {
+                                        let _ = tx.send(());
+                                    }
+                                }
+
+                                ServerResponse::SetupSuccess { file_name, file_size, total_chunks } => {
+                                    let info = SetupInfo { file_name, file_size, total_chunks };
+                                    if let Some(tx) = setup_waiter.lock().await.take() {
+                                        let _ = tx.send(info);
+                                    } else {
+                                        ui::log_warn("收到 SetupSuccess 但没有等待者");
+                                    }
+                                }
+
+                                ServerResponse::StartSuccess { remaining_size } => {
+                                    let info = StartInfo { remaining_size };
+                                    if let Some(tx) = start_waiter.lock().await.take() {
+                                        let _ = tx.send(info);
+                                    } else {
+                                        ui::log_warn("收到 StartSuccess 但没有等待者");
+                                    }
+                                }
+
+                                ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64, retry } => {
+                                    let ev = DownloadEvent::ChunkReady { chunk_id, passphrase_b64, retry };
+                                    if let Err(e) = download_tx.send(ev).await {
+                                        ui::log_error(&format!("发送 DownloadEvent 失败: {e}"));
+                                    }
+                                }
+
+                                ServerResponse::UploadCompleted => {
+                                    if let Err(e) = download_tx.send(DownloadEvent::UploadCompleted).await {
+                                        ui::log_error(&format!("发送 UploadCompleted 失败: {e}"));
+                                    }
+                                }
+
+                                ServerResponse::Error(msg) => {
+                                    return Err(anyhow!("服务端错误: {msg}"));
+                                }
+                            }
+                        },
+                        None => {
+                            ui::log_debug("response_rx 已关闭, dispatcher 退出");
+                            return Ok(());
+                        }
                     }
                 }
 
-                ServerResponse::StartSuccess { remaining_size } => {
-                    let info = StartInfo { remaining_size };
-                    if let Some(tx) = start_waiter.lock().await.take() {
-                        let _ = tx.send(info);
-                    } else {
-                        ui::log_warn("收到 StartSuccess 但没有等待者");
+                // 每秒定期检查心跳超时
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if last_heartbeat.elapsed() > timeout {
+                        return Err(anyhow!("心跳超时: 5 秒未收到服务端心跳，连接可能已断开"));
                     }
-                }
-
-                ServerResponse::ChunkReadyForDownload {
-                    chunk_id,
-                    passphrase_b64,
-                    retry,
-                } => {
-                    // 转发给下载循环
-                    let ev = DownloadEvent::ChunkReady {
-                        chunk_id,
-                        passphrase_b64,
-                        retry,
-                    };
-                    if let Err(e) = download_tx.send(ev).await {
-                        ui::log_error(&format!("发送 DownloadEvent 失败: {e}"));
-                    }
-                }
-
-                ServerResponse::UploadCompleted => {
-                    if let Err(e) = download_tx.send(DownloadEvent::UploadCompleted).await {
-                        ui::log_error(&format!("发送 UploadCompleted 事件失败: {e}"));
-                    }
-                }
-
-                ServerResponse::Error(msg) => {
-                    ui::log_error(&format!("服务端错误: {msg}"));
-                    return Err(anyhow!("服务端错误: {msg}"));
                 }
             }
         }
-
-        Ok(())
     }
 
     pub fn spawn_dispatcher(&mut self) {
         let response_rx = self.response_rx.take().expect("dispatcher 已经被启动过了");
 
         let download_tx = self.download_tx.clone();
+        let ready_waiter = Arc::clone(&self.ready_waiter);
         let setup_waiter = Arc::clone(&self.setup_waiter);
         let start_waiter = Arc::clone(&self.start_waiter);
 
         tokio::spawn(async move {
-            if let Err(e) =
-                GMFClient::run_dispatcher(response_rx, download_tx, setup_waiter, start_waiter)
-                    .await
+            if let Err(e) = GMFClient::run_dispatcher(
+                response_rx,
+                download_tx,
+                ready_waiter,
+                setup_waiter,
+                start_waiter,
+            )
+            .await
             {
-                ui::log_error(&format!("dispatcher 出错退出: {e:#}"));
+                ui::log_error(&format!("dispatcher 发生错误: {e:#}"));
             }
         });
+    }
+
+    pub async fn wait_ready(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut guard = self.ready_waiter.lock().await;
+            *guard = Some(tx);
+        }
+
+        rx.await
+            .context("等待服务器 Heartbeat/Ready 时被取消或连接关闭")?;
+        Ok(())
     }
 
     pub async fn setup(&mut self) -> Result<()> {
@@ -328,10 +361,7 @@ impl GMFClient {
     }
 
     /// 接收服务端消息的主循环
-    async fn download_loop(
-        &mut self,
-        gmf_session: Arc<GmfSession>,
-    ) -> Result<Duration> {
+    async fn download_loop(&mut self, gmf_session: Arc<GmfSession>) -> Result<Duration> {
         let total_chunks = gmf_session.total_chunks;
         let mut completed_chunk_ids: HashSet<u64> = (0..self.resume_from_chunk_id).collect();
         let mut join_set: JoinSet<ChunkResult> = JoinSet::new();

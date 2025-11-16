@@ -24,6 +24,7 @@ async fn real_main(args: GetArgs) -> Result<()> {
     let result: Result<()> = tokio::select! {
         // 正常执行业务逻辑
         res = async {
+            client.wait_ready().await?;
             client.setup().await?;
             client.start().await?;
             Ok(())

@@ -14,6 +14,38 @@ use tokio::{
 };
 use tracing::{error, info};
 
+fn start_heartbeat_task(tx: mpsc::Sender<Message>, mut shutdown_rx: watch::Receiver<()>) {
+    tokio::spawn(async move {
+        use std::time::Duration;
+        use tokio::time::interval;
+
+        let mut ticker = interval(Duration::from_secs(1));
+
+        // 启动后先立即发一次心跳
+        if tx.send(ServerResponse::Heartbeat.into()).await.is_err() {
+            error!("无法发送初始心跳，通信通道已关闭");
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if tx.send(ServerResponse::Heartbeat.into()).await.is_err() {
+                        error!("发送心跳失败，通信通道已关闭，心跳任务退出");
+                        break;
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() {
+                        info!("收到关闭信号，心跳任务退出");
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_logging().expect("无法初始化文件日志系统");
@@ -33,20 +65,18 @@ async fn main() -> Result<()> {
 
     // 初始化
     let state: SharedState = Arc::new(Mutex::new(AppState::default()));
-    if tx.send(ServerResponse::Heartbeat.into()).await.is_err() {
-        error!("无法发送 Ready 消息，通信通道已关闭");
-        return Ok(());
-    }
 
     // 创建用于优雅关闭的 watch channel
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let mut task_handle: Option<JoinHandle<()>> = None;
 
-    info!("服务端启动成功,开始监听 stdin...");
+    start_heartbeat_task(tx.clone(), shutdown_rx.clone());
+
+    info!("服务端启动成功, 开始监听 stdin...");
 
     // 主循环,监听来自客户端的消息
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line_buffer = String::new();
+    let mut task_handle: Option<JoinHandle<()>> = None;
     loop {
         line_buffer.clear();
         match stdin.read_line(&mut line_buffer).await {
