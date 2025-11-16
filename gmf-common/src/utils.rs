@@ -51,3 +51,30 @@ pub fn calc_xxh3(path: &Path) -> Result<String> {
 
     Ok(format!("{hash:x}"))
 }
+
+pub fn find_available_filename(path: &PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path.clone();
+    }
+
+    let parent = path.parent().unwrap();
+    let file_stem = path.file_stem().unwrap().to_string_lossy();
+    let extension = path.extension().map(|e| e.to_string_lossy());
+
+    // filename.ext → filename (1).ext
+    for i in 1..10000 {
+        let new_name = if let Some(ext) = &extension {
+            format!("{} ({}).{}", file_stem, i, ext)
+        } else {
+            format!("{} ({})", file_stem, i)
+        };
+
+        let new_path = parent.join(new_name);
+        if !new_path.exists() {
+            return new_path;
+        }
+    }
+
+    // 防御性代码：基本不会走到
+    path.clone()
+}

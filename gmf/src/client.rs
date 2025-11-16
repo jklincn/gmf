@@ -5,10 +5,9 @@ use crate::ssh;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use gmf_common::{interface::*, utils::format_size};
-use tokio::time::timeout;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::timeout;
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
@@ -168,8 +167,8 @@ impl GMFClient {
                                     }
                                 }
 
-                                ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64, retry } => {
-                                    let ev = DownloadEvent::ChunkReady { chunk_id, passphrase_b64, retry };
+                                ServerResponse::ChunkReadyForDownload { chunk_id, passphrase_b64 } => {
+                                    let ev = DownloadEvent::ChunkReady { chunk_id, passphrase_b64 };
                                     if let Err(e) = download_tx.send(ev).await {
                                         ui::log_error(&format!("发送 DownloadEvent 失败: {e}"));
                                     }
@@ -288,11 +287,6 @@ impl GMFClient {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        let session = self
-            .download_session
-            .take()
-            .ok_or_else(|| anyhow!("内部状态错误: file 未初始化"))?;
-
         let (tx, rx) = oneshot::channel();
         {
             let mut guard = self.start_waiter.lock().await;
@@ -314,22 +308,15 @@ impl GMFClient {
             format_size(remaining_size)
         ));
 
-        // 开始下载循环（基本就是你原来的 event_loop，但从 download_rx 收消息）
-        let loop_result = self.download_loop(session.clone()).await;
-
-        // 后面这段可以沿用你原来的逻辑
-        match loop_result {
+        // 开始下载循环
+        match self.download_loop().await {
             Ok(upload_time) => {
-                ui::log_debug("等待本地写入完成...");
-
-                let session_to_finish = Arc::try_unwrap(session).map_err(|arc| {
-                    anyhow!(
-                        "无法获得 GmfSession 的唯一所有权，还有 {} 个引用存在。这可能是个逻辑错误。",
-                        Arc::strong_count(&arc)
-                    )
-                })?;
-
-                session_to_finish.wait_for_completion().await?;
+                if let Some(session) = &self.download_session {
+                    session
+                        .finalize()
+                        .await
+                        .context("下载完成后整理本地文件失败（重命名或删除元数据失败）")?;
+                }
                 let secs = upload_time.as_secs_f64();
                 let speed_str = if secs > 0.0 {
                     format!(
@@ -350,27 +337,26 @@ impl GMFClient {
     }
 
     /// 接收服务端消息的主循环
-    async fn download_loop(&mut self, download_session: Arc<DownloadSession>) -> Result<Duration> {
-        let total_chunks = download_session.total_chunks;
-        let mut completed_chunk_ids: HashSet<u64> = (0..self.resume_from_chunk_id).collect();
+    async fn download_loop(&mut self) -> Result<Duration> {
+        let download_session = self.download_session.as_ref().unwrap().clone();
+        let total_chunks = download_session.total_chunks().await;
+        let mut completed_chunks = download_session.completed_chunks().await;
         let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
         let mut upload_completed = false;
         let mut upload_time = Duration::ZERO;
         let start_time = std::time::Instant::now();
+
         ui::start_tick();
 
         ui::log_debug(&format!(
-            "下载事件循环开始，总分块数: {}, 已完成分块数: {}, 需要下载分块数: {}",
-            total_chunks,
-            completed_chunk_ids.len(),
-            total_chunks - completed_chunk_ids.len() as u64
+            "下载事件循环开始，总分块数: {total_chunks}, 已完成分块数: {completed_chunks}, 需要下载分块数: {}",
+            total_chunks - completed_chunks
         ));
 
         loop {
             // 检查是否所有分块都已完成
-            if completed_chunk_ids.len() as u64 == total_chunks {
-                // 等待所有剩余的任务完成
-                while let Some(_) = join_set.join_next().await {}
+            if completed_chunks == total_chunks {
+                while join_set.join_next().await.is_some() {}
                 ui::log_debug("所有分块均已成功处理！");
                 break;
             }
@@ -382,32 +368,32 @@ impl GMFClient {
                 Some(res) = join_set.join_next() => {
                     match res {
                         Ok(ChunkResult::Success(chunk_id)) => {
-                            completed_chunk_ids.insert(chunk_id);
                             ui::log_debug(&format!("分块 #{chunk_id} 处理成功"));
+                            completed_chunks = download_session.completed_chunks().await;
                         },
                         Ok(ChunkResult::Timeout(chunk_id)) => {
                             ui::log_debug(&format!("分块 #{chunk_id} 下载超时，正在重试..."));
                             self.send_request(ClientRequest::Retry { chunk_id }).await?;
                         },
                         Ok(ChunkResult::Failure(chunk_id, err)) => {
-                            let error_msg = format!("分块 #{chunk_id} 处理失败: {err:?}");
-                            bail!(error_msg);
+                            bail!("分块 #{chunk_id} 处理失败: {err:?}");
                         },
                         Err(join_err) => {
-                            let error_msg = format!("任务执行出现严重错误 (panic): {join_err:?}");
-                            bail!(error_msg);
+                            bail!("任务执行出现严重错误 (panic): {join_err:?}");
                         },
                     }
                 },
 
                 Some(ev) = self.download_rx.recv(), if !upload_completed => {
                     match ev {
-                        DownloadEvent::ChunkReady { chunk_id, passphrase_b64, retry } => {
+                        DownloadEvent::ChunkReady { chunk_id, passphrase_b64 } => {
+                            if download_session.is_completed(chunk_id).await {
+                                ui::log_debug(&format!("分块 #{chunk_id} 已完成，跳过"));
+                                continue;
+                            }
                             let session_clone = download_session.clone();
                             join_set.spawn(async move {
-                                session_clone
-                                    .handle_chunk(chunk_id, passphrase_b64, retry)
-                                    .await
+                                session_clone.handle_chunk(chunk_id, passphrase_b64).await
                             });
                         }
                         DownloadEvent::UploadCompleted => {

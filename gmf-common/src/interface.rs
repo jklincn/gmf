@@ -35,7 +35,6 @@ pub enum DownloadEvent {
     ChunkReady {
         chunk_id: u64,
         passphrase_b64: String,
-        retry: bool,
     },
     UploadCompleted,
 }
@@ -50,7 +49,6 @@ pub enum ServerResponse {
     ChunkReadyForDownload {
         chunk_id: u64,
         passphrase_b64: String,
-        retry: bool,
     },
     UploadCompleted,
     Error(String),

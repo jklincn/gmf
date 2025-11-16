@@ -1,7 +1,7 @@
+use base64::{Engine as _, engine::general_purpose};
 use bitvec::prelude::*;
-use serde::{Serialize, Deserialize, Serializer, Deserializer};
-use base64::{engine::general_purpose, Engine as _};
 use bytemuck;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone)]
 pub struct ChunkBitmap {
@@ -24,6 +24,22 @@ impl ChunkBitmap {
 
     pub fn all_completed(&self) -> bool {
         self.bits.all()
+    }
+
+    pub fn completed_count(&self) -> u64 {
+        self.bits.count_ones() as u64
+    }
+
+    pub fn pending_count(&self) -> u64 {
+        (self.bits.len() - self.bits.count_ones()) as u64
+    }
+
+    pub fn completed_ids(&self) -> Vec<u64> {
+        self.bits.iter_ones().map(|idx| idx as u64).collect()
+    }
+
+    pub fn pending_ids(&self) -> Vec<u64> {
+        self.bits.iter_zeros().map(|idx| idx as u64).collect()
     }
 }
 

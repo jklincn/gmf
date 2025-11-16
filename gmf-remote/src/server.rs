@@ -204,7 +204,7 @@ pub async fn start(
                                                     upload_start_time.elapsed().as_secs_f32()
                                                 );
                                                 let success_response = ServerResponse::ChunkReadyForDownload {
-                                                    chunk_id, passphrase_b64, retry:false
+                                                    chunk_id, passphrase_b64
                                                 };
                                                 if sender_clone.send(success_response.into()).await.is_err() {
                                                     error!("无法将 ChunkReadyForDownload 消息发送给客户端: 通道已关闭");
@@ -454,7 +454,6 @@ pub async fn chunk_retry(chunk_id: u64, state: SharedState, sender: mpsc::Sender
         let success_response = ServerResponse::ChunkReadyForDownload {
             chunk_id,
             passphrase_b64,
-            retry: true,
         };
         sender
             .send(success_response.into())
