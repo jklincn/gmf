@@ -52,7 +52,11 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
         if resp.success() {
             resp.bucket
         } else {
-            return Err(anyhow!("创建 S3 bucket 失败"));
+            return Err(anyhow!(
+                "创建 S3 bucket 失败: HTTP {}, 响应内容：{}",
+                resp.response_code,
+                resp.response_text
+            ));
         }
     } else {
         bucket

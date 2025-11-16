@@ -72,11 +72,11 @@ impl Header {
 }
 
 // 文件上下文
-pub struct GMFFile {
+struct GMFFile {
     file: File,
     header: Header,
-    pub file_name: String,
-    pub temp_path: PathBuf,
+    file_name: String,
+    temp_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +95,7 @@ impl Metadata {
     fn path(&self) -> PathBuf {
         app_dir().join(format!("{}.json", self.xxh3))
     }
-    pub fn open(&self) -> Result<()>{
+    pub fn open(&self) -> Result<()> {
         let cwd: PathBuf = env::current_dir().unwrap();
         let metadata_path = self.path();
         if metadata_path.exists() {
@@ -344,7 +344,7 @@ pub enum ChunkResult {
     Failure(u64, anyhow::Error),
 }
 
-pub struct GmfSession {
+pub struct DownloadSession {
     gmf_file: Arc<Mutex<GMFFile>>,
     decrypted_tx: mpsc::Sender<DecryptedChunk>,
     writer_handle: JoinHandle<Result<()>>,
@@ -352,13 +352,35 @@ pub struct GmfSession {
     pub total_chunks: u64,
 }
 
-impl GmfSession {
-    pub fn new(gmf_file: GMFFile, completed_chunks: u64) -> Self {
-        let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
-        let buffer_semaphore = Arc::new(Semaphore::new(20));
+impl DownloadSession {
+    pub fn new(
+        file_name: &str,
+        file_size: u64,
+        xxh3: &str,
+        remote_path: &str,
+        chunk_size: u64,
+        total_chunks: u64,
+    ) -> Result<(Self, u64)> {
+        // 1. 先创建/校验元数据文件
+        GMFFile::new(
+            file_name,
+            file_size,
+            xxh3,
+            remote_path,
+            chunk_size,
+            total_chunks,
+        )?;
+
+
+        let (gmf_file, completed_chunks) =
+            GMFFile::new_or_resume(file_name, file_size, total_chunks)?;
 
         let total_chunks = gmf_file.total_chunks();
         let gmf_file_arc = Arc::new(Mutex::new(gmf_file));
+
+        // 建立解密后的 chunk 通道和写入任务
+        let (decrypted_tx, decrypted_rx) = mpsc::channel(128);
+        let buffer_semaphore = Arc::new(Semaphore::new(20));
 
         let writer_handle = tokio::spawn(writer(
             gmf_file_arc.clone(),
@@ -367,13 +389,15 @@ impl GmfSession {
             total_chunks,
         ));
 
-        Self {
+        let session = Self {
             gmf_file: gmf_file_arc,
             decrypted_tx,
             writer_handle,
             buffer_semaphore,
             total_chunks,
-        }
+        };
+
+        Ok((session, completed_chunks))
     }
 
     /// 负责下载分块与解密，写入交由写入器操作

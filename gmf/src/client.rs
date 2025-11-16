@@ -1,10 +1,11 @@
 use crate::args::GetArgs;
 use crate::comm::SSHCommunicator;
-use crate::file::{ChunkResult, GMFFile, GmfSession};
+use crate::file::{ChunkResult, DownloadSession};
 use crate::ssh;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use gmf_common::{interface::*, utils::format_size};
+use tokio::time::timeout;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,8 +52,7 @@ pub struct GMFClient {
     comm_handle: JoinHandle<()>,
     // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::SSHSession,
-    // GMF 文件管理
-    file: Option<Arc<GmfSession>>,
+
     resume_from_chunk_id: u64,
 
     // 等待 setup / start 结果的 oneshot sender
@@ -61,6 +61,7 @@ pub struct GMFClient {
     start_waiter: Arc<Mutex<Option<oneshot::Sender<StartResponse>>>>,
 
     // dispatcher -> 下载循环 的事件通道
+    download_session: Option<Arc<DownloadSession>>,
     download_tx: mpsc::Sender<DownloadEvent>,
     download_rx: mpsc::Receiver<DownloadEvent>,
 }
@@ -113,11 +114,11 @@ impl GMFClient {
             response_rx: Some(response_rx),
             comm_handle,
             ssh_session,
-            file: None,
             resume_from_chunk_id: 0,
             ready_waiter: Arc::new(Mutex::new(None)),
             setup_waiter: Arc::new(Mutex::new(None)),
             start_waiter: Arc::new(Mutex::new(None)),
+            download_session: None,
             download_tx,
             download_rx,
         })
@@ -233,8 +234,11 @@ impl GMFClient {
             *guard = Some(tx);
         }
 
-        rx.await
-            .context("等待服务器 Heartbeat/Ready 时被取消或连接关闭")?;
+        // 超时包裹 futures
+        timeout(Duration::from_secs(10), rx)
+            .await
+            .context("10 秒内没有收到 Heartbeat/Ready 信号，等待超时")??;
+
         Ok(())
     }
 
@@ -265,21 +269,27 @@ impl GMFClient {
             format_size(info.file_size)
         );
         ui::log_info(&success_msg);
-        GMFFile::new(&info.file_name, info.file_size, &info.xxh3, &file_path, chunk_size, info.total_chunks)?;
-        let (gmf_file, completed_chunks) =
-            GMFFile::new_or_resume(&info.file_name, info.file_size, info.total_chunks)?;
+
+        let (session, completed_chunks) = DownloadSession::new(
+            &info.file_name,
+            info.file_size,
+            &info.xxh3,
+            &file_path,
+            chunk_size,
+            info.total_chunks,
+        )?;
 
         ui::init_global_download_bar(info.total_chunks, completed_chunks)?;
 
         self.resume_from_chunk_id = completed_chunks;
-        self.file = Some(Arc::new(GmfSession::new(gmf_file, completed_chunks)));
+        self.download_session = Some(Arc::new(session));
 
         Ok(())
     }
 
     pub async fn start(&mut self) -> Result<()> {
         let session = self
-            .file
+            .download_session
             .take()
             .ok_or_else(|| anyhow!("内部状态错误: file 未初始化"))?;
 
@@ -340,8 +350,8 @@ impl GMFClient {
     }
 
     /// 接收服务端消息的主循环
-    async fn download_loop(&mut self, gmf_session: Arc<GmfSession>) -> Result<Duration> {
-        let total_chunks = gmf_session.total_chunks;
+    async fn download_loop(&mut self, download_session: Arc<DownloadSession>) -> Result<Duration> {
+        let total_chunks = download_session.total_chunks;
         let mut completed_chunk_ids: HashSet<u64> = (0..self.resume_from_chunk_id).collect();
         let mut join_set: JoinSet<ChunkResult> = JoinSet::new();
         let mut upload_completed = false;
@@ -393,7 +403,7 @@ impl GMFClient {
                 Some(ev) = self.download_rx.recv(), if !upload_completed => {
                     match ev {
                         DownloadEvent::ChunkReady { chunk_id, passphrase_b64, retry } => {
-                            let session_clone = gmf_session.clone();
+                            let session_clone = download_session.clone();
                             join_set.spawn(async move {
                                 session_clone
                                     .handle_chunk(chunk_id, passphrase_b64, retry)
