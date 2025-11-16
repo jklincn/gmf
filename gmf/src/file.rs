@@ -5,7 +5,9 @@ use aes_gcm::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
-use gmf_common::{consts::NONCE_SIZE, r2};
+use gmf_common::{chunk::ChunkBitmap, consts::NONCE_SIZE, r2, utils::app_dir};
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -77,7 +79,106 @@ pub struct GMFFile {
     pub temp_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Metadata {
+    name: String,
+    size: u64,
+    xxh3: String,
+    local_path: PathBuf,
+    remote_path: PathBuf,
+    chunk_size: u64,
+    total_chunks: u64,
+    chunk_bitmap: ChunkBitmap,
+}
+
+impl Metadata {
+    fn path(&self) -> PathBuf {
+        app_dir().join(format!("{}.json", self.xxh3))
+    }
+    pub fn open(&self) -> Result<()>{
+        let cwd: PathBuf = env::current_dir().unwrap();
+        let metadata_path = self.path();
+        if metadata_path.exists() {
+            let metadata_content = fs::read_to_string(&metadata_path)
+                .with_context(|| format!("读取元数据文件 '{}' 失败", metadata_path.display()))?;
+            let metadata: Metadata = serde_json::from_str(&metadata_content)
+                .with_context(|| format!("解析元数据文件 '{}' 失败", metadata_path.display()))?;
+            // 验证元数据是否匹配
+            if metadata.name != self.name
+                || metadata.size != self.size
+                || metadata.xxh3 != self.xxh3
+                || metadata.local_path != self.local_path
+                || metadata.remote_path != self.remote_path
+                || metadata.chunk_size != self.chunk_size
+                || metadata.total_chunks != self.total_chunks
+            {
+                bail!(
+                    "元数据文件 '{}' 内容与当前下载任务不匹配，可能是旧的或损坏的文件",
+                    metadata_path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+    pub fn remove(&self) -> Result<()> {
+        let metadata_path = self.path();
+        if metadata_path.exists() {
+            fs::remove_file(&metadata_path)
+                .with_context(|| format!("删除元数据文件 '{}' 失败", metadata_path.display()))?;
+        }
+        Ok(())
+    }
+}
+
 impl GMFFile {
+    pub fn new(
+        name: &str,
+        size: u64,
+        xxh3: &str,
+        remote_path: &str,
+        chunk_size: u64,
+        total_chunks: u64,
+    ) -> Result<()> {
+        let cwd: PathBuf = env::current_dir().unwrap();
+        let metadata_path = app_dir().join(format!("{}.json", xxh3));
+        if metadata_path.exists() {
+            let metadata_content = fs::read_to_string(&metadata_path)
+                .with_context(|| format!("读取元数据文件 '{}' 失败", metadata_path.display()))?;
+            let metadata: Metadata = serde_json::from_str(&metadata_content)
+                .with_context(|| format!("解析元数据文件 '{}' 失败", metadata_path.display()))?;
+            // 验证元数据是否匹配
+            if metadata.name != name
+                || metadata.size != size
+                || metadata.remote_path != PathBuf::from(remote_path)
+                || metadata.chunk_size != chunk_size
+                || metadata.total_chunks != total_chunks
+            {
+                bail!(
+                    "元数据文件 '{}' 内容与当前下载任务不匹配，可能是旧的或损坏的文件",
+                    metadata_path.display()
+                );
+            }
+            ui::log_info("继续未完成的下载任务");
+        } else {
+            let metadata = Metadata {
+                name: name.to_string(),
+                size,
+                xxh3: xxh3.to_string(),
+                local_path: cwd.join(name),
+                remote_path: PathBuf::from(remote_path),
+                chunk_size,
+                total_chunks,
+                chunk_bitmap: ChunkBitmap::new(total_chunks),
+            };
+            let metadata_content = serde_json::to_string_pretty(&metadata)
+                .with_context(|| format!("序列化元数据失败"))?;
+            fs::write(&metadata_path, metadata_content)
+                .with_context(|| format!("写入元数据文件 '{}' 失败", metadata_path.display()))?;
+            ui::log_debug(&format!("创建新的元数据文件: {}", metadata_path.display()));
+        }
+        Ok(())
+    }
+
     pub fn new_or_resume(
         file_name: &str,
         file_size: u64,

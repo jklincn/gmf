@@ -265,7 +265,7 @@ impl GMFClient {
             format_size(info.file_size)
         );
         ui::log_info(&success_msg);
-
+        GMFFile::new(&info.file_name, info.file_size, &info.xxh3, &file_path, chunk_size, info.total_chunks)?;
         let (gmf_file, completed_chunks) =
             GMFFile::new_or_resume(&info.file_name, info.file_size, info.total_chunks)?;
 

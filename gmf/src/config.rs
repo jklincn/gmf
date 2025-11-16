@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use gmf_common::r2;
+use gmf_common::utils::config_path;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
-use std::{fs, path::PathBuf};
-use std::io::{self, Write};
+use std::{
+    fs,
+    io::{self, Write},
+    sync::OnceLock,
+};
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
     pub host: String,
@@ -15,16 +19,6 @@ pub struct Config {
     pub endpoint: String,
     pub access_key_id: String,
     pub secret_access_key: String,
-}
-
-fn config_path() -> PathBuf {
-    let base = dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .expect("Cannot determine config directory");
-
-    let gmf_dir = base.join("gmf");
-    fs::create_dir_all(&gmf_dir).expect("Failed to create config directory");
-    gmf_dir.join("config.toml")
 }
 
 fn write_default_config() -> Result<()> {
@@ -118,7 +112,6 @@ pub fn reset_config() -> Result<()> {
 
     Ok(())
 }
-
 
 pub async fn init_r2() -> Result<()> {
     let cfg = get_config();

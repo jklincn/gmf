@@ -1,6 +1,22 @@
 use anyhow::{Context, Result};
+use std::{fs, path::PathBuf};
 use std::{fs::File, hash::Hasher, io, path::Path};
 use xxhash_rust::xxh3::Xxh3;
+
+pub fn app_dir() -> PathBuf {
+    let base = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .expect("Cannot determine config directory");
+
+    let gmf_dir = base.join("gmf");
+    fs::create_dir_all(&gmf_dir).expect("Failed to create config directory");
+    gmf_dir
+}
+
+pub fn config_path() -> PathBuf {
+    let gmf_dir = app_dir();
+    gmf_dir.join("config.toml")
+}
 
 /// 格式化字节大小为易读的字符串
 pub fn format_size(size: u64) -> String {
