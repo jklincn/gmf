@@ -61,9 +61,9 @@ async fn main() -> Result<()> {
         // gmf get <path>
         Command::Get {
             path,
-            chunk_size,
             verbose,
         } => {
+            let chunk_size = 10 * 1024 * 1024;
             let get_args = GetArgs {
                 path,
                 chunk_size,
