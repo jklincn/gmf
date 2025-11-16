@@ -9,8 +9,8 @@ mod ui;
 use anyhow::Result;
 use args::{Command, GetArgs};
 
-use gmf_common::r2;
 use gmf_common::consts::CHUNK_SIZE;
+use gmf_common::r2;
 use tokio::try_join;
 
 use crate::config::init_r2;
@@ -61,10 +61,7 @@ async fn main() -> Result<()> {
             }
         }
         // gmf get <path>
-        Command::Get {
-            path,
-            verbose,
-        } => {
+        Command::Get { path, verbose } => {
             let get_args = GetArgs {
                 path,
                 chunk_size: CHUNK_SIZE,

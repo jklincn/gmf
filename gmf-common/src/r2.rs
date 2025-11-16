@@ -6,7 +6,9 @@ use tokio::sync::OnceCell;
 use s3::creds::Credentials;
 use s3::region::Region;
 use s3::{Bucket, BucketConfiguration};
+use s3::{retry, set_retries};
 
+use crate::consts::S3_RETRY;
 static S3_CONFIG: OnceCell<S3Config> = OnceCell::const_new();
 static BUCKET: OnceCell<Box<Bucket>> = OnceCell::const_new();
 
@@ -20,6 +22,7 @@ pub struct S3Config {
 }
 
 pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
+    set_retries(S3_RETRY);
     let use_override = config_override.is_some();
 
     S3_CONFIG
@@ -71,7 +74,7 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
                 MAX_RETRIES
             ));
         }
-        
+
         BUCKET
             .set(bucket)
             .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
@@ -153,7 +156,7 @@ pub async fn delete_bucket() -> Result<()> {
 
 pub async fn get_object(key: &str) -> Result<Bytes> {
     let bucket = get_bucket()?;
-    let resp = bucket.get_object(key).await?;
+    let resp = retry!(bucket.get_object(key).await)?;
     let code = resp.status_code();
     if code != 200 {
         return Err(anyhow!(
@@ -167,7 +170,7 @@ pub async fn get_object(key: &str) -> Result<Bytes> {
 
 pub async fn put_object(key: &str, data: &[u8]) -> Result<()> {
     let bucket = get_bucket()?;
-    let resp = bucket.put_object(key, data).await?;
+    let resp = retry!(bucket.put_object(key, data).await)?;
     let code = resp.status_code();
     if code != 200 {
         return Err(anyhow!(

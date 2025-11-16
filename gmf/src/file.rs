@@ -98,7 +98,7 @@ impl Metadata {
     fn save(&self) -> Result<()> {
         let metadata_path = self.path();
         let metadata_content =
-            serde_json::to_string_pretty(&self).with_context(|| format!("序列化元数据失败"))?;
+            serde_json::to_string_pretty(&self).with_context(|| "序列化元数据失败".to_string())?;
         fs::write(&metadata_path, metadata_content)
             .with_context(|| format!("写入元数据文件 '{}' 失败", metadata_path.display()))?;
         Ok(())

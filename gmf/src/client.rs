@@ -108,7 +108,7 @@ impl GMFClient {
         ui::log_debug("本地通信器已成功启动");
 
         Ok(Self {
-            args: args,
+            args,
             command_tx,
             response_rx: Some(response_rx),
             comm_handle,
@@ -357,6 +357,7 @@ impl GMFClient {
             if completed_chunks == total_chunks {
                 while join_set.join_next().await.is_some() {}
                 ui::log_debug("所有分块均已成功处理！");
+                ui::finish_download();
                 break;
             }
 
@@ -369,6 +370,7 @@ impl GMFClient {
                         Ok(ChunkResult::Success(chunk_id)) => {
                             ui::log_debug(&format!("分块 #{chunk_id} 处理成功"));
                             completed_chunks = download_session.completed_chunks().await;
+                            ui::update_download();
                         },
                         Ok(ChunkResult::Timeout(chunk_id)) => {
                             ui::log_debug(&format!("分块 #{chunk_id} 下载超时，正在重试..."));

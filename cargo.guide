@@ -1,0 +1,12 @@
+cargo install cargo-edit
+cargo upgrade --verbose
+
+rustup component add rustfmt
+cargo fmt
+
+rustup component add clippy
+cargo clippy --fix --bin gmf --allow-dirty
+cargo clippy --fix --bin gmf-remote --allow-dirty
+
+cargo install cargo-udeps
+cargo +nightly udeps --all-targets

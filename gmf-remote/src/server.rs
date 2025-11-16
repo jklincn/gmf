@@ -317,11 +317,10 @@ pub async fn start(
         let was_interrupted = matches!(&encryption_result, Err(e) if e.to_string() == "任务被用户中断");
         let encryption_successful = encryption_result.is_ok();
 
-        if let Err(e) = encryption_result {
-            if !was_interrupted {
+        if let Err(e) = encryption_result
+            && !was_interrupted {
                 return Err(e);
             }
-        }
 
         // 关闭生产者通道
         drop(upload_tx);
