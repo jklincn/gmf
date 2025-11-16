@@ -20,6 +20,8 @@ pub struct S3Config {
 }
 
 pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
+    let use_override = config_override.is_some();
+
     S3_CONFIG
         .set(match config_override {
             Some(cfg) => cfg,
@@ -45,30 +47,62 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
         None,
         None,
     )?;
-    let bucket = Bucket::new(BUCKET_NAME, region.clone(), credentials.clone())?.with_path_style();
-    let final_bucket = if !bucket.exists().await? {
-        let config = BucketConfiguration::default();
-        let resp = Bucket::create(BUCKET_NAME, region, credentials, config).await?;
-        if resp.success() {
-            resp.bucket
-        } else {
+
+    if !use_override {
+        let bucket =
+            Bucket::new(BUCKET_NAME, region.clone(), credentials.clone())?.with_path_style();
+
+        const MAX_RETRIES: usize = 5;
+        const RETRY_DELAY_MS: u64 = 500;
+
+        let mut ok = false;
+        for _ in 1..=MAX_RETRIES {
+            if bucket.exists().await? {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+
+        if !ok {
             return Err(anyhow!(
-                "创建 S3 bucket 失败: HTTP {}, 响应内容：{}",
-                resp.response_code,
-                resp.response_text
+                "S3 bucket '{}' 在默认配置下未检测到存在（尝试 {} 次）",
+                BUCKET_NAME,
+                MAX_RETRIES
             ));
         }
+        
+        BUCKET
+            .set(bucket)
+            .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
+
+        Ok(())
     } else {
-        bucket
-    };
+        let bucket =
+            Bucket::new(BUCKET_NAME, region.clone(), credentials.clone())?.with_path_style();
+        let final_bucket = if !bucket.exists().await? {
+            let config = BucketConfiguration::default();
+            let resp = Bucket::create(BUCKET_NAME, region, credentials, config).await?;
+            if resp.success() {
+                resp.bucket
+            } else {
+                return Err(anyhow!(
+                    "创建 S3 bucket 失败: HTTP {}, 响应内容：{}",
+                    resp.response_code,
+                    resp.response_text
+                ));
+            }
+        } else {
+            bucket
+        };
 
-    BUCKET
-        .set(final_bucket)
-        .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
+        BUCKET
+            .set(final_bucket)
+            .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
 
-    Ok(())
+        Ok(())
+    }
 }
-
 pub fn get_bucket() -> Result<&'static Bucket> {
     BUCKET
         .get()

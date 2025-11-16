@@ -233,10 +233,9 @@ impl GMFClient {
             *guard = Some(tx);
         }
 
-        // 超时包裹 futures
         timeout(Duration::from_secs(10), rx)
             .await
-            .context("10 秒内没有收到 Heartbeat/Ready 信号，等待超时")??;
+            .context("服务端启动失败，请使用 -v 重新运行并检查服务端日志")??;
 
         Ok(())
     }
@@ -416,7 +415,7 @@ impl GMFClient {
         self.command_tx
             .send(request)
             .await
-            .context("向 I/O Actor 发送命令失败，通道可能已关闭")
+            .context("向 Communicator 发送命令失败，通道可能已关闭")
     }
 
     pub async fn shutdown(mut self) -> Result<()> {

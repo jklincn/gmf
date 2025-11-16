@@ -15,7 +15,7 @@ pub enum Command {
     Get {
         path: String,
 
-        /// 打印详细输出
+        /// 更加详细的输出
         #[arg(short, long)]
         verbose: bool,
     },
