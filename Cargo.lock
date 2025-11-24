@@ -1128,6 +1128,7 @@ dependencies = [
  "gmf-common",
  "shellexpand",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

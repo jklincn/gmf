@@ -6,10 +6,10 @@ use aes_gcm::{
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use gmf_common::{
-    chunk::ChunkBitmap,
+    chunk_bitmap::ChunkBitmap,
     consts::NONCE_SIZE,
     r2,
-    utils::{app_dir, find_available_filename},
+    utils::{app_dir, calc_xxh3, find_available_filename},
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -129,7 +129,6 @@ impl Metadata {
 #[derive(Debug)]
 pub enum ChunkResult {
     Success(u64),
-    Timeout(u64),
     Failure(u64, anyhow::Error),
 }
 
@@ -146,7 +145,7 @@ impl DownloadSession {
         remote_path: &str,
         chunk_size: u64,
         total_chunks: u64,
-    ) -> Result<(Self, u64)> {
+    ) -> Result<Self> {
         let cwd: PathBuf = env::current_dir().unwrap();
         let local_path = cwd.join(file_name);
         let temp_path = cwd.join(format!("{}.gmf", xxh3));
@@ -183,23 +182,30 @@ impl DownloadSession {
             )?
         };
 
-        let completed_chunks = metadata.completed_chunks();
         let session = Self {
             file: Arc::new(Mutex::new(file)),
             metadata: Arc::new(Mutex::new(metadata)),
         };
 
-        Ok((session, completed_chunks))
+        Ok(session)
     }
+
     pub async fn total_chunks(&self) -> u64 {
         self.metadata.lock().await.total_chunks()
     }
+
     pub async fn completed_chunks(&self) -> u64 {
         self.metadata.lock().await.completed_chunks()
     }
+
     pub async fn is_completed(&self, chunk_id: u64) -> bool {
         self.metadata.lock().await.is_completed(chunk_id)
     }
+
+    pub async fn chunk_bitmap(&self) -> ChunkBitmap {
+        self.metadata.lock().await.chunk_bitmap.clone()
+    }
+
     /// 负责下载分块与解密，写入交由写入器操作
     pub async fn handle_chunk(&self, chunk_id: u64, passphrase_b64: String) -> ChunkResult {
         ui::log_debug(&format!("分块 #{chunk_id} 开始处理"));
@@ -277,13 +283,13 @@ impl DownloadSession {
     }
 
     pub async fn finalize(&self) -> Result<()> {
-        let md = self.metadata.lock().await;
+        let metadata = self.metadata.lock().await;
 
-        if md.completed_chunks() != md.total_chunks() {
+        if metadata.completed_chunks() != metadata.total_chunks() {
             bail!(
                 "尝试完成下载，但还有未完成的分块: {}/{}",
-                md.completed_chunks(),
-                md.total_chunks()
+                metadata.completed_chunks(),
+                metadata.total_chunks()
             );
         }
 
@@ -293,17 +299,27 @@ impl DownloadSession {
         }
 
         let cwd: PathBuf = env::current_dir().unwrap();
-        let temp_path = cwd.join(format!("{}.gmf", md.xxh3));
-        let final_path = cwd.join(&md.name);
+        let temp_path = cwd.join(format!("{}.gmf", metadata.xxh3));
 
-        // 使用安全方式获取一个不会覆盖任何文件的最终路径
+        calc_xxh3(&temp_path)
+            .with_context(|| format!("计算下载文件 '{}' 的 XXH3 哈希值失败", temp_path.display()))
+            .and_then(|hash| {
+                if hash != metadata.xxh3 {
+                    bail!(
+                        "下载文件完整性校验失败，期望的 XXH3: {}, 实际的 XXH3: {}",
+                        metadata.xxh3,
+                        hash
+                    );
+                } else {
+                    ui::log_debug("下载文件完整性校验通过");
+                }
+                Ok(())
+            })?;
+
+        let final_path = cwd.join(&metadata.name);
+
+        // 获取文件最终路径
         let safe_path = find_available_filename(&final_path);
-
-        ui::log_debug(&format!(
-            "重命名临时文件 '{}' → '{}'",
-            temp_path.display(),
-            safe_path.display()
-        ));
 
         std::fs::rename(&temp_path, &safe_path).with_context(|| {
             format!(
@@ -313,7 +329,7 @@ impl DownloadSession {
             )
         })?;
 
-        md.remove()?;
+        metadata.remove()?;
 
         ui::log_debug("元数据文件已删除，下载会话清理完成");
 

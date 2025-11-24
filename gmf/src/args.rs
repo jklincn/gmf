@@ -9,7 +9,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    #[command(about = "重置 GMF 的配置文件")]
+    #[command(about = "创建/重置 GMF 的配置文件")]
     Config,
     #[command(about = "从远程服务器下载文件")]
     Get {

@@ -50,7 +50,7 @@ user = "{}"
 # 密码 (推荐使用密钥登陆，如果启用密码，则会忽略密钥)
 # password = "{}"
 
-# 私钥路径 (Windows中文件路径注意使用单引号或双反斜杠, 例如: 'C:\\Users\\user\\.ssh\\id_rsa')
+# 私钥路径 (Windows文件路径注意使用单引号或双反斜杠, 例如: 'C:\\Users\\user\\.ssh\\id_rsa')
 private_key_path = '{}'
 
 # ======== Cloudflare R2 对象存储配置 =========
@@ -107,7 +107,7 @@ pub fn reset_config() -> Result<()> {
 
     write_default_config()?;
 
-    println!("配置文件已重置为默认值");
+    println!("配置文件已创建");
     println!("路径: {}", path.display());
 
     Ok(())

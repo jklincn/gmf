@@ -52,8 +52,6 @@ pub struct GMFClient {
     // 持有底层的 SSH 会话对象，以便能够关闭它
     ssh_session: ssh::SSHSession,
 
-    resume_from_chunk_id: u64,
-
     // 等待 setup / start 结果的 oneshot sender
     ready_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     setup_waiter: Arc<Mutex<Option<oneshot::Sender<SetupResponse>>>>,
@@ -113,7 +111,6 @@ impl GMFClient {
             response_rx: Some(response_rx),
             comm_handle,
             ssh_session,
-            resume_from_chunk_id: 0,
             ready_waiter: Arc::new(Mutex::new(None)),
             setup_waiter: Arc::new(Mutex::new(None)),
             start_waiter: Arc::new(Mutex::new(None)),
@@ -258,28 +255,27 @@ impl GMFClient {
         })
         .await?;
 
-        // 在这里等待 dispatcher 把结果发回来
-        let info = rx.await.context("等待 SetupSuccess 被取消或连接关闭")?;
+        // 等待 dispatcher 发送结果
+        let response = rx.await.context("等待 SetupSuccess 被取消或连接关闭")?;
 
         let success_msg = format!(
             "文件名称: {} (大小: {})",
-            info.file_name,
-            format_size(info.file_size)
+            response.file_name,
+            format_size(response.file_size)
         );
         ui::log_info(&success_msg);
 
-        let (session, completed_chunks) = DownloadSession::new(
-            &info.file_name,
-            info.file_size,
-            &info.xxh3,
+        let session = DownloadSession::new(
+            &response.file_name,
+            response.file_size,
+            &response.xxh3,
             &file_path,
             chunk_size,
-            info.total_chunks,
+            response.total_chunks,
         )?;
+        let completed_chunks = session.completed_chunks().await;
+        ui::init_global_download_bar(response.total_chunks, completed_chunks)?;
 
-        ui::init_global_download_bar(info.total_chunks, completed_chunks)?;
-
-        self.resume_from_chunk_id = completed_chunks;
         self.download_session = Some(Arc::new(session));
 
         Ok(())
@@ -291,16 +287,15 @@ impl GMFClient {
             let mut guard = self.start_waiter.lock().await;
             *guard = Some(tx);
         }
-
+        let download_session = self.download_session.as_ref().unwrap().clone();
+        let chunk_bitmap = download_session.chunk_bitmap().await;
         ui::log_debug("正在发送 Start 请求...");
-        self.send_request(ClientRequest::Start {
-            resume_from_chunk_id: self.resume_from_chunk_id,
-        })
-        .await?;
+        self.send_request(ClientRequest::Start { chunk_bitmap })
+            .await?;
 
-        // 等待 StartSuccess
-        let start_info = rx.await.context("等待 StartSuccess 时被取消或连接关闭")?;
-        let remaining_size = start_info.remaining_size;
+        // 等待 dispatcher 发送结果
+        let response = rx.await.context("等待 StartSuccess 时被取消或连接关闭")?;
+        let remaining_size = response.remaining_size;
 
         ui::log_debug(&format!(
             "服务端确认，需要传输的大小为 {} ，开始接收分块信息...",
@@ -371,10 +366,6 @@ impl GMFClient {
                             ui::log_debug(&format!("分块 #{chunk_id} 处理成功"));
                             completed_chunks = download_session.completed_chunks().await;
                             ui::update_download();
-                        },
-                        Ok(ChunkResult::Timeout(chunk_id)) => {
-                            ui::log_debug(&format!("分块 #{chunk_id} 下载超时，正在重试..."));
-                            self.send_request(ClientRequest::Retry { chunk_id }).await?;
                         },
                         Ok(ChunkResult::Failure(chunk_id, err)) => {
                             bail!("分块 #{chunk_id} 处理失败: {err:?}");

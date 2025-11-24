@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::chunk_bitmap::ChunkBitmap;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "message_type", content = "payload")]
 pub enum Message {
@@ -13,8 +15,7 @@ pub enum Message {
 #[serde(tag = "type", content = "data")]
 pub enum ClientRequest {
     Setup { path: String, chunk_size: u64 },
-    Start { resume_from_chunk_id: u64 },
-    Retry { chunk_id: u64 },
+    Start { chunk_bitmap: ChunkBitmap },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

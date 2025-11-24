@@ -1,22 +1,18 @@
 mod logging;
+mod metadata;
+mod msg;
 mod server;
 
 use crate::logging::init_logging;
-use crate::server::{AppState, SharedState};
 use anyhow::Result;
-use gmf_common::interface::{Message, ServerResponse};
+use gmf_common::interface::{ClientRequest, Message, ServerResponse, StartResponse};
 use gmf_common::r2::init_s3;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::{Mutex, mpsc, watch},
-    task::JoinHandle,
-    time::interval,
-};
+use tokio::{sync::mpsc, task::JoinHandle, time::interval};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-fn start_heartbeat_task(tx: mpsc::Sender<Message>, mut shutdown_rx: watch::Receiver<()>) {
+fn start_heartbeat_task(tx: mpsc::Sender<Message>, shutdown_token: CancellationToken) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
 
@@ -34,10 +30,8 @@ fn start_heartbeat_task(tx: mpsc::Sender<Message>, mut shutdown_rx: watch::Recei
                         break;
                     }
                 }
-                changed = shutdown_rx.changed() => {
-                    if changed.is_ok() {
-                        info!("收到关闭信号，心跳任务退出");
-                    }
+                _ = shutdown_token.cancelled() => {
+                    info!("收到关闭信号，心跳任务退出");
                     break;
                 }
             }
@@ -51,22 +45,19 @@ async fn main() -> Result<()> {
 
     // 创建本地通信器
     let (tx, mut rx) = mpsc::channel::<Message>(100);
-    let writer_task = tokio::spawn(async move {
+    let writer_to_client = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             match msg.to_json() {
                 Ok(json) => println!("{json}"),
-                Err(e) => eprintln!("writer_task: JSON 序列化失败: {e}"),
+                Err(e) => eprintln!("writer_to_client: JSON 序列化失败: {e}"),
             }
         }
     });
 
-    info!("writer_task 已启动");
-
-    // 初始化
-    let state: SharedState = Arc::new(Mutex::new(AppState::default()));
+    info!("writer_to_client 已启动");
 
     // 创建用于优雅关闭的 watch channel
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let shutdown_token = CancellationToken::new();
 
     if let Err(e) = init_s3(None).await {
         let _ = tx
@@ -76,111 +67,71 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 开启心跳
-    start_heartbeat_task(tx.clone(), shutdown_rx.clone());
+    // 开始监听 stdin
+    let mut request_rx = msg::start_stdin_request_channel(tx.clone());
 
-    info!("服务端启动成功, 开始监听 stdin...");
+    // 开启心跳
+    start_heartbeat_task(tx.clone(), shutdown_token.clone());
+
+    info!("服务端启动成功!");
 
     // 主循环,监听来自客户端的消息
-    let mut stdin = BufReader::new(tokio::io::stdin());
-    let mut line_buffer = String::new();
-    let mut task_handle: Option<JoinHandle<()>> = None;
-    loop {
-        line_buffer.clear();
-        match stdin.read_line(&mut line_buffer).await {
-            Ok(0) => {
-                info!("stdin EOF: 客户端已关闭，会话即将结束");
-                break;
-            }
-            Ok(_) => {
-                let line = line_buffer.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let msg = match Message::from_json(line) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = tx
-                            .send(ServerResponse::Error(format!("无法解析 JSON: {e}")).into())
-                            .await;
-                        continue;
-                    }
-                };
-                let request = match msg {
-                    Message::Request(req) => req,
-                    _ => {
-                        let _ = tx
-                            .send(
-                                ServerResponse::Error(
-                                    "协议错误：收到了非 Request 类型的消息。".to_string(),
-                                )
-                                .into(),
-                            )
-                            .await;
-                        continue;
-                    }
-                };
-                // 业务处理
-                match server::handle_message(
-                    request,
-                    state.clone(),
-                    tx.clone(),
-                    shutdown_rx.clone(),
-                )
-                .await
-                {
-                    Ok(Some(handle)) => {
-                        if let Some(old) = task_handle.take() {
-                            old.abort();
-                        }
-                        task_handle = Some(handle);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        // 发送业务错误
-                        let _ = tx
-                            .send(ServerResponse::Error(format!("处理消息失败: {e}")).into())
-                            .await;
-                        // 不 break，一样继续监听
-                    }
+    let mut start_handle: Option<JoinHandle<()>> = None;
+    while let Some(request) = request_rx.recv().await {
+        match request {
+            ClientRequest::Setup { path, chunk_size } => {
+                let response = server::setup(path, chunk_size).await;
+                if tx.send(response.into()).await.is_err() {
+                    error!("Channel closed. Could not send setup response.");
                 }
             }
-            Err(e) => {
-                error!("读取 stdin 时发生错误: {}", e);
-                let _ = tx
-                    .send(ServerResponse::Error(format!("读取 stdin 失败: {e}")).into())
-                    .await;
-                break;
+            ClientRequest::Start { mut chunk_bitmap } => {
+                let metadata = metadata::global_metadata();
+
+                // 修复 Bitmap 长度：因为在分配时至少用一个完整的u64，反序列化恢复了所有的存储位
+                let total_chunks = metadata.total_chunks() as usize;
+                if chunk_bitmap.bits.len() > total_chunks {
+                    chunk_bitmap.bits.truncate(total_chunks);
+                }
+                metadata::init_chunk_bitmap(chunk_bitmap.clone());
+                let chunk_size = metadata.chunk_size();
+                let file_size = metadata.file_size();
+                let sent_bytes = chunk_bitmap.completed_count() * chunk_size;
+                let remaining_size = file_size.saturating_sub(sent_bytes);
+                let ack = ServerResponse::StartSuccess(StartResponse { remaining_size });
+                if tx.send(ack.into()).await.is_err() {
+                    error!("Channel closed. Could not send StartSuccess ack.");
+                }
+                let handle = tokio::spawn(server::start(tx.clone(), shutdown_token.clone()));
+                start_handle = Some(handle);
             }
         }
     }
 
     info!("正在通知所有任务关闭...");
 
-    let _ = shutdown_tx.send(());
+    shutdown_token.cancel();
 
-    if let Some(handle) = task_handle {
-        info!("等待任务完成清理...");
+    if let Some(handle) = start_handle {
+        info!("等待 start 任务完成清理...");
         let abort_handle = handle.abort_handle();
         match tokio::time::timeout(Duration::from_secs(10), handle).await {
-            Ok(result) => match result {
-                Ok(_) => info!("任务已成功关闭。"),
-                Err(e) if e.is_panic() => error!("任务在关闭过程中发生 panic"),
-                Err(_) => info!("任务被成功中止"),
-            },
+            Ok(Ok(())) => info!("start 任务已成功关闭"),
+            Ok(Err(e)) if e.is_panic() => error!("start 任务在关闭过程中 panic: {e:?}"),
+            Ok(Err(_)) => info!("start 任务已被中止"),
             Err(_) => {
-                error!("等待任务超时, 将强制中止。");
+                error!("等待 start 任务超时, 将强制中止");
                 abort_handle.abort();
             }
         }
     }
 
-    // 通知 writer_task 退出
+    // 通知 writer_to_client 退出
     drop(tx);
-    if let Err(e) = writer_task.await {
-        error!("等待 writer_task 退出时发生错误: {e:?}");
+    if let Err(e) = writer_to_client.await {
+        error!("等待 writer_to_client 退出时发生错误: {e:?}");
     } else {
-        info!("writer_task 已成功退出");
+        info!("writer_to_client 已成功退出");
     }
 
     info!("服务端已成功关闭。");

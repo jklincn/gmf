@@ -120,10 +120,11 @@ impl SSHSession {
 
         // 创建父目录（如果不存在）
         if let Some(parent_dir) = std::path::Path::new(remote_path).parent()
-            && let Some(parent_str) = parent_dir.to_str() {
-                // 尝试创建父目录，忽略错误（可能已存在）
-                let _ = sftp.create_dir(parent_str).await;
-            }
+            && let Some(parent_str) = parent_dir.to_str()
+        {
+            // 尝试创建父目录，忽略错误（可能已存在）
+            let _ = sftp.create_dir(parent_str).await;
+        }
 
         let mut file = sftp
             .open_with_flags(
