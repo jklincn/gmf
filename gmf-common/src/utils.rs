@@ -15,7 +15,7 @@ pub fn app_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     let gmf_dir = app_dir();
-    gmf_dir.join("config.toml")
+    gmf_dir.join("config.json")
 }
 
 /// 格式化字节大小为易读的字符串
@@ -35,21 +35,6 @@ pub fn format_size(size: u64) -> String {
     }
 
     format!("{:.2} {}", size, UNITS[unit])
-}
-
-/// 计算指定文件的 XXH3 哈希值
-pub fn calc_xxh3(path: &Path) -> Result<String> {
-    let mut input = File::open(path)
-        .with_context(|| format!("打开文件 '{}' 失败用于计算 XXH3", path.display()))?;
-
-    let mut hasher = Xxh3::new();
-
-    io::copy(&mut input, &mut hasher)
-        .with_context(|| format!("读取文件 '{}' 内容失败用于计算 XXH3", path.display()))?;
-
-    let hash = hasher.finish();
-
-    Ok(format!("{hash:x}"))
 }
 
 pub fn find_available_filename(path: &PathBuf) -> PathBuf {
@@ -75,6 +60,68 @@ pub fn find_available_filename(path: &PathBuf) -> PathBuf {
         }
     }
 
-    // 防御性代码：基本不会走到
+    // 防御性代码
     path.clone()
+}
+
+/// 解析路径字符串，处理首尾引号和波浪号(~)展开
+pub fn resolve_path(path_str: &str) -> PathBuf {
+    let mut p = path_str.trim();
+    // 去除首尾引号
+    if (p.starts_with('"') && p.ends_with('"')) || (p.starts_with('\'') && p.ends_with('\'')) {
+        p = &p[1..p.len() - 1];
+    }
+
+    if p.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            if p == "~" {
+                return home;
+            }
+            // 处理 ~/ 或 ~\
+            if p.starts_with("~/") || p.starts_with("~\\") {
+                return home.join(&p[2..]);
+            }
+        }
+    }
+
+    PathBuf::from(p)
+}
+
+pub trait Xxh3Hashable {
+    fn compute_xxh3(&self) -> Result<String>;
+}
+
+impl Xxh3Hashable for Path {
+    fn compute_xxh3(&self) -> Result<String> {
+        let mut input = File::open(self)
+            .with_context(|| format!("打开文件 '{}' 失败用于计算 XXH3", self.display()))?;
+
+        let mut hasher = Xxh3::new();
+
+        io::copy(&mut input, &mut hasher)
+            .with_context(|| format!("读取文件 '{}' 内容失败用于计算 XXH3", self.display()))?;
+
+        let hash = hasher.finish();
+        Ok(format!("{hash:x}"))
+    }
+}
+
+impl Xxh3Hashable for PathBuf {
+    fn compute_xxh3(&self) -> Result<String> {
+        self.as_path().compute_xxh3()
+    }
+}
+
+impl Xxh3Hashable for str {
+    fn compute_xxh3(&self) -> Result<String> {
+        let mut hasher = Xxh3::new();
+        hasher.update(self.as_bytes());
+        let hash = hasher.finish();
+        Ok(format!("{hash:x}"))
+    }
+}
+
+/// 计算 XXH3 哈希值
+pub fn calc_xxh3<T: Xxh3Hashable + ?Sized>(input: &T) -> Result<String> {
+    input.compute_xxh3()
 }

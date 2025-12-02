@@ -1,44 +1,37 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use std::env;
-use tokio::sync::OnceCell;
-
 use s3::creds::Credentials;
 use s3::region::Region;
 use s3::{Bucket, BucketConfiguration};
 use s3::{retry, set_retries};
+use serde::{Deserialize, Serialize};
+use std::env;
+use tokio::sync::OnceCell;
 
 use crate::consts::S3_RETRY;
-static S3_CONFIG: OnceCell<S3Config> = OnceCell::const_new();
 static BUCKET: OnceCell<Box<Bucket>> = OnceCell::const_new();
 
 const BUCKET_NAME: &str = "gmf";
 
-#[derive(Clone, Debug)]
-pub struct S3Config {
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct R2Config {
     pub endpoint: String,
     pub access_key_id: String,
     pub secret_access_key: String,
 }
 
-pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
+pub async fn init(config_override: Option<R2Config>) -> Result<()> {
     set_retries(S3_RETRY);
     let use_override = config_override.is_some();
-
-    S3_CONFIG
-        .set(match config_override {
-            Some(cfg) => cfg,
-            None => S3Config {
-                endpoint: env::var("ENDPOINT").context("环境变量 'ENDPOINT' 未设置")?,
-                access_key_id: env::var("ACCESS_KEY_ID")
-                    .context("环境变量 'ACCESS_KEY_ID' 未设置")?,
-                secret_access_key: env::var("SECRET_ACCESS_KEY")
-                    .context("环境变量 'SECRET_ACCESS_KEY' 未设置")?,
-            },
-        })
-        .map_err(|_| anyhow!("S3 配置已初始化，不可重复初始化"))?;
-
-    let cfg = S3_CONFIG.get().unwrap();
+    let cfg = match config_override {
+        Some(cfg) => cfg,
+        None => R2Config {
+            endpoint: env::var("ENDPOINT").context("环境变量 'ENDPOINT' 未设置")?,
+            access_key_id: env::var("ACCESS_KEY_ID").context("环境变量 'ACCESS_KEY_ID' 未设置")?,
+            secret_access_key: env::var("SECRET_ACCESS_KEY")
+                .context("环境变量 'SECRET_ACCESS_KEY' 未设置")?,
+        },
+    };
     let region = Region::Custom {
         region: "us-east-1".to_string(),
         endpoint: cfg.endpoint.clone(),
@@ -69,7 +62,7 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
 
         if !ok {
             return Err(anyhow!(
-                "S3 bucket '{}' 在默认配置下未检测到存在（尝试 {} 次）",
+                "R2 bucket '{}' 在默认配置下未检测到存在（尝试 {} 次）",
                 BUCKET_NAME,
                 MAX_RETRIES
             ));
@@ -77,7 +70,7 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
 
         BUCKET
             .set(bucket)
-            .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
+            .map_err(|_| anyhow!("R2 Bucket 已初始化，不可重复初始化"))?;
 
         Ok(())
     } else {
@@ -90,7 +83,7 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
                 resp.bucket
             } else {
                 return Err(anyhow!(
-                    "创建 S3 bucket 失败: HTTP {}, 响应内容：{}",
+                    "创建 R2 bucket 失败: HTTP {}, 响应内容：{}",
                     resp.response_code,
                     resp.response_text
                 ));
@@ -101,16 +94,17 @@ pub async fn init_s3(config_override: Option<S3Config>) -> Result<()> {
 
         BUCKET
             .set(final_bucket)
-            .map_err(|_| anyhow!("S3 Bucket 已初始化，不可重复初始化"))?;
+            .map_err(|_| anyhow!("R2 Bucket 已初始化，不可重复初始化"))?;
 
         Ok(())
     }
 }
+
 pub fn get_bucket() -> Result<&'static Bucket> {
     BUCKET
         .get()
         .map(|b| b.as_ref())
-        .context("S3 Bucket 尚未初始化，请先调用 init_s3()")
+        .context("R2 Bucket 尚未初始化，请先调用 init()")
 }
 
 pub async fn list_objects() -> Result<Vec<String>> {

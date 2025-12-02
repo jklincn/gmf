@@ -67,8 +67,8 @@ impl GMFClient {
     /// 启动远程程序并创建一个新的交互式会话。
     pub async fn new(args: GetArgs) -> Result<Self> {
         // 检查远程环境并获取 SSH 会话和远程程序路径
-        let cfg = crate::config::get_config();
-        let mut ssh_session = ssh::SSHSession::connect(cfg)
+        let cfg = crate::config::get_config()?;
+        let mut ssh_session = ssh::SSHSession::connect(&cfg.ssh_config)
             .await
             .context("连接远程服务器失败")?;
         let remote_path = check_remote(&mut ssh_session)
@@ -80,9 +80,9 @@ impl GMFClient {
         // 注入环境变量
         let command = format!(
             "ENDPOINT='{}' ACCESS_KEY_ID='{}' SECRET_ACCESS_KEY='{}' LOG='{}' {}",
-            cfg.endpoint,
-            cfg.access_key_id,
-            cfg.secret_access_key,
+            cfg.r2_config.endpoint,
+            cfg.r2_config.access_key_id,
+            cfg.r2_config.secret_access_key,
             if args.verbose { "INFO" } else { "None" },
             remote_path
         );

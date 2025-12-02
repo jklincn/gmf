@@ -50,16 +50,13 @@ async fn real_main(args: GetArgs) -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let args = args::get_cli_args();
 
-    match args.command {
-        // gmf config
-        Command::Config => {
-            if let Err(e) = config::reset_config() {
-                ui::log_error(&format!("{e:#}"));
-            }
-        }
+    let result = match args.command {
+        // gmf login
+        Command::Login => config::login().await,
+
         // gmf get <path>
         Command::Get { path, verbose } => {
             let get_args = GetArgs {
@@ -67,12 +64,12 @@ async fn main() -> Result<()> {
                 chunk_size: CHUNK_SIZE,
                 verbose,
             };
-
-            if let Err(e) = real_main(get_args).await {
-                ui::log_error(&format!("{e:#}"));
-            }
+            real_main(get_args).await
         }
-    }
+    };
 
-    Ok(())
+    if let Err(e) = result {
+        ui::log_error(&format!("{:#}", e));
+        std::process::exit(1);
+    }
 }

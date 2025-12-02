@@ -1,9 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use crate::config::Config;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use russh::{keys::*, *};
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 struct ClientHandle {}
@@ -19,6 +19,15 @@ impl client::Handler for ClientHandle {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SSHConfig {
+    pub hostname: String,
+    pub port: u16,
+    pub user: String,
+    pub private_key_path: Option<String>,
+    pub password: Option<String>,
+}
+
 /// 一次性执行命令的返回结果
 #[derive(Debug)]
 pub struct ExecOutput {
@@ -31,7 +40,7 @@ pub struct SSHSession {
 }
 
 impl SSHSession {
-    pub async fn connect(cfg: &Config) -> Result<Self> {
+    pub async fn connect(cfg: &SSHConfig) -> Result<Self> {
         let config = client::Config {
             inactivity_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
@@ -39,7 +48,7 @@ impl SSHSession {
         let config = Arc::new(config);
 
         let sh = ClientHandle {};
-        let addr = (cfg.host.as_str(), cfg.port);
+        let addr = (cfg.hostname.as_str(), cfg.port);
 
         // 建立 TCP + SSH 握手
         let mut session = client::connect(config, addr, sh).await?;

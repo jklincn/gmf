@@ -1,126 +1,150 @@
-use anyhow::{Context, Result};
-use gmf_common::r2;
-use gmf_common::utils::config_path;
+use crate::ssh::{SSHConfig, SSHSession};
+use anyhow::{Context, Result, anyhow, bail};
+use gmf_common::utils::{config_path, resolve_path};
+use gmf_common::{r2, utils::calc_xxh3};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{self, Write},
     sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: Option<String>,
-    pub private_key_path: Option<String>,
-
-    pub endpoint: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
+    pub time: u64,
+    pub ssh_config: SSHConfig,
+    pub r2_config: r2::R2Config,
+    pub hash: String,
 }
 
-fn write_default_config() -> Result<()> {
+impl Config {
+    fn calculate_hash(&self) -> Result<String> {
+        let mut temp = self.clone();
+        // 计算哈希前必须将 xxh3 字段置空，防止循环依赖，并确保验证的一致性
+        temp.hash = String::new();
+        let content = serde_json::to_string(&temp).unwrap_or_default();
+        calc_xxh3(content.as_str())
+    }
+}
+
+fn save_config(config: &Config) -> Result<()> {
     let path = config_path();
+    let mut temp = config.clone();
+    temp.time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    temp.hash = temp.calculate_hash()?;
 
-    let default = Config {
-        host: "192.168.1.1".into(),
-        port: 22,
-        user: "user".into(),
-        password: Some("password".into()),
-        private_key_path: Some("your_private_key_path".into()),
-        endpoint: "https://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.r2.cloudflarestorage.com".into(),
-        access_key_id: "your_access_key_id".into(),
-        secret_access_key: "your_secret_access_key".into(),
-    };
-
-    let config_content = format!(
-        r#"# =============== SSH 连接配置 ================
-
-# 目标主机IP或域名
-host = "{}"
-
-# SSH端口
-port = {}
-
-# 用户名
-user = "{}"
-
-# 密码 (推荐使用密钥登陆，如果启用密码，则会忽略密钥)
-# password = "{}"
-
-# 私钥路径 (Windows文件路径注意使用单引号或双反斜杠, 例如: 'C:\\Users\\user\\.ssh\\id_rsa')
-private_key_path = '{}'
-
-# ======== Cloudflare R2 对象存储配置 =========
-
-# R2 API 的 Endpoint 地址
-endpoint = "{}"
-
-# Cloudflare R2 访问密钥ID
-access_key_id = "{}"
-
-# Cloudflare R2 机密访问密钥
-secret_access_key = "{}"
-"#,
-        default.host,
-        default.port,
-        default.user,
-        default.password.as_deref().unwrap_or(""),
-        default.private_key_path.as_deref().unwrap_or(""),
-        default.endpoint,
-        default.access_key_id,
-        default.secret_access_key
-    );
-
-    fs::write(&path, config_content).context("写入默认配置失败")?;
+    let content = serde_json::to_string_pretty(&temp).context("序列化配置失败")?;
+    fs::write(&path, content).context("写入配置文件失败")?;
     Ok(())
 }
 
-fn load_or_create_config() -> Result<Option<Config>> {
+fn load_config() -> Result<Config> {
     let path = config_path();
-    if path.exists() {
-        let content = fs::read_to_string(path).context("读取配置文件失败")?;
-        let cfg: Config = toml::from_str(&content).context("解析配置文件失败")?;
-        return Ok(Some(cfg));
+
+    if !path.exists() {
+        return Err(anyhow!("配置文件不存在"));
     }
-    write_default_config()?;
-    Ok(None)
+
+    let content = fs::read_to_string(&path).context("读取配置文件失败")?;
+    let config: Config = serde_json::from_str(&content).context("解析配置文件失败")?;
+
+    if config.hash != config.calculate_hash()? {
+        bail!("配置文件 {} 数据校验失败，请重新登录设置", path.display());
+    }
+
+    Ok(config)
 }
 
-pub fn reset_config() -> Result<()> {
+fn prompt(label: &str) -> String {
+    print!("{}: ", label);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    input.trim().to_string()
+}
+
+pub async fn login() -> Result<()> {
     let path = config_path();
     if path.exists() {
-        println!("检测到已有配置文件：{}", path.display());
-        print!("是否确认重置为默认配置？(y/N): ");
-        io::stdout().flush().ok();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).ok();
-        let input = input.trim().to_lowercase();
-        if input != "y" && input != "yes" {
-            println!("操作已取消，未修改配置文件。");
+        let input = prompt("配置文件已存在，是否覆盖？(y/N)");
+        if !input.eq_ignore_ascii_case("y") {
+            println!("已取消配置更改。");
             return Ok(());
         }
-        fs::remove_file(&path).context("删除旧配置文件失败")?;
     }
 
-    write_default_config()?;
+    println!("\n=== SSH 配置 ===");
 
-    println!("配置文件已创建");
-    println!("路径: {}", path.display());
+    let mut ssh_config = SSHConfig::default();
 
+    ssh_config.hostname = prompt("主机地址");
+    let port_str = prompt("端口");
+    if let Ok(p) = port_str.parse() {
+        ssh_config.port = p;
+    } else {
+        bail!("无效的端口号");
+    }
+    ssh_config.user = prompt("用户名");
+    let key = prompt("私钥路径 (推荐，回车跳过)");
+    ssh_config.private_key_path = if key.is_empty() {
+        None
+    } else {
+        Some(resolve_path(&key).to_string_lossy().to_string())
+    };
+
+    let pass_label = if ssh_config.private_key_path.is_some() {
+        "密码 (已设置私钥，回车跳过)"
+    } else {
+        "密码"
+    };
+    let pass = prompt(pass_label);
+    ssh_config.password = if pass.is_empty() { None } else { Some(pass) };
+
+    // 测试 ssh 连接
+    let mut ssh_session = SSHSession::connect(&ssh_config)
+        .await
+        .context("SSH 连接失败")?;
+    ssh_session.close().await?;
+    println!("SSH 连接成功!");
+
+    println!("\n=== Cloudflare R2 配置 ===");
+    let mut r2_config = r2::R2Config::default();
+    r2_config.endpoint = prompt("S3 API Endpoint");
+    r2_config.access_key_id = prompt("AccessKeyID");
+    r2_config.secret_access_key = prompt("SecretAccessKey");
+
+    // 测试 r2 连接
+    r2::init(Some(r2_config.clone()))
+        .await
+        .with_context(|| "连接 Cloudflare R2 失败")?;
+    r2::delete_bucket()
+        .await
+        .with_context(|| "删除 R2 Bucket 失败")?;
+    println!("Cloudflare R2 连接成功!");
+
+    let config = Config {
+        ssh_config,
+        r2_config,
+        ..Default::default()
+    };
+    save_config(&config).context("保存配置失败")?;
+    println!("\n=== 配置完成 ===");
+    println!("配置已保存至 {}", config_path().display());
     Ok(())
 }
 
 pub async fn init_r2() -> Result<()> {
-    let cfg = get_config();
-    let s3_config = r2::S3Config {
-        endpoint: cfg.endpoint.clone(),
-        access_key_id: cfg.access_key_id.clone(),
-        secret_access_key: cfg.secret_access_key.clone(),
+    let cfg = get_config()?;
+    let s3_config = r2::R2Config {
+        endpoint: cfg.r2_config.endpoint.clone(),
+        access_key_id: cfg.r2_config.access_key_id.clone(),
+        secret_access_key: cfg.r2_config.secret_access_key.clone(),
     };
-    r2::init_s3(Some(s3_config))
+    r2::init(Some(s3_config))
         .await
         .context("连接 Cloudflare R2 失败")?;
     Ok(())
@@ -128,17 +152,13 @@ pub async fn init_r2() -> Result<()> {
 
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
-pub fn get_config() -> &'static Config {
-    GLOBAL_CONFIG.get_or_init(|| {
-        let result = load_or_create_config().expect("读取配置失败");
+pub fn get_config() -> Result<&'static Config> {
+    if let Some(cfg) = GLOBAL_CONFIG.get() {
+        return Ok(cfg);
+    }
 
-        match result {
-            Some(cfg) => cfg,
-            None => {
-                println!("配置文件已创建，请根据实际情况修改后重新运行程序。");
-                println!("路径: {}", config_path().display());
-                std::process::exit(0);
-            }
-        }
-    })
+    let cfg = load_config()?;
+    let _ = GLOBAL_CONFIG.set(cfg);
+
+    Ok(GLOBAL_CONFIG.get().expect("配置应当已被初始化"))
 }

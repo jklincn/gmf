@@ -6,7 +6,7 @@ mod server;
 use crate::logging::init_logging;
 use anyhow::Result;
 use gmf_common::interface::{ClientRequest, Message, ServerResponse, StartResponse};
-use gmf_common::r2::init_s3;
+use gmf_common::r2;
 use std::time::Duration;
 use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use tokio_util::sync::CancellationToken;
@@ -59,11 +59,11 @@ async fn main() -> Result<()> {
     // 创建用于优雅关闭的 watch channel
     let shutdown_token = CancellationToken::new();
 
-    if let Err(e) = init_s3(None).await {
+    if let Err(e) = r2::init(None).await {
         let _ = tx
-            .send(ServerResponse::Error(format!("远程 S3 客户端初始化失败: {e}")).into())
+            .send(ServerResponse::Error(format!("远程 R2 客户端初始化失败: {e}")).into())
             .await;
-        error!("远程 S3 客户端初始化失败: {e}");
+        error!("远程 R2 客户端初始化失败: {e}");
         return Ok(());
     }
 
