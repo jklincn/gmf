@@ -24,10 +24,8 @@
    - 打开终端输入
 
      ```
-     .\gmf.exe
+     .\gmf.exe login
      ```
-
-   - 程序会在当前目录生成默认配置文件 `config.toml`
 
    - 填写远程主机和 R2 的连接信息
 
@@ -36,23 +34,8 @@
    - 打开终端输入
 
      ```
-     .\gmf.exe /remote/example.txt
+     .\gmf.exe get ~/example.txt
      ```
-
-## 🖥️ 命令行参数
-
-```
-Usage: gmf.exe [OPTIONS] <PATH>
-
-Arguments:
-  <PATH>  要下载的远程文件路径
-
-Options:
-  -c, --chunk-size <SIZE>  分块大小 [default: 10485760]
-  -v, --verbose            打印详细输出
-  -h, --help               Print help
-  -V, --version            Print version
-```
 
 ## 💰 Cloudflare R2 免费额度
 
@@ -76,7 +59,7 @@ Security warning: OS has failed to lock/unlock memory for a cryptographic buffer
 This warning will only be shown once.
 ```
 
-这是 `russh` 库在 Windows 上锁定加密缓冲区失败的提示，对传输功能影响不大，可放心使用。
+这是 `russh` 库在 Windows 上锁定加密缓冲区失败的提示，对传输功能无影响，可放心使用。
 
 跟踪 Issue ➜ https://github.com/Eugeny/russh/issues/504
 
