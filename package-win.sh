@@ -30,4 +30,4 @@ echo "--- 文件大小 ---"
 ls -lh "${SOURCE_PATH}" "${REMOTE_PATH}"
 echo "----------------"
 
-cp ${SOURCE_PATH} .
+cp ${SOURCE_PATH} ./gmf-x86_64-pc-windows-gnu.exe
