@@ -142,7 +142,7 @@ pub fn init_global_logger(verbose: bool) -> Result<()> {
     let progress_bar = AllProgressBar::new(log_level);
     G_PROGRESS_BAR
         .set(progress_bar)
-        .map_err(|_| anyhow::anyhow!("全局日志/进度条模块已经初始化过了"))?;
+        .map_err(|_| anyhow::anyhow!("全局日志模块重复初始化"))?;
     Ok(())
 }
 
@@ -187,7 +187,5 @@ pub fn log_error(msg: &str) {
 }
 
 fn global() -> &'static AllProgressBar {
-    G_PROGRESS_BAR
-        .get()
-        .expect("全局日志/进度条(G_PROGRESS_BAR)未初始化，请先调用 init_global_logger")
+    G_PROGRESS_BAR.get().expect("全局日志模块未初始化")
 }

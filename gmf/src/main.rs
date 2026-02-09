@@ -16,7 +16,6 @@ use tokio::try_join;
 use crate::config::init_r2;
 
 async fn real_main(args: GetArgs) -> Result<()> {
-    ui::init_global_logger(args.verbose)?;
 
     ui::log_info("正在连接...");
     let ((), mut client) = try_join!(init_r2(), client::GMFClient::new(args))?;
@@ -53,12 +52,18 @@ async fn real_main(args: GetArgs) -> Result<()> {
 async fn main() {
     let args = args::get_cli_args();
 
+    let verbose = match &args.command {
+        Command::Login => false,
+        Command::Get { verbose, .. } => *verbose,
+    };
+    ui::init_global_logger(verbose).expect("初始化 logger 失败");
+
     let result = match args.command {
         // gmf login
         Command::Login => config::login().await,
 
         // gmf get <path>
-        Command::Get { path, verbose } => {
+        Command::Get { path, .. } => {
             let get_args = GetArgs {
                 path,
                 chunk_size: CHUNK_SIZE,
